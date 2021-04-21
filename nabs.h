@@ -2048,16 +2048,16 @@ namespace nabs
 {
 	namespace os
 	{
-		using Fd = int;
-		static constexpr Fd FD_NONE = -1;
-
-		struct PipeDes
-		{
-			Fd read_end;
-			Fd write_end;
-		};
-
 		#if defined(_WIN32)
+
+			using Fd = int;
+			static constexpr Fd FD_NONE = -1;
+
+			struct PipeDes
+			{
+				Fd read_end;
+				Fd write_end;
+			};
 
 			using Proc = HANDLE;
 			static constexpr Proc PROC_NONE = nullptr;
@@ -2134,6 +2134,12 @@ namespace nabs
 			using Fd = int;
 			static constexpr Fd FD_NONE = -1;
 
+			struct PipeDes
+			{
+				Fd read_end;
+				Fd write_end;
+			};
+
 			using Proc = pid_t;
 			static constexpr Proc PROC_NONE = -1;
 
@@ -2180,7 +2186,7 @@ namespace nabs
 
 				int fd = 0;
 				if(fof._should_create)
-					fd = open(path, flags, fof.create_perms);
+					fd = open(path, flags, fof._create_perms);
 
 				else
 					fd = open(path, flags);
@@ -2230,6 +2236,14 @@ namespace nabs
 		private:
 			std::vector<os::Proc> runAsync(os::Fd in_fd);
 		};
+
+		#if defined(_WIN32)
+			inline DWORD WINAPI split_program(SplitProgArgs* args);
+		#else
+			inline void split_program(SplitProgArgs* args);
+		#endif // _WIN32
+
+
 
 		struct Part
 		{
@@ -2504,7 +2518,6 @@ namespace nabs
 			}
 			else if(this->type() == TYPE_SPLIT)
 			{
-
 			#if defined(_WIN32)
 
 				// since we cannot fork(), we just use a thread. this is necessary
@@ -2749,19 +2762,22 @@ namespace nabs
 			while(true)
 			{
 				auto n = os::fd_read(args->read_fd, buf, 4096);
+				zpr::fprintln(stderr, "read: {} bytes", n);
+
 				if(n <= 0)
 				{
-					if(n < 0) zpr::fprintln(stderr, "tee(stdin): read error: {}", strerror(errno));
+					if(n < 0) zpr::fprintln(stderr, "split(stdin): read error: {}", strerror(errno));
 					break;
 				}
 
+				zpr::fprintln(stderr, "read: {} bytes", n);
 				if(os::fd_write(args->write_fd, buf, n) < 0)
-					zpr::fprintln(stderr, "tee(stdout): write error: {}", strerror(errno));
+					zpr::fprintln(stderr, "split(stdout): write error: {}", strerror(errno));
 
 				for(auto& f : fds)
 				{
 					if(os::fd_write(f, buf, n) < 0)
-						zpr::fprintln(stderr, "tee({}): write error: {}", f, strerror(errno));
+						zpr::fprintln(stderr, "split({}): write error: {}", f, strerror(errno));
 				}
 			}
 
