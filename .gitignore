@@ -7,6 +7,8 @@
 *.c.d
 *.log
 *.obj
+*.ilk
+*.pdb
 
 *.gch
 *.pch

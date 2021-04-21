@@ -1968,7 +1968,6 @@ static constexpr int STDERR_FILENO  = 2;
 
 using ssize_t = long long;
 
-#if 0
 LPSTR GetLastErrorAsString()
 {
 	// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
@@ -1985,14 +1984,6 @@ LPSTR GetLastErrorAsString()
 
 	return messageBuffer;
 }
-#else
-DWORD GetLastErrorAsString()
-{
-	// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
-
-	return GetLastError();
-}
-#endif
 
 #else
 
@@ -2091,7 +2082,6 @@ namespace nabs
 				}
 				else
 				{
-					// O_NOINHERIT is functionally CLOEXEC, so no need to fcntl it
 					return PipeDes { p[0], p[1] };
 				}
 			}
@@ -2126,9 +2116,14 @@ namespace nabs
 				if(result == WAIT_FAILED)
 					impl::int_error("WaitForSingleObject(): {}", GetLastErrorAsString());
 
+				// we are using this for threads as well; if it is not a process, return 0.
 				DWORD status = 0;
-				if(!GetExitCodeProcess(proc, &status))
-					impl::int_error("GetExitCodeProcess(): {}", GetLastErrorAsString());
+
+				if(GetProcessId(proc) != 0)
+				{
+					if(!GetExitCodeProcess(proc, &status))
+						impl::int_error("GetExitCodeProcess(): {}", GetLastErrorAsString());
+				}
 
 				CloseHandle(proc);
 				return static_cast<int>(status);
@@ -2210,9 +2205,8 @@ namespace nabs
 
 	namespace impl
 	{
-		inline void split_program(std::vector<os::Fd> fds);
-
 		struct Part;
+		struct SplitProgArgs;
 
 		struct Pipeline
 		{
@@ -2226,6 +2220,12 @@ namespace nabs
 			std::vector<Part> parts;
 
 			friend struct Part;
+
+		#if defined(_WIN32)
+			friend inline DWORD WINAPI split_program(SplitProgArgs* args);
+		#else
+			friend inline void split_program(SplitProgArgs* args);
+		#endif // _WIN32
 
 		private:
 			std::vector<os::Proc> runAsync(os::Fd in_fd);
@@ -2356,6 +2356,17 @@ namespace nabs
 
 			friend struct Pipeline;
 		};
+
+		struct SplitProgArgs
+		{
+			os::Fd read_fd;
+			os::Fd write_fd;
+			std::vector<os::Fd>* write_fds;
+
+			std::vector<impl::Pipeline>* split_vals;
+			std::vector<impl::Pipeline*>* split_ptrs;
+		};
+
 
 		// ADL should let us find this operator.
 		inline Pipeline operator| (Pipeline head, const Pipeline& tail)
@@ -2496,8 +2507,35 @@ namespace nabs
 
 			#if defined(_WIN32)
 
-				int_error("split() not supported on windows yet");
-				return os::PROC_NONE;
+				// since we cannot fork(), we just use a thread. this is necessary
+				// so we can return and let the rest of the pipeline proceed. since
+				// CreateThread also returns a HANDLE, we can also use WaitForObject
+				// to wait for it, which is actually super convenient. thanks, bill gates.
+
+				// for windows, this needs to be heap-allocated, and we make the split_program
+				// responsible for freeing it. this is because it executes in a separate thread,
+				// so we cannot allocate it on this stack.
+				auto args = new SplitProgArgs;
+				args->read_fd = in_fd;
+				args->write_fd = out_fd;
+				args->split_vals = &this->split_vals;
+				args->split_ptrs = &this->split_ptrs;
+
+				auto func = reinterpret_cast<LPTHREAD_START_ROUTINE>(split_program);
+
+				auto proc = CreateThread(
+					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					0,          // DWORD                    dwStackSize
+					func,       // LPTHREAD_START_ROUTINE   lpStartAddress
+					args,       // LPVOID                   lpParameter
+					0,          // DWORD                    dwCreationFlags
+					nullptr     // LPDWORD                  lpThreadId
+				);
+
+				if(proc == os::PROC_NONE)
+					int_error("CreateThread(): {}", GetLastErrorAsString());
+
+				return proc;
 
 			#else
 				// basically we have to emulate what the `tee` program does.
@@ -2523,45 +2561,16 @@ namespace nabs
 					if(err_fd != os::FD_NONE)
 						dupe_fd(err_fd, STDERR_FILENO);
 
-					auto iterate_splits = [&fds, &children](Pipeline* pl) {
+					// for unix, we can just allocate this on the stack, since this is run synchronously
+					// inside the fork()-ed child process.
+					SplitProgArgs args { };
+					args.read_fd = STDIN_FILENO;
+					args.write_fd = STDOUT_FILENO;
+					args.write_fds = &fds;
+					args.split_vals = &this->split_vals;
+					args.split_ptrs = &this->split_ptrs;
 
-						assert(pl != nullptr);
-						auto [ p_read, p_write ] = os::make_pipe();
-
-						auto cs = pl->runAsync(p_read);
-						children.insert(children.end(), cs.begin(), cs.end());
-
-						// if the pipeline's first argument is passive, then we write directly into it.
-						// we rely on the pipeline's run() to perform dup2() to change our fd as appropriate.
-						if(pl->parts[0].is_passive())
-						{
-							close(p_write);
-							fds.push_back(p_read);
-						}
-						else
-						{
-							close(p_read);
-							fds.push_back(p_write);
-						}
-					};
-
-					if(!this->split_ptrs.empty())
-					{
-						for(auto& sp : this->split_ptrs)
-							iterate_splits(sp);
-					}
-					else
-					{
-						for(auto& sp : this->split_vals)
-							iterate_splits(&sp);
-					}
-
-					split_program(std::move(fds));
-
-					// wait for all the children...
-					for(auto c : children)
-						os::wait_for_pid(c);
-
+					split_program(&args);
 					exit(0);
 				}
 				else
@@ -2694,19 +2703,59 @@ namespace nabs
 			return status;
 		}
 
-		inline void split_program(std::vector<os::Fd> fds)
+	#if defined(_WIN32)
+		inline DWORD WINAPI split_program(SplitProgArgs* args)
 		{
+	#else
+		inline void split_program(SplitProgArgs* args)
+		{
+	#endif // _WIN32
+
+			std::vector<os::Fd> fds;
+			std::vector<os::Proc> children;
+
+			// because this is launched as a thread on windows,
+			// we also need to be responsible for actually firing off the
+			// pipelines here.
+			auto iterate_splits = [&args, &fds, &children](Pipeline* pl) {
+
+				assert(pl != nullptr);
+				auto [ p_read, p_write ] = os::make_pipe();
+
+				auto cs = pl->runAsync(p_read);
+				children.insert(children.end(), cs.begin(), cs.end());
+
+				// if the pipeline's first argument is passive, then we write directly into it.
+				// we rely on the pipeline's run() to perform dup2() to change our fd as appropriate.
+				if(pl->parts[0].is_passive())
+				{
+					close(p_write);
+					fds.push_back(p_read);
+				}
+				else
+				{
+					close(p_read);
+					fds.push_back(p_write);
+				}
+			};
+
+			for(auto& sp : *args->split_ptrs)
+				iterate_splits(sp);
+
+			for(auto& sp : *args->split_vals)
+				iterate_splits(&sp);
+
 			char buf[4096] { };
 			while(true)
 			{
-				auto n = os::fd_read(STDIN_FILENO, buf, 4096);
+				auto n = os::fd_read(args->read_fd, buf, 4096);
 				if(n <= 0)
 				{
 					if(n < 0) zpr::fprintln(stderr, "tee(stdin): read error: {}", strerror(errno));
 					break;
 				}
 
-				if(os::fd_write(STDOUT_FILENO, buf, n) < 0)
+				if(os::fd_write(args->write_fd, buf, n) < 0)
 					zpr::fprintln(stderr, "tee(stdout): write error: {}", strerror(errno));
 
 				for(auto& f : fds)
@@ -2718,8 +2767,22 @@ namespace nabs
 
 			for(auto& f : fds)
 				close(f);
+
+			// wait for all the children...
+			for(auto c : children)
+				os::wait_for_pid(c);
+
+		#if defined(_WIN32)
+			delete args;
+			return 0;
+		#endif // _WIN32
 		}
 	}
+
+
+
+
+
 
 	template <typename... Args>
 	inline impl::Pipeline cmd(std::string exe, Args&&... args)
@@ -2796,6 +2859,9 @@ namespace nabs
 		});
 	}
 }
+
+
+
 
 
 
