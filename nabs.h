@@ -2099,15 +2099,7 @@ namespace nabs
 				impl::int_error("_pipe(): {}", strerror(errno));
 
 			else
-			{
-				// auto p_r = reinterpret_cast<HANDLE>(_get_osfhandle(p[0]));
-				// auto p_w = reinterpret_cast<HANDLE>(_get_osfhandle(p[1]));
-
-				// SetHandleInformation(p_r, HANDLE_FLAG_INHERIT, 0);
-				// SetHandleInformation(p_w, HANDLE_FLAG_INHERIT, 0);
-
 				return PipeDes { p[0], p[1] };
-			}
 		#else
 			if(int p[2]; pipe(p) < 0)
 			{
@@ -2131,11 +2123,44 @@ namespace nabs
 		inline void close_file(Fd fd)
 		{
 		#if defined(_WIN32)
-			_close(fd);
+			if(_close(fd) < 0)
 		#else
 			if(close(fd) < 0)
-				impl::int_error("close(): {}", strerror(errno));
 		#endif
+				impl::int_error("close(): {}", strerror(errno));
+		}
+
+		inline int dupe_fd(os::Fd src, os::Fd dst, bool close_src = true)
+		{
+		#if defined(_WIN32)
+			constexpr auto f_dup2 = ::_dup2;
+		#else
+			constexpr auto f_dup2 = ::dup2;
+		#endif
+			// dup2 closes dst for us.
+			if(f_dup2(src, dst) < 0)
+				impl::int_error("dup2({}, {}): {}", src, dst, strerror(errno));
+
+			if(close_src)
+				os::close_file(src);
+		}
+
+		inline os::Fd dupe_fd(os::Fd src)
+		{
+			if(src == os::FD_NONE)
+				return src;
+
+		#if defined(_WIN32)
+			constexpr auto f_dup = ::_dup;
+		#else
+			constexpr auto f_dup = ::dup;
+		#endif
+			// dup2 closes dst for us.
+			if(auto ret = f_dup(src); ret < 0)
+				impl::int_error("dup({}): {}", src, strerror(errno));
+
+			else
+				return ret;
 		}
 
 		inline Fd open_file(const char* path, FileOpenFlags fof)
@@ -2392,15 +2417,6 @@ namespace nabs
 
 		os::Proc Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
 		{
-			auto dupe_fd = [](int src, int dst, bool close_src = true) {
-				// dup2 closes dst for us.
-				if(dup2(src, dst) < 0)
-					int_error("dup2({}, {}): {}", src, dst, strerror(errno));
-
-				if(close_src)
-					os::close_file(src);
-			};
-
 			if(this->type() == TYPE_PROC)
 			{
 			#if defined(_WIN32)
@@ -2421,7 +2437,14 @@ namespace nabs
 				info.hStdError  = get_handle(err_fd, GetStdHandle(STD_ERROR_HANDLE));
 				info.dwFlags |= STARTF_USESTDHANDLES;
 
-				// TODO: need to disable inheritance on the child_close handle
+				// need to disable inheritance on the child_close handle
+				if(child_close != os::FD_NONE)
+				{
+					// TODO: handle error for _get_osfhandle
+					auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(child_close));
+					if(!SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0))
+						impl::int_error("SetHandleInformation(): {}", GetLastErrorAsString());
+				}
 
 				PROCESS_INFORMATION procinfo;
 				memset(&procinfo, 0, sizeof(procinfo));
@@ -2503,14 +2526,60 @@ namespace nabs
 					);
 				};
 
-			#if defined(_WIN32)
-				#error asdf
-			#else
-
 				// files cannot be both read and write (use split/tee for that)
 				// while this is an "artificial" limitation, i'm going to enforce it for now.
 				if(in_fd != os::FD_NONE && out_fd != os::FD_NONE)
 					impl::int_error("file() cannot appear in the middle of a pipeline");
+
+			#if defined(_WIN32)
+
+				struct Args
+				{
+					os::Fd in_fd;
+					os::Fd out_fd;
+				};
+
+				auto func = [](void* arg) -> DWORD {
+					auto fds = reinterpret_cast<Args*>(arg);
+					fd_transfer(fds->in_fd, fds->out_fd);
+					os::close_file(fds->in_fd);
+					os::close_file(fds->out_fd);
+					delete fds;
+					return 0;
+				};
+
+				auto args = new Args;
+				auto file_fd = make_the_file();
+				if(in_fd != os::FD_NONE)
+				{
+					args->in_fd = os::dupe_fd(in_fd);
+					args->out_fd = file_fd;
+				}
+				else if(out_fd != os::FD_NONE)
+				{
+					args->in_fd = file_fd;
+					args->out_fd = os::dupe_fd(out_fd);
+				}
+				else
+				{
+					impl::int_error("unreachable");
+				}
+
+				auto proc = CreateThread(
+					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					0,          // DWORD                    dwStackSize
+					func,       // LPTHREAD_START_ROUTINE   lpStartAddress
+					args,       // LPVOID                   lpParameter
+					0,          // DWORD                    dwCreationFlags
+					nullptr     // LPDWORD                  lpThreadId
+				);
+
+				if(proc == os::PROC_NONE)
+					int_error("CreateThread(): {}", GetLastErrorAsString());
+
+				return proc;
+
+			#else
 
 				if(auto child = fork(); child < 0)
 				{
@@ -2550,7 +2619,12 @@ namespace nabs
 			}
 			else if(this->type() == TYPE_SPLIT)
 			{
+				if(in_fd == os::FD_NONE)
+					int_error("split() cannot be the first item in a pipeline");
+
 			#if defined(_WIN32)
+				if(out_fd == os::FD_NONE)
+					out_fd = STDOUT_FILENO;
 
 				// since we cannot fork(), we just use a thread. this is necessary
 				// so we can return and let the rest of the pipeline proceed. since
@@ -2561,27 +2635,35 @@ namespace nabs
 				// responsible for freeing it. this is because it executes in a separate thread,
 				// so we cannot allocate it on this stack.
 				auto args = new SplitProgArgs;
-				args->read_fd = in_fd;
-				args->write_fd = out_fd;
-				args->split_vals = &this->split_vals;
-				args->split_ptrs = &this->split_ptrs;
+				args->read_fd = os::dupe_fd(in_fd);
+				args->write_fd = os::dupe_fd(out_fd);
+				args->split_vals = this->split_vals;
+				args->split_ptrs = this->split_ptrs;
 
-				// TODO: need to disable inheritance on the child_close handle
+				auto func = [](void* arg) -> DWORD {
+					auto args = reinterpret_cast<SplitProgArgs*>(arg);
+					split_transfer(*args);
+					os::close_file(args->read_fd);
+					os::close_file(args->write_fd);
 
-				auto func = reinterpret_cast<LPTHREAD_START_ROUTINE>(&split_transfer);
+					delete args;
+					return 0;
+				};
 
 				auto proc = CreateThread(
-					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
-					0,          // DWORD                    dwStackSize
-					func,       // LPTHREAD_START_ROUTINE   lpStartAddress
-					args,       // LPVOID                   lpParameter
-					0,          // DWORD                    dwCreationFlags
-					nullptr     // LPDWORD                  lpThreadId
+					nullptr,            // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					0,                  // DWORD                    dwStackSize
+					func,               // LPTHREAD_START_ROUTINE   lpStartAddress
+					args,               // LPVOID                   lpParameter
+					CREATE_SUSPENDED,   // DWORD                    dwCreationFlags
+					nullptr             // LPDWORD                  lpThreadId
 				);
 
 				if(proc == os::PROC_NONE)
 					int_error("CreateThread(): {}", GetLastErrorAsString());
 
+				// since we are not in a separate process, we cannot close in_fd nor out_fd.
+				ResumeThread(proc);
 				return proc;
 
 			#else
@@ -2594,9 +2676,6 @@ namespace nabs
 				{
 					if(child_close != os::FD_NONE)
 						os::close_file(child_close);
-
-					if(in_fd == os::FD_NONE)
-						int_error("tee() cannot be the first item in a pipeline");
 
 					SplitProgArgs args { };
 					args.read_fd = in_fd;
@@ -2638,7 +2717,6 @@ namespace nabs
 
 			for(size_t i = 0; i < this->parts.size(); i++)
 			{
-				bool did_file = false;
 				bool is_last = (i == this->parts.size() - 1);
 
 				auto [ pipe_read, pipe_write ] = os::make_pipe();
@@ -2664,9 +2742,6 @@ namespace nabs
 				predecessor_pipe = pipe_read;
 				if(!is_last)
 					os::close_file(pipe_write);
-
-				if(did_file)
-					i += 1;
 			}
 
 			os::close_file(predecessor_pipe);
@@ -2792,17 +2867,6 @@ namespace nabs
 		});
 	}
 
-	template <typename... Args>
-	inline impl::Pipeline tee(Args&&... args)
-	{
-		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
-			"tee() requires std::filesystem::path");
-
-		return impl::Pipeline({
-			impl::Part::of_split(std::vector<impl::Pipeline> { nabs::file(args)... }, { })
-		});
-	}
-
 	namespace impl
 	{
 		template <typename T>
@@ -2830,6 +2894,10 @@ namespace nabs
 	template <typename... Args>
 	inline impl::Pipeline split(Args&&... args)
 	{
+	#if defined(_WIN32)
+		static_assert(std::conjunction_v<std::is_same<int, char>>, "split() does not work on windows");
+	#endif
+
 		static_assert(sizeof...(args) > 0, "split() requires at least one argument");
 
 		std::vector<impl::Pipeline> vals;
@@ -2839,6 +2907,21 @@ namespace nabs
 
 		return impl::Pipeline({
 			impl::Part::of_split(std::move(vals), std::move(ptrs))
+		});
+	}
+
+	template <typename... Args>
+	inline impl::Pipeline tee(Args&&... args)
+	{
+	#if defined(_WIN32)
+		static_assert(std::conjunction_v<std::is_same<int, char>>, "tee() does not work on windows");
+	#endif
+
+		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
+			"tee() requires std::filesystem::path");
+
+		return impl::Pipeline({
+			impl::Part::of_split(std::vector<impl::Pipeline> { nabs::file(args)... }, { })
 		});
 	}
 }
