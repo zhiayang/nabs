@@ -6,18 +6,10 @@
 *.cpp.d
 *.c.d
 *.log
-
-!build/
-
-build/*
-!build/assets/
+*.obj
 
 *.gch
 *.pch
 *.sublime-project
 *.sublime-workspace
-**/.vscode/ipch
-dump
-.vscode
-run.fish
-*.code-workspace
+

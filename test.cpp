@@ -8,8 +8,10 @@ int main()
 {
 	using namespace nabs;
 
-	// auto x = cmd("cat", "test.cpp") | split(file("asdf.txt"), file("bsdf.txt")) | cmd("hexdump", "-C");
-	// zpr::println("status = {}", x.run());
+	// auto x = cmd("type", "test.cpp") | split(file("asdf.txt"), file("bsdf.txt")) | cmd("hexdump", "-C");
 
-	compile_files({ }, "owo", "owo.c", "uwu.c");
+	auto x = file("test.cpp") | cmd("reverse") | cmd("hexdump", "-C") | file("foozle.txt");
+	zpr::println("status = {}", x.run());
+
+	// compile_files({ }, "owo", "owo.c", "uwu.c");
 }

@@ -38,6 +38,19 @@
 
 #pragma once
 
+// this needs to appear above any C++ STL header.
+#if defined(_WIN32)
+
+#if defined(_HAS_EXCEPTIONS)
+#undef _HAS_EXCEPTIONS
+#endif
+
+#define _HAS_EXCEPTIONS 0
+
+#endif
+
+
+
 /*
 	zpr is included here to maintain a single-header strategy.
 	it is available from https://github.com/zhiayang/ztl
@@ -1932,19 +1945,58 @@ namespace zpr
 #include <filesystem>
 #include <type_traits>
 
-#if defined(_WIN32)
-
-#error "windows not supported yet"
-
-#else
-
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <assert.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+
+#if defined(_WIN32)
+
+#include <io.h>
+
+#define WIN32_LEAN_AND_MEAN 1
+#define NOMINMAX            1
+#include <windows.h>
+
+static constexpr int STDIN_FILENO   = 0;
+static constexpr int STDOUT_FILENO  = 1;
+static constexpr int STDERR_FILENO  = 2;
+
+using ssize_t = long long;
+
+#if 0
+LPSTR GetLastErrorAsString()
+{
+	// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
+
+	DWORD errorMessageId = GetLastError();
+	assert(errorMessageId != 0);
+
+	LPSTR messageBuffer = nullptr;
+
+	DWORD size = FormatMessage(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		nullptr, errorMessageId, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+		reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
+
+	return messageBuffer;
+}
+#else
+DWORD GetLastErrorAsString()
+{
+	// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
+
+	return GetLastError();
+}
+#endif
+
+#else
+
+#include <unistd.h>
 
 #endif // _WIN32
 
@@ -1976,11 +2028,17 @@ namespace nabs
 	{
 		struct FileOpenFlags
 		{
-			bool need_write = false;
-			bool should_create = false;
-			bool append_mode = false;
-			bool truncate_mode = false;
-			int create_perms = 0664;
+			bool _need_write = false;
+			bool _should_create = false;
+			bool _append_mode = false;
+			bool _truncate_mode = false;
+			int _create_perms = 0664;
+
+			FileOpenFlags& needs_write(bool x)      { _need_write = x; return *this; }
+			FileOpenFlags& should_create(bool x)    { _should_create = x; return *this; }
+			FileOpenFlags& append_mode(bool x)      { _append_mode = x; return *this; }
+			FileOpenFlags& truncate_mode(bool x)    { _truncate_mode = x; return *this; }
+			FileOpenFlags& create_perms(int x)      { _create_perms = x; return *this; }
 		};
 	}
 
@@ -1999,26 +2057,106 @@ namespace nabs
 {
 	namespace os
 	{
+		using Fd = int;
+		static constexpr Fd FD_NONE = -1;
+
+		struct PipeDes
+		{
+			Fd read_end;
+			Fd write_end;
+		};
+
 		#if defined(_WIN32)
 
+			using Proc = HANDLE;
+			static constexpr Proc PROC_NONE = nullptr;
+
+			static size_t PIPE_BUFFER_SIZE = 16384;
+
+			inline ssize_t fd_read(Fd fd, void* buf, size_t len)
+			{
+				return static_cast<ssize_t>(_read(fd, buf, len));
+			}
+
+			inline ssize_t fd_write(Fd fd, void* buf, size_t len)
+			{
+				return static_cast<ssize_t>(_write(fd, buf, len));
+			}
+
+			inline PipeDes make_pipe()
+			{
+				if(int p[2]; _pipe(p, PIPE_BUFFER_SIZE, _O_BINARY) < 0)
+				{
+					impl::int_error("_pipe(): {}", strerror(errno));
+				}
+				else
+				{
+					// O_NOINHERIT is functionally CLOEXEC, so no need to fcntl it
+					return PipeDes { p[0], p[1] };
+				}
+			}
+
+			inline Fd open_file(const char* path, FileOpenFlags fof)
+			{
+				int flags = 0;
+
+				if(fof._need_write)         flags |= _O_RDWR;
+				else                        flags |= _O_RDONLY;
+
+				if(fof._should_create)      flags |= _O_CREAT;
+				if(fof._truncate_mode)      flags |= _O_TRUNC;
+				else if(fof._append_mode)   flags |= _O_APPEND;
+
+				int fd = 0;
+				if(fof._should_create)
+					fd = _open(path, flags, _S_IREAD | _S_IWRITE);
+
+				else
+					fd = _open(path, flags);
+
+				if(fd < 0)
+					impl::int_error("open('{}'): {}", path, strerror(errno));
+
+				return fd;
+			}
+
+			inline int wait_for_pid(Proc proc)
+			{
+				auto result = WaitForSingleObject(proc, INFINITE);
+				if(result == WAIT_FAILED)
+					impl::int_error("WaitForSingleObject(): {}", GetLastErrorAsString());
+
+				DWORD status = 0;
+				if(!GetExitCodeProcess(proc, &status))
+					impl::int_error("GetExitCodeProcess(): {}", GetLastErrorAsString());
+
+				CloseHandle(proc);
+				return static_cast<int>(status);
+			}
+
 		#else
+
 			using Fd = int;
 			static constexpr Fd FD_NONE = -1;
 
 			using Proc = pid_t;
 			static constexpr Proc PROC_NONE = -1;
 
-			struct PipeDes
+			inline ssize_t fd_read(Fd fd, void* buf, size_t len)
 			{
-				Fd read_end;
-				Fd write_end;
-			};
+				return read(fd, buf, len);
+			}
+
+			inline ssize_t fd_write(Fd fd, void* buf, size_t len)
+			{
+				return write(fd, buf, len);
+			}
 
 			inline PipeDes make_pipe()
 			{
 				if(int p[2]; pipe(p) < 0)
 				{
-					impl::int_error("Pipeline(): {}", strerror(errno));
+					impl::int_error("pipe(): {}", strerror(errno));
 				}
 				else
 				{
@@ -2038,15 +2176,15 @@ namespace nabs
 			{
 				int flags = 0;
 
-				if(fof.need_write)  flags |= O_RDWR;
-				else                flags |= O_RDONLY;
+				if(fof._need_write)         flags |= O_RDWR;
+				else                        flags |= O_RDONLY;
 
-				if(fof.should_create)   flags |= O_CREAT;
-				if(fof.truncate_mode)   flags |= O_TRUNC;
-				else if(fof.append_mode)flags |= O_APPEND;
+				if(fof._should_create)      flags |= O_CREAT;
+				if(fof._truncate_mode)      flags |= O_TRUNC;
+				else if(fof._append_mode)   flags |= O_APPEND;
 
 				int fd = 0;
-				if(fof.should_create)
+				if(fof._should_create)
 					fd = open(path, flags, fof.create_perms);
 
 				else
@@ -2057,6 +2195,16 @@ namespace nabs
 
 				return fd;
 			}
+
+			inline int wait_for_pid(Proc proc)
+			{
+				int status = 0;
+				if(waitpid(proc, &status, 0) < 0)
+					impl::int_error("waitpid({}): {}", proc, strerror(errno));
+
+				return status;
+			}
+
 		#endif // _WIN32
 	}
 
@@ -2068,6 +2216,8 @@ namespace nabs
 
 		struct Pipeline
 		{
+			Pipeline(std::vector<Part> parts) : parts(std::move(parts)) { }
+
 			bool empty() const { return this->parts.empty(); }
 
 			int run();
@@ -2092,6 +2242,62 @@ namespace nabs
 			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
 			os::Proc runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
 
+		#if defined(_WIN32)
+
+			std::string make_args()
+			{
+				std::string ret;
+
+				auto quote_thing = [](const std::string& s) -> std::string {
+					if(s.find_first_of(" \t\n\v\f") == std::string::npos)
+						return s;
+
+					std::string ret = "\"";
+					int backs = 0;
+					for(size_t i = 0; i < s.size(); i++)
+					{
+						char c = s[i];
+
+						if(c == '\\')
+						{
+							backs++;
+							continue;
+						}
+
+						if(i == s.size() - 1)
+						{
+							ret.append(backs * 2, '\\');
+						}
+						else if(c == '"')
+						{
+							ret.append(backs * 2, '\\');
+							ret += '"';
+						}
+						else
+						{
+							ret.append(backs, '\\');
+							ret += c;
+						}
+
+						backs = 0;
+					}
+
+					ret += '"';
+					return ret;
+				};
+
+
+				ret += quote_thing(this->name);
+				for(auto& arg : this->arguments)
+				{
+					ret += " ";
+					ret += quote_thing(arg);
+				}
+
+				return ret;
+			}
+
+		#else
 			char** make_args()
 			{
 				char** args_array = new char*[this->arguments.size() + 2];
@@ -2102,10 +2308,11 @@ namespace nabs
 				args_array[this->arguments.size() + 1] = nullptr;
 				return args_array;
 			}
+		#endif // _WIN32
 
-			static constexpr int TYPE_PROC = 1;
-			static constexpr int TYPE_FILE = 2;
-			static constexpr int TYPE_SPLIT  = 3;
+			static constexpr int TYPE_PROC  = 1;
+			static constexpr int TYPE_FILE  = 2;
+			static constexpr int TYPE_SPLIT = 3;
 
 			int type() const  { return this->_type; }
 			int flags() const { return this->_flags; }
@@ -2183,6 +2390,52 @@ namespace nabs
 
 			if(this->type() == TYPE_PROC)
 			{
+			#if defined(_WIN32)
+
+				auto get_handle = [](os::Fd fd, HANDLE def) -> HANDLE {
+					if(fd == os::FD_NONE)
+						return def;
+
+					else
+						return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+				};
+
+
+				STARTUPINFO info;
+				memset(&info, 0, sizeof(info));
+
+				info.cb = sizeof(STARTUPINFO);
+				info.hStdInput  = get_handle(in_fd, GetStdHandle(STD_INPUT_HANDLE));
+				info.hStdOutput = get_handle(out_fd, GetStdHandle(STD_OUTPUT_HANDLE));
+				info.hStdError  = get_handle(err_fd, GetStdHandle(STD_ERROR_HANDLE));
+				info.dwFlags |= STARTF_USESTDHANDLES;
+
+				PROCESS_INFORMATION procinfo;
+				memset(&procinfo, 0, sizeof(procinfo));
+
+				auto cmdline = this->make_args();
+				auto cmdline_ = const_cast<LPSTR>(cmdline.c_str());
+
+				auto result = CreateProcessA(
+					nullptr,    // LPCSTR                   lpApplicationName
+					cmdline_,   // LPSTR                    lpCommandLine
+					nullptr,    // LPSECURITY_ATTRIBUTES    lpProcessAttributes
+					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					true,       // BOOL                     bInheritHandles
+					0,          // DWORD                    dwCreationFlags
+					nullptr,    // LPVOID                   lpEnvironment
+					nullptr,    // LPCSTR                   lpCurrentDirectory
+					&info,      // LPSTARTUPINFO            lpStartupInfo
+					&procinfo   // LPPROCESS_INFORMATION    lpProcessInformation
+				);
+
+				if(!result)
+					impl::int_error("CreateProcess('{}'): {}", cmdline, GetLastErrorAsString());
+
+				CloseHandle(procinfo.hThread);
+				return procinfo.hProcess;
+
+			#else
 				if(auto child = fork(); child < 0)
 				{
 					int_error("fork(): {}", strerror(errno));
@@ -2215,18 +2468,19 @@ namespace nabs
 				{
 					return child;
 				}
+			#endif // _WIN32
 			}
 			else if(this->type() == TYPE_FILE)
 			{
 				// if the in_fd is not -1, then we need to write to the file.
-				os::Fd file = os::open_file(this->name.c_str(), os::FileOpenFlags {
-					.need_write = (in_fd != os::FD_NONE),
+				os::Fd file = os::open_file(this->name.c_str(), os::FileOpenFlags()
+					.needs_write(in_fd != os::FD_NONE)
 
 					// TODO: make a way to specify the file opening flags/modes
-					.append_mode = true,    // append by default
-					.should_create = true,  // create by default
-					.create_perms = 0664
-				});
+					.append_mode(true)      // append by default
+					.should_create(true)    // create by default
+					.create_perms(0664)
+				);
 
 				if(in_fd != os::FD_NONE)
 					dupe_fd(file, in_fd, /* close_src: */ false);
@@ -2239,6 +2493,13 @@ namespace nabs
 			}
 			else if(this->type() == TYPE_SPLIT)
 			{
+
+			#if defined(_WIN32)
+
+				int_error("split() not supported on windows yet");
+				return os::PROC_NONE;
+
+			#else
 				// basically we have to emulate what the `tee` program does.
 				if(auto child = fork(); child < 0)
 				{
@@ -2251,6 +2512,16 @@ namespace nabs
 
 					std::vector<os::Fd> fds;
 					std::vector<os::Proc> children;
+
+					// it's basically like a normal process
+					if(in_fd != os::FD_NONE)
+						dupe_fd(in_fd, STDIN_FILENO);
+
+					if(out_fd != os::FD_NONE)
+						dupe_fd(out_fd, STDOUT_FILENO);
+
+					if(err_fd != os::FD_NONE)
+						dupe_fd(err_fd, STDERR_FILENO);
 
 					auto iterate_splits = [&fds, &children](Pipeline* pl) {
 
@@ -2285,22 +2556,11 @@ namespace nabs
 							iterate_splits(&sp);
 					}
 
-
-					// it's basically like a normal process
-					if(in_fd != os::FD_NONE)
-						dupe_fd(in_fd, STDIN_FILENO);
-
-					if(out_fd != os::FD_NONE)
-						dupe_fd(out_fd, STDOUT_FILENO);
-
-					if(err_fd != os::FD_NONE)
-						dupe_fd(err_fd, STDERR_FILENO);
-
 					split_program(std::move(fds));
 
 					// wait for all the children...
 					for(auto c : children)
-						waitpid(c, nullptr, 0);
+						os::wait_for_pid(c);
 
 					exit(0);
 				}
@@ -2308,6 +2568,7 @@ namespace nabs
 				{
 					return child;
 				}
+			#endif
 			}
 			else
 			{
@@ -2321,11 +2582,7 @@ namespace nabs
 			if(child_pid == os::PROC_NONE)
 				return 0;
 
-			int status = 0;
-		 	if(waitpid(child_pid, &status, 0) < 0)
-		 		int_error("waitpid({}): {}", child_pid, strerror(errno));
-
-		 	return WEXITSTATUS(status);
+			return os::wait_for_pid(child_pid);
 		}
 
 		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd)
@@ -2347,10 +2604,9 @@ namespace nabs
 						int_error("file() must be the last item in a tee()");
 
 					// open this file in read mode.
-					os::Fd file = os::open_file(this->parts[0].name.c_str(), os::FileOpenFlags {
-						.need_write = false,
-						.should_create = false,
-					});
+					os::Fd file = os::open_file(this->parts[0].name.c_str(),
+						os::FileOpenFlags().needs_write(false).should_create(false)
+					);
 
 					predecessor_pipe = file;
 					start = 1;
@@ -2432,10 +2688,10 @@ namespace nabs
 
 			int status = 0;
 			for(auto c : children)
-				waitpid(c, &status, 0);
+				status = os::wait_for_pid(c);
 
 			// just use the last one.
-			return WEXITSTATUS(status);
+			return status;
 		}
 
 		inline void split_program(std::vector<os::Fd> fds)
@@ -2443,19 +2699,19 @@ namespace nabs
 			char buf[4096] { };
 			while(true)
 			{
-				auto n = read(STDIN_FILENO, buf, 4096);
+				auto n = os::fd_read(STDIN_FILENO, buf, 4096);
 				if(n <= 0)
 				{
 					if(n < 0) zpr::fprintln(stderr, "tee(stdin): read error: {}", strerror(errno));
 					break;
 				}
 
-				if(write(STDOUT_FILENO, buf, n) < 0)
+				if(os::fd_write(STDOUT_FILENO, buf, n) < 0)
 					zpr::fprintln(stderr, "tee(stdout): write error: {}", strerror(errno));
 
 				for(auto& f : fds)
 				{
-					if(write(f, buf, n) < 0)
+					if(os::fd_write(f, buf, n) < 0)
 						zpr::fprintln(stderr, "tee({}): write error: {}", f, strerror(errno));
 				}
 			}
@@ -2471,23 +2727,23 @@ namespace nabs
 		static_assert(((std::is_convertible_v<Args, std::string>) && ...),
 			"arguments to cmd() must be convertible to std::string");
 
-		return impl::Pipeline { .parts = {
+		return impl::Pipeline({
 			impl::Part::of_command(std::move(exe), std::vector<std::string>{std::forward<Args>(args)...})
-		} };
+		});
 	}
 
 	inline impl::Pipeline cmd(std::string exe, std::vector<std::string> args)
 	{
-		return impl::Pipeline { .parts = {
+		return impl::Pipeline({
 			impl::Part::of_command(std::move(exe), std::move(args))
-		} };
+		});
 	}
 
 	inline impl::Pipeline file(fs::path path)
 	{
-		return impl::Pipeline { .parts = {
+		return impl::Pipeline({
 			impl::Part::of_file(path.string())
-		} };
+		});
 	}
 
 	template <typename... Args>
@@ -2496,9 +2752,9 @@ namespace nabs
 		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
 			"tee() requires std::filesystem::path");
 
-		return impl::Pipeline { .parts = {
+		return impl::Pipeline({
 			impl::Part::of_split(std::vector<impl::Pipeline> { nabs::file(args)... }, { })
-		} };
+		});
 	}
 
 	namespace impl
@@ -2535,9 +2791,9 @@ namespace nabs
 
 		impl::split_helper(vals, ptrs, std::forward<Args>(args)...);
 
-		return impl::Pipeline { .parts = {
+		return impl::Pipeline({
 			impl::Part::of_split(std::move(vals), std::move(ptrs))
-		} };
+		});
 	}
 }
 
@@ -2610,7 +2866,7 @@ namespace nabs
 
 	#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__)
 
-		#error "msvc is not supported yet"
+		impl::int_error("msvc is not supported yet");
 
 	#else
 		// basically, find 'cc' in the path.
@@ -2769,22 +3025,23 @@ namespace nabs::dep
 		bool phony = false;
 
 		std::vector<Item> deps;
+
+		Item() { }
+		Item(bool phony, std::string name, fs::path path)
+			: path(std::move(path))
+			, name(std::move(name))
+			, phony(phony)
+		{ }
 	};
 
 	inline Item create(fs::path path)
 	{
-		return Item {
-			.path = std::move(path),
-			.phony = false
-		};
+		return Item(/* phony: */ false, "", std::move(path));
 	}
 
 	inline Item create_phony(std::string name)
 	{
-		return Item {
-			.name = std::move(name),
-			.phony = true
-		};
+		return Item(/* phony: */ true, std::move(name), "");
 	}
 
 	namespace impl
