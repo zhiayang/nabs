@@ -8,16 +8,18 @@ int main()
 {
 	using namespace nabs;
 
-	// auto x = file("test.cpp") | split(file("asdf.txt"), file("bsdf.txt")) | cmd("hexdump", "-C") | file("foozle.txt");
-	auto x
-		= cmd("cat", "test.cpp")
-		| split(
-			cmd("rev") | file("asdf.txt"),
-			file("bsdf.txt"))
-		| cmd("hexdump", "-C")
-		| file("foozle.txt");
+	// auto x
+	// 	= cmd("cat", "test.cpp")
+	// 	| split(
+	// 		cmd("reverse") | file("asdf.txt"),
+	// 		file("bsdf.txt"))
+	// 	| cmd("hexdump", "-C")
+	// 	| file("foozle.txt");
 
+	auto x = file("test.cpp") | cmd("reverse") | cmd("hexdump", "-C") | file("foozle.txt");
 	zpr::println("status = {}", x.run());
 
+	auto c = find_c_compiler().path.string();
+	zpr::println("path = {}", c);
 	// compile_files({ }, "owo", "owo.c", "uwu.c");
 }
