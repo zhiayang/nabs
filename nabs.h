@@ -1939,6 +1939,9 @@ namespace zpr
 
 
 
+
+
+
 #include <set>
 #include <string>
 #include <vector>
@@ -2071,7 +2074,7 @@ namespace nabs
 			Fd write_end;
 		};
 
-		inline ssize_t fd_read(Fd fd, void* buf, size_t len)
+		inline ssize_t read_file(Fd fd, void* buf, size_t len)
 		{
 		#if defined(_WIN32)
 			return static_cast<ssize_t>(_read(fd, buf, len));
@@ -2080,7 +2083,7 @@ namespace nabs
 		#endif
 		}
 
-		inline ssize_t fd_write(Fd fd, void* buf, size_t len)
+		inline ssize_t write_file(Fd fd, void* buf, size_t len)
 		{
 		#if defined(_WIN32)
 			return static_cast<ssize_t>(_write(fd, buf, len));
@@ -2130,14 +2133,17 @@ namespace nabs
 		#if defined(_WIN32)
 			_close(fd);
 		#else
-			close(fd);
+			if(close(fd) < 0)
+				impl::int_error("close(): {}", strerror(errno));
 		#endif
 		}
 
 		inline Fd open_file(const char* path, FileOpenFlags fof)
 		{
 			int flags = 0;
+			Fd fd = 0;
 
+		#if defined(_WIN32)
 			if(fof._need_write)         flags |= _O_RDWR;
 			else                        flags |= _O_RDONLY;
 
@@ -2145,8 +2151,6 @@ namespace nabs
 			if(fof._truncate_mode)      flags |= _O_TRUNC;
 			else if(fof._append_mode)   flags |= _O_APPEND;
 
-			Fd fd = 0;
-		#if defined(_WIN32)
 			if(fof._should_create)
 				fd = _open(path, flags, _S_IREAD | _S_IWRITE);
 			else
@@ -2156,8 +2160,15 @@ namespace nabs
 				impl::int_error("open('{}'): {}", path, strerror(errno));
 
 		#else
+			if(fof._need_write)         flags |= O_RDWR;
+			else                        flags |= O_RDONLY;
+
+			if(fof._should_create)      flags |= O_CREAT;
+			if(fof._truncate_mode)      flags |= O_TRUNC;
+			else if(fof._append_mode)   flags |= O_APPEND;
+
 			if(fof._should_create)
-				fd = open(path, flags, fof.create_perms);
+				fd = open(path, flags, fof._create_perms);
 			else
 				fd = open(path, flags);
 
@@ -2201,6 +2212,9 @@ namespace nabs
 		struct Part;
 		struct SplitProgArgs;
 
+		inline void split_transfer(SplitProgArgs args);
+		inline void fd_transfer(os::Fd in_fd, os::Fd out_fd);
+
 		struct Pipeline
 		{
 			Pipeline(std::vector<Part> parts) : parts(std::move(parts)) { }
@@ -2213,15 +2227,10 @@ namespace nabs
 			std::vector<Part> parts;
 
 			friend struct Part;
-
-		#if defined(_WIN32)
-			friend inline DWORD WINAPI split_program(SplitProgArgs* args);
-		#else
-			friend inline void split_program(SplitProgArgs* args);
-		#endif // _WIN32
+			friend inline void split_transfer(SplitProgArgs args);
 
 		private:
-			std::vector<os::Proc> runAsync(os::Fd in_fd);
+			std::vector<os::Proc> runAsync(os::Fd in_fd, os::Fd close_in_children);
 		};
 
 		struct Part
@@ -2233,7 +2242,7 @@ namespace nabs
 			Part& operator= (const Part&) = default;
 
 			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
-			os::Proc runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
+			os::Proc runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
 
 		#if defined(_WIN32)
 
@@ -2354,10 +2363,10 @@ namespace nabs
 		{
 			os::Fd read_fd;
 			os::Fd write_fd;
-			std::vector<os::Fd>* write_fds;
+			std::vector<os::Fd> write_fds;
 
-			std::vector<impl::Pipeline>* split_vals;
-			std::vector<impl::Pipeline*>* split_ptrs;
+			std::vector<impl::Pipeline> split_vals;
+			std::vector<impl::Pipeline*> split_ptrs;
 		};
 
 
@@ -2381,7 +2390,7 @@ namespace nabs
 		}
 
 
-		os::Proc Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
+		os::Proc Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
 		{
 			auto dupe_fd = [](int src, int dst, bool close_src = true) {
 				// dup2 closes dst for us.
@@ -2411,6 +2420,8 @@ namespace nabs
 				info.hStdOutput = get_handle(out_fd, GetStdHandle(STD_OUTPUT_HANDLE));
 				info.hStdError  = get_handle(err_fd, GetStdHandle(STD_ERROR_HANDLE));
 				info.dwFlags |= STARTF_USESTDHANDLES;
+
+				// TODO: need to disable inheritance on the child_close handle
 
 				PROCESS_INFORMATION procinfo;
 				memset(&procinfo, 0, sizeof(procinfo));
@@ -2444,6 +2455,9 @@ namespace nabs
 				}
 				else if(child == 0)
 				{
+					if(child_close != os::FD_NONE)
+						os::close_file(child_close);
+
 					if(in_fd != os::FD_NONE)
 					{
 						dupe_fd(in_fd, STDIN_FILENO);
@@ -2474,27 +2488,65 @@ namespace nabs
 			}
 			else if(this->type() == TYPE_FILE)
 			{
-				// if the in_fd is not -1, then we need to write to the file.
-				os::Fd file = os::open_file(this->name.c_str(), os::FileOpenFlags()
-					.needs_write(in_fd != os::FD_NONE)
+				// wrap it in a lambda so we can call it in the child only. it's the same
+				// code for both windows and unix anyway.
 
-					// TODO: make a way to specify the file opening flags/modes
-					.append_mode(true)      // append by default
-					.should_create(true)    // create by default
-					.create_perms(0664)
-				);
+				auto make_the_file = [this, &in_fd]() -> os::Fd {
+					// if the in_fd is not -1, then we need to write to the file.
+					return os::open_file(this->name.c_str(), os::FileOpenFlags()
+						.needs_write(in_fd != os::FD_NONE)
 
-				zpr::fprintln(stderr, "opened '{}' and my handle is {}", this->name, (HANDLE) _get_osfhandle(file));
-				zpr::fprintln(stderr, "in_fd = {}", (HANDLE) _get_osfhandle(in_fd));
+						// TODO: make a way to specify the file opening flags/modes
+						.append_mode(true)      // append by default
+						.should_create(true)    // create by default
+						.create_perms(0664)
+					);
+				};
 
-				if(in_fd != os::FD_NONE)
-					dupe_fd(file, in_fd, /* close_src: */ false);
+			#if defined(_WIN32)
+				#error asdf
+			#else
 
-				if(out_fd != os::FD_NONE)
-					dupe_fd(file, out_fd, /* close_src: */ false);
+				// files cannot be both read and write (use split/tee for that)
+				// while this is an "artificial" limitation, i'm going to enforce it for now.
+				if(in_fd != os::FD_NONE && out_fd != os::FD_NONE)
+					impl::int_error("file() cannot appear in the middle of a pipeline");
 
-				os::close_file(file);
-				return os::PROC_NONE;
+				if(auto child = fork(); child < 0)
+				{
+					impl::int_error("fork(): {}", strerror(errno));
+				}
+				else if(child == 0)
+				{
+					if(child_close != os::FD_NONE)
+						os::close_file(child_close);
+
+					auto file_fd = make_the_file();
+
+					if(in_fd != os::FD_NONE)
+					{
+						impl::fd_transfer(in_fd, file_fd);
+						os::close_file(in_fd);
+					}
+					else if(out_fd != os::FD_NONE)
+					{
+						impl::fd_transfer(file_fd, out_fd);
+						os::close_file(out_fd);
+					}
+					else
+					{
+						impl::int_error("unreachable");
+					}
+
+					os::close_file(file_fd);
+					exit(0);
+				}
+				else
+				{
+					return child;
+				}
+
+			#endif
 			}
 			else if(this->type() == TYPE_SPLIT)
 			{
@@ -2505,7 +2557,7 @@ namespace nabs
 				// CreateThread also returns a HANDLE, we can also use WaitForObject
 				// to wait for it, which is actually super convenient. thanks, bill gates.
 
-				// for windows, this needs to be heap-allocated, and we make the split_program
+				// for windows, this needs to be heap-allocated, and we make the split_transfer
 				// responsible for freeing it. this is because it executes in a separate thread,
 				// so we cannot allocate it on this stack.
 				auto args = new SplitProgArgs;
@@ -2514,7 +2566,9 @@ namespace nabs
 				args->split_vals = &this->split_vals;
 				args->split_ptrs = &this->split_ptrs;
 
-				auto func = reinterpret_cast<LPTHREAD_START_ROUTINE>(&split_program);
+				// TODO: need to disable inheritance on the child_close handle
+
+				auto func = reinterpret_cast<LPTHREAD_START_ROUTINE>(&split_transfer);
 
 				auto proc = CreateThread(
 					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
@@ -2538,32 +2592,19 @@ namespace nabs
 				}
 				else if(child == 0)
 				{
+					if(child_close != os::FD_NONE)
+						os::close_file(child_close);
+
 					if(in_fd == os::FD_NONE)
 						int_error("tee() cannot be the first item in a pipeline");
 
-					std::vector<os::Fd> fds;
-					std::vector<os::Proc> children;
-
-					// it's basically like a normal process
-					if(in_fd != os::FD_NONE)
-						dupe_fd(in_fd, STDIN_FILENO);
-
-					if(out_fd != os::FD_NONE)
-						dupe_fd(out_fd, STDOUT_FILENO);
-
-					if(err_fd != os::FD_NONE)
-						dupe_fd(err_fd, STDERR_FILENO);
-
-					// for unix, we can just allocate this on the stack, since this is run synchronously
-					// inside the fork()-ed child process.
 					SplitProgArgs args { };
-					args.read_fd = STDIN_FILENO;
-					args.write_fd = STDOUT_FILENO;
-					args.write_fds = &fds;
-					args.split_vals = &this->split_vals;
-					args.split_ptrs = &this->split_ptrs;
+					args.read_fd = in_fd;
+					args.write_fd = out_fd;
+					args.split_vals = this->split_vals;
+					args.split_ptrs = this->split_ptrs;
 
-					split_program(&args);
+					impl::split_transfer(std::move(args));
 					exit(0);
 				}
 				else
@@ -2587,7 +2628,7 @@ namespace nabs
 			return os::wait_for_pid(child_pid);
 		}
 
-		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd)
+		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd, os::Fd close_in_children)
 		{
 			std::vector<os::Proc> children;
 			os::Fd predecessor_pipe = in_fd;
@@ -2595,59 +2636,12 @@ namespace nabs
 			if(this->empty())
 				int_error("unexpected empty pipeline");
 
-			size_t start = 0;
-			if(!this->parts.empty() && this->parts[0].type() == Part::TYPE_FILE)
-			{
-				if(this->parts.size() > 1)
-				{
-					// in this case, we should not have an `in_fd`, since that would conflict
-					// with the file.
-					if(in_fd != os::FD_NONE)
-						int_error("file() must be the last item in a tee()");
-
-					// open this file in read mode.
-					os::Fd file = os::open_file(this->parts[0].name.c_str(),
-						os::FileOpenFlags().needs_write(false).should_create(false)
-					);
-
-					predecessor_pipe = file;
-					start = 1;
-				}
-				else
-				{
-					// open this file as write mode.
-					// now, we just need to dup2 the file descriptor to the in_fd, and return immediately.
-					// by passing in_fd, we get the file to open in write mode.
-					zpr::fprintln(stderr, "opening file...");
-					this->parts[0].runAsync(in_fd, os::FD_NONE, os::FD_NONE);
-					return { };
-				}
-			}
-
-			for(size_t i = start; i < this->parts.size(); i++)
+			for(size_t i = 0; i < this->parts.size(); i++)
 			{
 				bool did_file = false;
 				bool is_last = (i == this->parts.size() - 1);
 
 				auto [ pipe_read, pipe_write ] = os::make_pipe();
-
-				// we need some special handling here if the output of this stage goes to a file.
-				// at the point of the fork, the parent (us) won't have the file opened, so even if
-				// we play with dup2() etc, the child will never be able to see the file. so, we need
-				// to scan-ahead and see if the next idiot is a file, and if so we must open it now.
-				if(!is_last && this->parts[i + 1].type() == Part::TYPE_FILE)
-				{
-					// 'run' the file (ie. setup the fds); the input to the file is the write end
-					// of *THIS* process's Pipeline (ie. output) -- so writing to it will write to the file,
-					// and the 'output' of the file will be the input of the *next* process -- so reading from
-					// it reads from the file.
-					this->parts[i + 1].runAsync(pipe_write, pipe_read, os::FD_NONE);
-					did_file = true;
-
-					// if this is not the last component, abort also.
-					if(i + 2 != this->parts.size())
-						int_error("unexpected file ('{}') in the middle of a pipeline", this->parts[i + 1].name);
-				}
 
 				if(is_last)
 				{
@@ -2655,12 +2649,11 @@ namespace nabs
 					pipe_write = os::FD_NONE;
 				}
 
-				// someone else should have caught this already.
-				assert(this->parts[i].type() != Part::TYPE_FILE);
-
 				// TODO: stderr is not handled here
 				// we don't really know how to link them together from proc to proc.
-				auto child = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE);
+				auto child = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE,
+					/* child_close: */ close_in_children);
+
 				if(child != os::PROC_NONE)
 					children.push_back(child);
 
@@ -2682,7 +2675,7 @@ namespace nabs
 
 		std::vector<os::Proc> Pipeline::runAsync()
 		{
-			return this->runAsync(os::FD_NONE);
+			return this->runAsync(os::FD_NONE, os::FD_NONE);
 		}
 
 		int Pipeline::run()
@@ -2697,82 +2690,63 @@ namespace nabs
 			return status;
 		}
 
-	#if defined(_WIN32)
-		#define FN_RETTY DWORD WINAPI
-	#else
-		#define FN_RETTY void
-	#endif
-
-		inline FN_RETTY split_program(SplitProgArgs* args)
+		inline void fd_transfer(os::Fd in_fd, os::Fd out_fd)
 		{
-	#undef FN_RETTY
+			char buf[4096] { };
+			while(true)
+			{
+				auto did = os::read_file(in_fd, buf, 4096);
+				if(did < 0)
+					impl::int_error("read(): {}", strerror(errno));
 
+				if(did == 0)
+					break;
+
+				if(os::write_file(out_fd, buf, did) < 0)
+					impl::int_error("write(): {}", strerror(errno));
+			}
+		}
+
+		inline void split_transfer(SplitProgArgs args)
+		{
 			std::vector<os::Fd> fds;
 			std::vector<os::Proc> children;
 
 			// because this is launched as a thread on windows,
 			// we also need to be responsible for actually firing off the
 			// pipelines here.
-			auto iterate_splits = [&args, &fds, &children](Pipeline* pl) {
+			auto iterate_splits = [&fds, &children](Pipeline* pl) {
 
 				assert(pl != nullptr);
 				auto [ p_read, p_write ] = os::make_pipe();
 
-				auto cs = pl->runAsync(p_read);
+				auto cs = pl->runAsync(p_read, /* close_in_children: */ p_write);
 				children.insert(children.end(), cs.begin(), cs.end());
-
-				// if the pipeline's first argument is passive, then we write directly into it.
-				// we rely on the pipeline's run() to perform dup2() to change our fd as appropriate.
-				if(pl->parts[0].is_passive())
-				{
-					os::close_file(p_write);
-					fds.push_back(p_read);
-				}
-				else
-				{
-					os::close_file(p_read);
-					fds.push_back(p_write);
-				}
+				fds.push_back(p_write);
 			};
 
-			for(auto& sp : *args->split_ptrs)
+			for(auto& sp : args.split_ptrs)
 				iterate_splits(sp);
 
-			for(auto& sp : *args->split_vals)
+			for(auto& sp : args.split_vals)
 				iterate_splits(&sp);
-
-			{
-				char buf[256];
-
-				auto h = (HANDLE) _get_osfhandle(args->read_fd);
-				zpr::fprintln(stderr, "reading: handle = {}", h);
-
-				DWORD len = 0;
-				if(!GetFinalPathNameByHandle(h, buf, len, 0))
-					impl::int_error("asdf: {}", GetLastErrorAsString());
-
-				zpr::fprintln(stderr, "handle = '{}'", buf);
-			}
 
 			char buf[4096] { };
 			while(true)
 			{
-				auto n = os::fd_read(args->read_fd, buf, 4096);
-				zpr::fprintln(stderr, "read: {} bytes", n);
+				auto n = os::read_file(args.read_fd, buf, 4096);
+				if(n < 0)
+					zpr::fprintln(stderr, "split(stdin): read error: {}", strerror(errno));
 
-				if(n <= 0)
-				{
-					if(n < 0) zpr::fprintln(stderr, "split(stdin): read error: {}", strerror(errno));
+				if(n == 0)
 					break;
-				}
 
-				zpr::fprintln(stderr, "read: {} bytes", n);
-				if(os::fd_write(args->write_fd, buf, n) < 0)
+				if(os::write_file(args.write_fd, buf, n) < 0)
 					zpr::fprintln(stderr, "split(stdout): write error: {}", strerror(errno));
 
 				for(auto& f : fds)
 				{
-					if(os::fd_write(f, buf, n) < 0)
+					if(os::write_file(f, buf, n) < 0)
 						zpr::fprintln(stderr, "split({}): write error: {}", f, strerror(errno));
 				}
 			}
@@ -2783,13 +2757,10 @@ namespace nabs
 			// wait for all the children...
 			for(auto c : children)
 				os::wait_for_pid(c);
-
-		#if defined(_WIN32)
-			delete args;
-			return 0;
-		#endif // _WIN32
 		}
 	}
+
+
 
 
 
