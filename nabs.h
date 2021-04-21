@@ -2048,165 +2048,152 @@ namespace nabs
 {
 	namespace os
 	{
+	#if defined(_WIN32)
+
+		using Fd = int;
+		static constexpr Fd FD_NONE = -1;
+
+		using Proc = HANDLE;
+		static constexpr Proc PROC_NONE = nullptr;
+
+		static size_t PIPE_BUFFER_SIZE = 16384;
+	#else
+		using Fd = int;
+		static constexpr Fd FD_NONE = -1;
+
+		using Proc = pid_t;
+		static constexpr Proc PROC_NONE = -1;
+	#endif
+
+		struct PipeDes
+		{
+			Fd read_end;
+			Fd write_end;
+		};
+
+		inline ssize_t fd_read(Fd fd, void* buf, size_t len)
+		{
 		#if defined(_WIN32)
+			return static_cast<ssize_t>(_read(fd, buf, len));
+		#else
+			return read(fd, buf, len);
+		#endif
+		}
 
-			using Fd = int;
-			static constexpr Fd FD_NONE = -1;
+		inline ssize_t fd_write(Fd fd, void* buf, size_t len)
+		{
+		#if defined(_WIN32)
+			return static_cast<ssize_t>(_write(fd, buf, len));
+		#else
+			return write(fd, buf, len);
+		#endif
+		}
 
-			struct PipeDes
+		inline PipeDes make_pipe()
+		{
+		#if defined(_WIN32)
+			if(int p[2]; _pipe(p, PIPE_BUFFER_SIZE, _O_BINARY) < 0)
+				impl::int_error("_pipe(): {}", strerror(errno));
+
+			else
 			{
-				Fd read_end;
-				Fd write_end;
-			};
+				// auto p_r = reinterpret_cast<HANDLE>(_get_osfhandle(p[0]));
+				// auto p_w = reinterpret_cast<HANDLE>(_get_osfhandle(p[1]));
 
-			using Proc = HANDLE;
-			static constexpr Proc PROC_NONE = nullptr;
+				// SetHandleInformation(p_r, HANDLE_FLAG_INHERIT, 0);
+				// SetHandleInformation(p_w, HANDLE_FLAG_INHERIT, 0);
 
-			static size_t PIPE_BUFFER_SIZE = 16384;
-
-			inline ssize_t fd_read(Fd fd, void* buf, size_t len)
-			{
-				return static_cast<ssize_t>(_read(fd, buf, len));
+				return PipeDes { p[0], p[1] };
 			}
-
-			inline ssize_t fd_write(Fd fd, void* buf, size_t len)
+		#else
+			if(int p[2]; pipe(p) < 0)
 			{
-				return static_cast<ssize_t>(_write(fd, buf, len));
+				impl::int_error("pipe(): {}", strerror(errno));
 			}
-
-			inline PipeDes make_pipe()
+			else
 			{
-				if(int p[2]; _pipe(p, PIPE_BUFFER_SIZE, _O_BINARY) < 0)
-				{
-					impl::int_error("_pipe(): {}", strerror(errno));
-				}
-				else
-				{
-					return PipeDes { p[0], p[1] };
-				}
+				// set the pipes to close on exec, so that we do not have dangling write ends
+				// left open in children.
+				if(fcntl(p[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(p[1], F_SETFD, FD_CLOEXEC) < 0)
+					impl::int_error("fcntl(FD_CLOEXEC): {}", strerror(errno));
+
+				return PipeDes {
+					.read_end = p[0],
+					.write_end = p[1]
+				};
 			}
+		#endif
+		}
 
-			inline Fd open_file(const char* path, FileOpenFlags fof)
-			{
-				int flags = 0;
+		inline void close_file(Fd fd)
+		{
+		#if defined(_WIN32)
+			_close(fd);
+		#else
+			close(fd);
+		#endif
+		}
 
-				if(fof._need_write)         flags |= _O_RDWR;
-				else                        flags |= _O_RDONLY;
+		inline Fd open_file(const char* path, FileOpenFlags fof)
+		{
+			int flags = 0;
 
-				if(fof._should_create)      flags |= _O_CREAT;
-				if(fof._truncate_mode)      flags |= _O_TRUNC;
-				else if(fof._append_mode)   flags |= _O_APPEND;
+			if(fof._need_write)         flags |= _O_RDWR;
+			else                        flags |= _O_RDONLY;
 
-				int fd = 0;
-				if(fof._should_create)
-					fd = _open(path, flags, _S_IREAD | _S_IWRITE);
+			if(fof._should_create)      flags |= _O_CREAT;
+			if(fof._truncate_mode)      flags |= _O_TRUNC;
+			else if(fof._append_mode)   flags |= _O_APPEND;
 
-				else
-					fd = _open(path, flags);
+			Fd fd = 0;
+		#if defined(_WIN32)
+			if(fof._should_create)
+				fd = _open(path, flags, _S_IREAD | _S_IWRITE);
+			else
+				fd = _open(path, flags);
 
-				if(fd < 0)
-					impl::int_error("open('{}'): {}", path, strerror(errno));
-
-				return fd;
-			}
-
-			inline int wait_for_pid(Proc proc)
-			{
-				auto result = WaitForSingleObject(proc, INFINITE);
-				if(result == WAIT_FAILED)
-					impl::int_error("WaitForSingleObject(): {}", GetLastErrorAsString());
-
-				// we are using this for threads as well; if it is not a process, return 0.
-				DWORD status = 0;
-
-				if(GetProcessId(proc) != 0)
-				{
-					if(!GetExitCodeProcess(proc, &status))
-						impl::int_error("GetExitCodeProcess(): {}", GetLastErrorAsString());
-				}
-
-				CloseHandle(proc);
-				return static_cast<int>(status);
-			}
+			if(fd < 0)
+				impl::int_error("open('{}'): {}", path, strerror(errno));
 
 		#else
+			if(fof._should_create)
+				fd = open(path, flags, fof.create_perms);
+			else
+				fd = open(path, flags);
 
-			using Fd = int;
-			static constexpr Fd FD_NONE = -1;
+			if(fd < 0)
+				impl::int_error("open('{}'): {}", path, strerror(errno));
+		#endif
 
-			struct PipeDes
+			return fd;
+		}
+
+		inline int wait_for_pid(Proc proc)
+		{
+		#if defined(_WIN32)
+			auto result = WaitForSingleObject(proc, INFINITE);
+			if(result == WAIT_FAILED)
+				impl::int_error("WaitForSingleObject(): {}", GetLastErrorAsString());
+
+			// we are using this for threads as well; if it is not a process, return 0.
+			DWORD status = 0;
+
+			if(GetProcessId(proc) != 0)
 			{
-				Fd read_end;
-				Fd write_end;
-			};
-
-			using Proc = pid_t;
-			static constexpr Proc PROC_NONE = -1;
-
-			inline ssize_t fd_read(Fd fd, void* buf, size_t len)
-			{
-				return read(fd, buf, len);
+				if(!GetExitCodeProcess(proc, &status))
+					impl::int_error("GetExitCodeProcess(): {}", GetLastErrorAsString());
 			}
 
-			inline ssize_t fd_write(Fd fd, void* buf, size_t len)
-			{
-				return write(fd, buf, len);
-			}
+			CloseHandle(proc);
+			return static_cast<int>(status);
+		#else
+			int status = 0;
+			if(waitpid(proc, &status, 0) < 0)
+				impl::int_error("waitpid({}): {}", proc, strerror(errno));
 
-			inline PipeDes make_pipe()
-			{
-				if(int p[2]; pipe(p) < 0)
-				{
-					impl::int_error("pipe(): {}", strerror(errno));
-				}
-				else
-				{
-					// set the pipes to close on exec, so that we do not have dangling write ends
-					// left open in children.
-					if(fcntl(p[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(p[1], F_SETFD, FD_CLOEXEC) < 0)
-						impl::int_error("fcntl(FD_CLOEXEC): {}", strerror(errno));
-
-					return PipeDes {
-						.read_end = p[0],
-						.write_end = p[1]
-					};
-				}
-			}
-
-			inline Fd open_file(const char* path, FileOpenFlags fof)
-			{
-				int flags = 0;
-
-				if(fof._need_write)         flags |= O_RDWR;
-				else                        flags |= O_RDONLY;
-
-				if(fof._should_create)      flags |= O_CREAT;
-				if(fof._truncate_mode)      flags |= O_TRUNC;
-				else if(fof._append_mode)   flags |= O_APPEND;
-
-				int fd = 0;
-				if(fof._should_create)
-					fd = open(path, flags, fof._create_perms);
-
-				else
-					fd = open(path, flags);
-
-				if(fd < 0)
-					impl::int_error("open('{}'): {}", path, strerror(errno));
-
-				return fd;
-			}
-
-			inline int wait_for_pid(Proc proc)
-			{
-				int status = 0;
-				if(waitpid(proc, &status, 0) < 0)
-					impl::int_error("waitpid({}): {}", proc, strerror(errno));
-
-				return status;
-			}
-
-		#endif // _WIN32
+			return status;
+		#endif
+		}
 	}
 
 	namespace impl
@@ -2236,14 +2223,6 @@ namespace nabs
 		private:
 			std::vector<os::Proc> runAsync(os::Fd in_fd);
 		};
-
-		#if defined(_WIN32)
-			inline DWORD WINAPI split_program(SplitProgArgs* args);
-		#else
-			inline void split_program(SplitProgArgs* args);
-		#endif // _WIN32
-
-
 
 		struct Part
 		{
@@ -2410,7 +2389,7 @@ namespace nabs
 					int_error("dup2({}, {}): {}", src, dst, strerror(errno));
 
 				if(close_src)
-					close(src);
+					os::close_file(src);
 			};
 
 			if(this->type() == TYPE_PROC)
@@ -2420,11 +2399,9 @@ namespace nabs
 				auto get_handle = [](os::Fd fd, HANDLE def) -> HANDLE {
 					if(fd == os::FD_NONE)
 						return def;
-
 					else
 						return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
 				};
-
 
 				STARTUPINFO info;
 				memset(&info, 0, sizeof(info));
@@ -2507,13 +2484,16 @@ namespace nabs
 					.create_perms(0664)
 				);
 
+				zpr::fprintln(stderr, "opened '{}' and my handle is {}", this->name, (HANDLE) _get_osfhandle(file));
+				zpr::fprintln(stderr, "in_fd = {}", (HANDLE) _get_osfhandle(in_fd));
+
 				if(in_fd != os::FD_NONE)
 					dupe_fd(file, in_fd, /* close_src: */ false);
 
 				if(out_fd != os::FD_NONE)
 					dupe_fd(file, out_fd, /* close_src: */ false);
 
-				close(file);
+				os::close_file(file);
 				return os::PROC_NONE;
 			}
 			else if(this->type() == TYPE_SPLIT)
@@ -2534,7 +2514,7 @@ namespace nabs
 				args->split_vals = &this->split_vals;
 				args->split_ptrs = &this->split_ptrs;
 
-				auto func = reinterpret_cast<LPTHREAD_START_ROUTINE>(split_program);
+				auto func = reinterpret_cast<LPTHREAD_START_ROUTINE>(&split_program);
 
 				auto proc = CreateThread(
 					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
@@ -2638,6 +2618,7 @@ namespace nabs
 					// open this file as write mode.
 					// now, we just need to dup2 the file descriptor to the in_fd, and return immediately.
 					// by passing in_fd, we get the file to open in write mode.
+					zpr::fprintln(stderr, "opening file...");
 					this->parts[0].runAsync(in_fd, os::FD_NONE, os::FD_NONE);
 					return { };
 				}
@@ -2670,7 +2651,7 @@ namespace nabs
 
 				if(is_last)
 				{
-					close(pipe_write);
+					os::close_file(pipe_write);
 					pipe_write = os::FD_NONE;
 				}
 
@@ -2685,17 +2666,17 @@ namespace nabs
 
 				// setup the read end for the next process.
 				if(predecessor_pipe != os::FD_NONE)
-					close(predecessor_pipe);
+					os::close_file(predecessor_pipe);
 
 				predecessor_pipe = pipe_read;
 				if(!is_last)
-					close(pipe_write);
+					os::close_file(pipe_write);
 
 				if(did_file)
 					i += 1;
 			}
 
-			close(predecessor_pipe);
+			os::close_file(predecessor_pipe);
 			return children;
 		}
 
@@ -2717,12 +2698,14 @@ namespace nabs
 		}
 
 	#if defined(_WIN32)
-		inline DWORD WINAPI split_program(SplitProgArgs* args)
-		{
+		#define FN_RETTY DWORD WINAPI
 	#else
-		inline void split_program(SplitProgArgs* args)
+		#define FN_RETTY void
+	#endif
+
+		inline FN_RETTY split_program(SplitProgArgs* args)
 		{
-	#endif // _WIN32
+	#undef FN_RETTY
 
 			std::vector<os::Fd> fds;
 			std::vector<os::Proc> children;
@@ -2742,12 +2725,12 @@ namespace nabs
 				// we rely on the pipeline's run() to perform dup2() to change our fd as appropriate.
 				if(pl->parts[0].is_passive())
 				{
-					close(p_write);
+					os::close_file(p_write);
 					fds.push_back(p_read);
 				}
 				else
 				{
-					close(p_read);
+					os::close_file(p_read);
 					fds.push_back(p_write);
 				}
 			};
@@ -2757,6 +2740,19 @@ namespace nabs
 
 			for(auto& sp : *args->split_vals)
 				iterate_splits(&sp);
+
+			{
+				char buf[256];
+
+				auto h = (HANDLE) _get_osfhandle(args->read_fd);
+				zpr::fprintln(stderr, "reading: handle = {}", h);
+
+				DWORD len = 0;
+				if(!GetFinalPathNameByHandle(h, buf, len, 0))
+					impl::int_error("asdf: {}", GetLastErrorAsString());
+
+				zpr::fprintln(stderr, "handle = '{}'", buf);
+			}
 
 			char buf[4096] { };
 			while(true)
@@ -2782,7 +2778,7 @@ namespace nabs
 			}
 
 			for(auto& f : fds)
-				close(f);
+				os::close_file(f);
 
 			// wait for all the children...
 			for(auto c : children)
