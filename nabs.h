@@ -2092,6 +2092,7 @@ namespace nabs
 	struct CompilerFlags
 	{
 		std::vector<std::string> options;
+		std::vector<std::string> libraries;
 		std::vector<fs::path> include_paths;
 	};
 }
@@ -2592,7 +2593,7 @@ namespace nabs
 		char** make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
 		{
 			char** args_array = new char*[args.size() + 2];
-			for(size_t i = 0; i < arguments.size(); i++)
+			for(size_t i = 0; i < args.size(); i++)
 				args_array[1 + i] = const_cast<char*>(args[i].c_str());
 
 			args_array[0] = const_cast<char*>(exec_name.c_str());
@@ -3101,10 +3102,16 @@ namespace nabs
 	{
 		std::vector<fs::path> ret;
 
+	#if defined(_WIN32)
 		char buf[4096] { };
 		size_t len = 0;
 		getenv_s(&len, buf, 4096, "PATH");
 		auto var = std::string_view(buf, len);
+	#else
+		char* buf = getenv("PATH");
+		auto var = std::string_view(buf);
+	#endif
+
 		if(var.empty())
 			return { };
 
@@ -3286,6 +3293,9 @@ namespace nabs
 			// but `/Fe: name` does work, for some reason.
 			args.push_back("/Fe:");
 			args.push_back(output.string());
+
+			if(!opts.libraries.empty())
+				impl::int_error("libraries unsupported");
 		}
 		else
 		{
@@ -3295,6 +3305,13 @@ namespace nabs
 		// assume all compilers let you just throw the input files at the end with no regard.
 		for(auto& f : files)
 			args.push_back(f.string());
+
+		// libraries go after.
+		if(cmp.kind == Compiler::KIND_GCC_CLANG)
+		{
+			for(auto& lib : opts.libraries)
+				args.push_back(zpr::sprint("-l{}", lib));
+		}
 
 		// construct the command, and run it.
 		return cmd(cmp.path.string(), std::move(args)).run();
@@ -3602,6 +3619,11 @@ namespace nabs
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
 				flags.options.push_back("-O2");
+
+				// this is a little annoying, but for older gcc we need to explicitly link std::filesystem.
+			#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 9)
+				flags.libraries.push_back("stdc++fs");
+			#endif
 			}
 			else if(cpp.kind == Compiler::KIND_MSVC_CL)
 			{

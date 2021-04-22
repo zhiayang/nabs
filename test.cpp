@@ -16,7 +16,7 @@ int main(int argc, char** argv)
 	auto x
 		= cmd("cat", "README.md")
 		| split(
-			cmd("reverse") | file("asdf.txt"),
+			cmd("rev") | file("asdf.txt"),
 			file("bsdf.txt"))
 		| cmd("hexdump", "-C")
 		| file("foozle.txt");

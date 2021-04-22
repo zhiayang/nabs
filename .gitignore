@@ -15,3 +15,5 @@
 *.sublime-project
 *.sublime-workspace
 
+*.txt
+/nabs
