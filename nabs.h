@@ -3483,7 +3483,6 @@ namespace nabs
 	{
 #if defined(_WIN32)
 		static constexpr const char* TMP_FILE_NAME = "__please_delete_me.exe";
-		static constexpr const char* _MAGIC_WORDS = "__@please_launch_the_replacement_thank_you";
 
 		static HANDLE create_process(fs::path proc, const char* first, const std::vector<std::string>& args)
 		{
@@ -3528,18 +3527,6 @@ namespace nabs
 		static void replace_self_windows(char** argv, fs::path new_name)
 		{
 			std::vector<std::string> arguments;
-
-			// argv[0] is still our current path.
-			// arguments.push_back(argv[0]);
-
-			// // also push our process id, so the child can avoid a race condition between
-			// // us calling exit and it trying to delete our exe.
-			// arguments.push_back(std::to_string(GetProcessId(GetCurrentProcess())));
-
-			// // and lastly, also push the new name that we are using (so the new process
-			// // can rename)
-			// arguments.push_back(new_name.string());
-
 			for(size_t i = 1; argv[i] != nullptr; i++)
 				arguments.push_back(argv[i]);
 
@@ -3663,12 +3650,6 @@ namespace nabs
 	#if defined(_WIN32)
 		if(fs::exists(impl::TMP_FILE_NAME))
 			fs::remove(impl::TMP_FILE_NAME);
-
-		// if(strcmp(argv[0], impl::_MAGIC_WORDS) == 0)
-		// {
-		// 	impl::launch_replacement(argc, argv);
-		// 	return;
-		// }
 	#endif
 
 		// first, get the modification time of this file:
