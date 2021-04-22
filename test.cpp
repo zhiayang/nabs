@@ -16,10 +16,12 @@ int main(int argc, char** argv)
 	auto x
 		= cmd("cat", "README.md")
 		| split(
-			cmd("rev") | file("asdf.txt"),
+			cmd("reverse") | file("asdf.txt"),
 			file("bsdf.txt"))
 		| cmd("hexdump", "-C")
 		| file("foozle.txt");
+
+	zpr::println("hi");
 
 	// auto x = file("test.cpp") | cmd("reverse") | cmd("hexdump", "-C") | file("foozle.txt");
 	// auto x = cmd("cat", "test.cpp") | cmd("hexdump", "-C") | cmd("reverse");

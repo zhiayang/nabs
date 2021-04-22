@@ -98,7 +98,7 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 
-	Version 2.1.12
+	Version 2.1.13
 	==============
 */
 
@@ -1104,7 +1104,7 @@ namespace zpr
 			}
 
 			if(value < 0x10)
-				*(--ptr) = hex_digit(value);
+				*(--ptr) = hex_digit(static_cast<int>(value));
 
 			else
 				copy((ptr -= 2), &lookup_table[value * 2]);
@@ -1173,7 +1173,7 @@ namespace zpr
 			}
 
 			if(value < 10)
-				*(--ptr) = (value + '0');
+				*(--ptr) = static_cast<char>(value + '0');
 
 			else
 				copy((ptr -= 2), &lookup_table[value * 2]);
@@ -1965,8 +1965,6 @@ static constexpr int STDERR_FILENO  = 2;
 
 using ssize_t = long long;
 
-LPSTR GetLastErrorAsString();
-
 #else
 #include <unistd.h>
 #endif // _WIN32
@@ -2106,9 +2104,6 @@ namespace nabs
 	{
 	#if defined(_WIN32)
 
-		// using Fd = int;
-		// static constexpr Fd FD_NONE = -1;
-
 		using Fd = HANDLE;
 		static constexpr Fd FD_NONE = nullptr;
 
@@ -2121,6 +2116,7 @@ namespace nabs
 		inline fs::path msvc_toolchain_libraries();
 		inline fs::path msvc_toolchain_binaries();
 
+		LPSTR GetLastErrorAsString();
 	#else
 		using Fd = int;
 		static constexpr Fd FD_NONE = -1;
@@ -2155,6 +2151,14 @@ namespace nabs
 
 		void split_transfer(SplitProgArgs args);
 		void fd_transfer(os::Fd in_fd, os::Fd out_fd);
+
+	#if defined(_WIN32)
+		std::string quote_argument(std::string_view arg);
+		std::string make_argument_array(const std::string& exec_name, const std::vector<std::string>& args);
+	#else
+		char** make_argument_array(const std::string& exec_name, const std::vector<std::string>& args);
+	#endif
+
 
 		struct Pipeline
 		{
@@ -2213,11 +2217,7 @@ namespace nabs
 			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
 			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
 
-		#if defined(_WIN32)
-			std::string make_args();
-		#else
-			char** make_args();
-		#endif // _WIN32
+			inline auto make_args() { return impl::make_argument_array(this->name, this->arguments); }
 
 			inline Part(int type, int flags, std::string name, std::vector<std::string> args)
 				: _type(type)
@@ -2355,7 +2355,10 @@ namespace nabs
 			}
 			return static_cast<ssize_t>(did);
 		#else
-			return read(fd, buf, len);
+			if(auto ret = read(fd, buf, len); ret >= 0)
+				return ret;
+			else
+				impl::int_error("read(): {}", strerror(errno));
 		#endif
 		}
 
@@ -2373,7 +2376,10 @@ namespace nabs
 
 			return static_cast<ssize_t>(did);
 		#else
-			return write(fd, buf, len);
+			if(auto ret = write(fd, buf, len); ret >= 0)
+				return ret;
+			else
+				impl::int_error("write(): {}", strerror(errno));
 		#endif
 		}
 
@@ -2508,13 +2514,11 @@ namespace nabs
 		int wait_for_pid(Proc proc)
 		{
 		#if defined(_WIN32)
-			auto result = WaitForSingleObject(proc, INFINITE);
-			if(result == WAIT_FAILED)
+			if(WaitForSingleObject(proc, INFINITE) != WAIT_OBJECT_0)
 				impl::int_error("WaitForSingleObject(): {}", GetLastErrorAsString());
 
 			// we are using this for threads as well; if it is not a process, return 0.
 			DWORD status = 0;
-
 			if(GetProcessId(proc) != 0)
 			{
 				if(!GetExitCodeProcess(proc, &status))
@@ -2536,68 +2540,63 @@ namespace nabs
 	namespace impl
 	{
 	#if defined(_WIN32)
-		std::string Part::make_args()
+		// https://docs.microsoft.com/en-gb/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+		std::string quote_argument(std::string_view s)
 		{
-			std::string ret;
+			if(s.find_first_of(" \t\n\v\f") == std::string::npos)
+				return std::string(s);
 
-			auto quote_thing = [](const std::string& s) -> std::string {
-				if(s.find_first_of(" \t\n\v\f") == std::string::npos)
-					return s;
+			std::string ret = "\"";
+			int backs = 0;
 
-				std::string ret = "\"";
+			for(auto it = s.begin(); ; ++it)
+			{
 				int backs = 0;
-				for(size_t i = 0; i < s.size(); i++)
+				while(it != s.end() && *it == '\\')
+					++it, ++backs;
+
+				if(it == s.end())
 				{
-					char c = s[i];
-
-					if(c == '\\')
-					{
-						backs++;
-						continue;
-					}
-
-					if(i == s.size() - 1)
-					{
-						ret.append(backs * 2, '\\');
-					}
-					else if(c == '"')
-					{
-						ret.append(backs * 2, '\\');
-						ret += '"';
-					}
-					else
-					{
-						ret.append(backs, '\\');
-						ret += c;
-					}
-
-					backs = 0;
+					ret.append(backs * 2, '\\');
+					break;
 				}
+				else if(*it == '"')
+				{
+					ret.append(backs * 2 + 1, '\\');
+					ret.push_back(*it);
+				}
+				else
+				{
+					ret.append(backs, '\\');
+					ret.push_back(*it);
+				}
+			}
 
-				ret += '"';
-				return ret;
-			};
+			ret.push_back('"');
+			return ret;
+		}
 
-
-			ret += quote_thing(this->name);
-			for(auto& arg : this->arguments)
+		std::string make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
+		{
+			std::string ret = quote_argument(exec_name);
+			for(auto& arg : args)
 			{
 				ret += " ";
-				ret += quote_thing(arg);
+				ret += quote_argument(arg);
 			}
 
 			return ret;
 		}
 
 	#else
-		char** Part::make_args()
+		char** make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
 		{
-			char** args_array = new char*[this->arguments.size() + 2];
+			char** args_array = new char*[args.size() + 2];
 			for(size_t i = 0; i < arguments.size(); i++)
-				args_array[1 + i] = const_cast<char*>(this->arguments[i].c_str());
+				args_array[1 + i] = const_cast<char*>(args[i].c_str());
 
-			args_array[0] = const_cast<char*>(this->name.c_str());
-			args_array[this->arguments.size() + 1] = nullptr;
+			args_array[0] = const_cast<char*>(exec_name.c_str());
+			args_array[args.size() + 1] = nullptr;
 			return args_array;
 		}
 	#endif // _WIN32
@@ -2668,14 +2667,14 @@ namespace nabs
 				auto attrib_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrib_buffer);
 
 				if(!InitializeProcThreadAttributeList(attrib_list, 1, 0, &attrib_size))
-					impl::int_error("InitializeProcThreadAttributeList(): {}", GetLastErrorAsString());
+					impl::int_error("InitializeProcThreadAttributeList(): {}", os::GetLastErrorAsString());
 
 				auto succ = UpdateProcThreadAttribute(attrib_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
 					inherited_handles.data(), inherited_handles.size() * sizeof(HANDLE),
 					nullptr, nullptr);
 
 				if(!succ)
-					impl::int_error("UpdateProcThreadAttribute(): {}", GetLastErrorAsString());
+					impl::int_error("UpdateProcThreadAttribute(): {}", os::GetLastErrorAsString());
 
 				info.lpAttributeList = attrib_list;
 
@@ -2699,7 +2698,7 @@ namespace nabs
 				);
 
 				if(!result)
-					impl::int_error("CreateProcess('{}'): {}", cmdline, GetLastErrorAsString());
+					impl::int_error("CreateProcess('{}'): {}", cmdline, os::GetLastErrorAsString());
 
 				DeleteProcThreadAttributeList(attrib_list);
 				delete[] attrib_buffer;
@@ -2811,7 +2810,7 @@ namespace nabs
 				);
 
 				if(proc == os::PROC_NONE)
-					int_error("CreateThread(): {}", GetLastErrorAsString());
+					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
 				return { proc, false };
 
@@ -2896,11 +2895,11 @@ namespace nabs
 				);
 
 				if(thr == os::PROC_NONE)
-					int_error("CreateThread(): {}", GetLastErrorAsString());
+					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
 				// since we are not in a separate process, we cannot close in_fd nor out_fd.
 				if(!ResumeThread(thr))
-					int_error("ResumeThread(): {}", GetLastErrorAsString());
+					int_error("ResumeThread(): {}", os::GetLastErrorAsString());
 
 				return { thr, /* dont_close_pipes: */ true };
 
@@ -3009,14 +3008,10 @@ namespace nabs
 			while(true)
 			{
 				auto did = os::read_file(in_fd, buf, 4096);
-				if(did < 0)
-					impl::int_error("read(): {}", strerror(errno));
-
 				if(did <= 0)
 					break;
 
-				if(os::write_file(out_fd, buf, did) < 0)
-					impl::int_error("write(): {}", strerror(errno));
+				os::write_file(out_fd, buf, did);
 			}
 		}
 
@@ -3048,21 +3043,12 @@ namespace nabs
 			while(true)
 			{
 				auto n = os::read_file(args.read_fd, buf, 4096);
-
-				if(n < 0)
-					zpr::fprintln(stderr, "split(stdin): read error: {}", strerror(errno));
-
 				if(n <= 0)
 					break;
 
-				if(os::write_file(args.write_fd, buf, n) < 0)
-					zpr::fprintln(stderr, "split(stdout): write error: {}", strerror(errno));
-
+				os::write_file(args.write_fd, buf, n);
 				for(auto& f : fds)
-				{
-					if(os::write_file(f, buf, n) < 0)
-						zpr::fprintln(stderr, "split({}): write error: {}", f, strerror(errno));
-				}
+					os::write_file(f, buf, n);
 			}
 
 			for(auto& f : fds)
@@ -3114,20 +3100,26 @@ namespace nabs
 	std::vector<fs::path> impl::get_path_variable()
 	{
 		std::vector<fs::path> ret;
-		std::string var = getenv("PATH");
+
+		char buf[4096] { };
+		size_t len = 0;
+		getenv_s(&len, buf, 4096, "PATH");
+		auto var = std::string_view(buf, len);
+		if(var.empty())
+			return { };
 
 		while(true)
 		{
 			auto i = var.find(':');
 			if(i == std::string::npos)
 			{
-				ret.push_back(var);
+				ret.push_back(std::string(var));
 				break;
 			}
 			else
 			{
 				auto comp = var.substr(0, i);
-				ret.push_back(comp);
+				ret.push_back(std::string(comp));
 				var = var.substr(i + 1);
 			}
 		}
@@ -3277,6 +3269,9 @@ namespace nabs
 		}
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
+			// this is annoying.
+			args.push_back("/nologo");
+
 			for(auto& inc : opts.include_paths)
 			{
 				// MSDN says that directories with spaces must be double-quoted, but
@@ -3484,89 +3479,177 @@ namespace nabs
 #if !NABS_DECLARATION_ONLY
 namespace nabs
 {
-	void impl::rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include)
+	namespace impl
 	{
-		log("build recipe changed, rebuilding...");
+#if defined(_WIN32)
+		static constexpr const char* TMP_FILE_NAME = "__please_delete_me.exe";
+		static constexpr const char* _MAGIC_WORDS = "__@please_launch_the_replacement_thank_you";
 
-		auto cpp = find_cpp_compiler();
-		if(!fs::exists(cpp.path))
+		static HANDLE create_process(fs::path proc, const char* first, const std::vector<std::string>& args)
 		{
-			impl::int_warn("C++ compiler (at path '{}') does not exist, aborting self-rebuild");
-			return;
+			STARTUPINFO info;
+			memset(&info, 0, sizeof(info));
+
+			info.cb = sizeof(STARTUPINFO);
+			info.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+			info.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+			info.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+			info.dwFlags |= STARTF_USESTDHANDLES;
+
+			PROCESS_INFORMATION procinfo;
+			memset(&procinfo, 0, sizeof(procinfo));
+
+			auto cmdline = make_argument_array(first, args);
+			auto cmdline_ = const_cast<LPSTR>(cmdline.c_str());
+
+			// provide the lpApplicationPath explicitly here.
+			auto exec_path = proc.string();
+
+			auto result = CreateProcessA(
+				exec_path.c_str(),  // LPCSTR                   lpApplicationName
+				cmdline_,           // LPSTR                    lpCommandLine
+				nullptr,            // LPSECURITY_ATTRIBUTES    lpProcessAttributes
+				nullptr,            // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+				true,               // BOOL                     bInheritHandles
+				0,                  // DWORD                    dwCreationFlags
+				nullptr,            // LPVOID                   lpEnvironment
+				nullptr,            // LPCSTR                   lpCurrentDirectory
+				&info,              // LPSTARTUPINFO            lpStartupInfo
+				&procinfo           // LPPROCESS_INFORMATION    lpProcessInformation
+			);
+
+			if(!result)
+				impl::int_error("CreateProcess('{}'): {}", cmdline, os::GetLastErrorAsString());
+
+			CloseHandle(procinfo.hThread);
+			return procinfo.hProcess;
 		}
 
-		// convert the filenames to paths. the caller should have already checked that
-		// all the provided files actually exist.
-		std::vector<fs::path> files;
-		for(auto& f : filenames)
-			files.push_back(fs::canonical(f));
-
-		CompilerFlags flags;
-
-		// find the required include directory
-		if(auto_find_include)
+		static void replace_self_windows(char** argv, fs::path new_name)
 		{
-			fs::path include_dir;
+			std::vector<std::string> arguments;
 
-			auto this_path = fs::path(__FILE__);
-			if(!fs::exists(this_path))
+			// argv[0] is still our current path.
+			// arguments.push_back(argv[0]);
+
+			// // also push our process id, so the child can avoid a race condition between
+			// // us calling exit and it trying to delete our exe.
+			// arguments.push_back(std::to_string(GetProcessId(GetCurrentProcess())));
+
+			// // and lastly, also push the new name that we are using (so the new process
+			// // can rename)
+			// arguments.push_back(new_name.string());
+
+			for(size_t i = 1; argv[i] != nullptr; i++)
+				arguments.push_back(argv[i]);
+
+			// before we do anything, rename ourselves to something else.
+			auto this_path = fs::canonical(argv[0]);
+
+			auto tmp_path = this_path;
+			tmp_path.replace_filename(TMP_FILE_NAME);
+
+			if(!MoveFileEx(this_path.string().c_str(), tmp_path.string().c_str(), MOVEFILE_REPLACE_EXISTING))
+				impl::int_error("MoveFileEx(): {}", os::GetLastErrorAsString());
+
+			// and rename the incoming one to our old name.
+			if(!MoveFileEx(new_name.string().c_str(), this_path.string().c_str(), MOVEFILE_REPLACE_EXISTING))
+				impl::int_error("MoveFileEx(): {}", os::GetLastErrorAsString());
+
+			auto child = create_process(this_path, this_path.string().c_str(), arguments);
+
+			// wait for the child to finish
+			if(WaitForSingleObject(child, INFINITE) != WAIT_OBJECT_0)
+				impl::int_error("WaitForSingleObject(): {}", os::GetLastErrorAsString());
+		}
+	#endif
+
+
+		void rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include)
+		{
+			log("build recipe changed, rebuilding...");
+
+			auto cpp = find_cpp_compiler();
+			if(!fs::exists(cpp.path))
 			{
-				impl::int_warn("somehow, the current header ('{}') does not exist, aborting self-rebuild", __FILE__);
+				impl::int_warn("C++ compiler (at path '{}') does not exist, aborting self-rebuild");
 				return;
 			}
 
-			// i can't be bothered to do some magic where we get the "shallowest" file and then
-			// compose the relative path from that. so, for every file, if the include path does
-			// not already exist, just include it again.
-			for(auto& file : files)
+			// convert the filenames to paths. the caller should have already checked that
+			// all the provided files actually exist.
+			std::vector<fs::path> files;
+			for(auto& f : filenames)
+				files.push_back(fs::canonical(f));
+
+			CompilerFlags flags;
+
+			// find the required include directory
+			if(auto_find_include)
 			{
-				auto& tmp = flags.include_paths;
+				fs::path include_dir;
 
-				auto inc = this_path.lexically_relative(file);
-				if(!inc.empty() && std::find(tmp.begin(), tmp.end(), inc) == tmp.end())
-					tmp.push_back(inc);
+				auto this_path = fs::path(__FILE__);
+				if(!fs::exists(this_path))
+				{
+					impl::int_warn("somehow, the current header ('{}') does not exist, aborting self-rebuild", __FILE__);
+					return;
+				}
+
+				// i can't be bothered to do some magic where we get the "shallowest" file and then
+				// compose the relative path from that. so, for every file, if the include path does
+				// not already exist, just include it again.
+				for(auto& file : files)
+				{
+					auto& tmp = flags.include_paths;
+
+					auto inc = this_path.lexically_relative(file);
+					if(!inc.empty() && std::find(tmp.begin(), tmp.end(), inc) == tmp.end())
+						tmp.push_back(inc);
+				}
 			}
+
+			if(cpp.kind == Compiler::KIND_GCC_CLANG)
+			{
+				flags.options.push_back("-std=c++17");
+				flags.options.push_back("-Wextra");
+				flags.options.push_back("-Wall");
+				flags.options.push_back("-O2");
+			}
+			else if(cpp.kind == Compiler::KIND_MSVC_CL)
+			{
+				flags.options.push_back("/std:c++17");
+				flags.options.push_back("/O2");
+				flags.options.push_back("/W3");
+			}
+			else
+			{
+				impl::int_warn("unsupported C++ compiler kind, aborting self-rebuild");
+				return;
+			}
+
+			auto this_path = fs::path(argv[0]);
+			assert(fs::exists(this_path));
+
+			auto new_name = fs::path("__" + this_path.filename().string());
+			int status = compile_files(flags, new_name, std::move(files));
+			if(status != 0)
+				impl::int_error("self-rebuild failed");
+
+		#if defined(_WIN32)
+			// on windows of course, this is a massive fucking pain.
+			impl::replace_self_windows(argv, std::move(new_name));
+
+		#else
+			// for posix, it's just a rename + exec... ez.
+			fs::rename(new_name, this_path);
+
+			// now just exec without forking.
+			if(execvp(this_path.string().c_str(), argv) < 0)
+				impl::int_error("execvp(): {}", strerror(errno));
+		#endif
 		}
 
-		if(cpp.kind == Compiler::KIND_GCC_CLANG)
-		{
-			flags.options.push_back("-std=c++17");
-			flags.options.push_back("-Wextra");
-			flags.options.push_back("-Wall");
-			flags.options.push_back("-O2");
-		}
-		else if(cpp.kind == Compiler::KIND_MSVC_CL)
-		{
-			flags.options.push_back("/std:c++17");
-			flags.options.push_back("/O2");
-			flags.options.push_back("/W3");
-		}
-		else
-		{
-			impl::int_warn("unsupported C++ compiler kind, aborting self-rebuild");
-			return;
-		}
-
-		auto this_path = fs::path(argv[0]);
-		assert(fs::exists(this_path));
-
-		auto new_name = fs::temp_directory_path() / (".__" + this_path.filename().string());
-		int status = compile_files(flags, new_name, std::move(files));
-		if(status != 0)
-			impl::int_error("self-rebuild failed");
-
-		// on windows of course, this is a massive fucking pain.
-	#if defined(_WIN32)
-
-
-	#else
-		// ok, now just rename it to ourselves. ez.
-		fs::rename(new_name, this_path);
-
-		// now just exec without forking.
-		if(execvp(this_path.string().c_str(), argv) < 0)
-			impl::int_error("execvp(): {}", strerror(errno));
-	#endif
 	}
 
 	void self_update(int argc, char** argv, std::vector<std::string> filenames, bool auto_find_include)
@@ -3576,6 +3659,17 @@ namespace nabs
 			impl::int_warn("argc < 1??");
 			return;
 		}
+
+	#if defined(_WIN32)
+		if(fs::exists(impl::TMP_FILE_NAME))
+			fs::remove(impl::TMP_FILE_NAME);
+
+		// if(strcmp(argv[0], impl::_MAGIC_WORDS) == 0)
+		// {
+		// 	impl::launch_replacement(argc, argv);
+		// 	return;
+		// }
+	#endif
 
 		// first, get the modification time of this file:
 		auto this_path = fs::path(argv[0]);
@@ -4147,24 +4241,27 @@ namespace nabs::os
 #if !NABS_DECLARATION_ONLY
 namespace nabs
 {
-#if defined(_WIN32)
-	LPSTR GetLastErrorAsString()
+	namespace os
 	{
-		// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
+	#if defined(_WIN32)
+		LPSTR GetLastErrorAsString()
+		{
+			// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
 
-		DWORD errorMessageId = GetLastError();
-		assert(errorMessageId != 0);
+			DWORD errorMessageId = GetLastError();
+			assert(errorMessageId != 0);
 
-		LPSTR messageBuffer = nullptr;
+			LPSTR messageBuffer = nullptr;
 
-		DWORD size = FormatMessage(
-			FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-			nullptr, errorMessageId, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-			reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
+			DWORD size = FormatMessage(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+				nullptr, errorMessageId, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
 
-		return messageBuffer;
+			return messageBuffer;
+		}
+	#endif // _WIN32
 	}
-#endif // _WIN32
 }
 #endif // !NABS_DECLARATION_ONLY
 
