@@ -3605,6 +3605,10 @@ namespace nabs
 			}
 		}
 
+		// also check the header itself.
+		if(auto p = fs::path(__FILE__); fs::exists(p) && fs::last_write_time(p) > this_time)
+			need_rebuild = true;
+
 		if(need_rebuild)
 			impl::rebuild_self(argv, std::move(filenames), auto_find_include);
 	}

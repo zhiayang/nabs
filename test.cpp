@@ -12,9 +12,7 @@ int main(int argc, char** argv)
 	for(int i = 0; i < argc; i++)
 		zpr::println("  {}", argv[i]);
 
-
 	using namespace nabs;
-
 	auto x
 		= cmd("cat", "README.md")
 		| split(
