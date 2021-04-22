@@ -11,6 +11,8 @@
 // god damned windows
 #if defined(_MSC_VER)
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN 1
+#include <windows.h>
 #endif
 
 
@@ -41,7 +43,6 @@ int main(int argc, char** argv)
 
 	else
 		printf("%07zx", offset);
-
 
 	char linebuf[16] { };
 	size_t linelen = 0;

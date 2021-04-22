@@ -1959,6 +1959,8 @@ namespace zpr
 
 #if defined(_WIN32)
 
+#include <thread>
+
 #include <io.h>
 
 #define WIN32_LEAN_AND_MEAN 1
@@ -2158,7 +2160,6 @@ namespace nabs
 		inline void close_file(Fd fd)
 		{
 		#if defined(_WIN32)
-			// if(_close(fd) < 0)
 			if(!CloseHandle(fd))
 				impl::int_error("CloseHandle(): {}", GetLastErrorAsString());
 		#else
@@ -2312,8 +2313,37 @@ namespace nabs
 			Part& operator= (Part&&) = default;
 			Part& operator= (const Part&) = default;
 
+			static constexpr int TYPE_PROC  = 1;
+			static constexpr int TYPE_FILE  = 2;
+			static constexpr int TYPE_SPLIT = 3;
+
+			int type() const  { return this->_type; }
+			int flags() const { return this->_flags; }
+
+			// used to check... certain things.
+			bool is_passive() const { return this->type() == TYPE_FILE; }
+
+			static Part of_command(std::string name, std::vector<std::string> args = { })
+			{
+				return Part(TYPE_PROC, 0, std::move(name), std::move(args));
+			}
+
+			static Part of_file(std::string name)
+			{
+				return Part(TYPE_FILE, 0, std::move(name), { });
+			}
+
+			static Part of_split(std::vector<impl::Pipeline> splits, std::vector<impl::Pipeline*> ptrs)
+			{
+				auto ret = Part(TYPE_SPLIT, 0, "split", { });
+				ret.split_vals = std::move(splits);
+				ret.split_ptrs = std::move(ptrs);
+				return ret;
+			}
+
+		private:
 			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
-			os::Proc runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
+			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
 
 		#if defined(_WIN32)
 
@@ -2383,35 +2413,6 @@ namespace nabs
 			}
 		#endif // _WIN32
 
-			static constexpr int TYPE_PROC  = 1;
-			static constexpr int TYPE_FILE  = 2;
-			static constexpr int TYPE_SPLIT = 3;
-
-			int type() const  { return this->_type; }
-			int flags() const { return this->_flags; }
-
-			// used to check... certain things.
-			bool is_passive() const { return this->type() == TYPE_FILE; }
-
-			static Part of_command(std::string name, std::vector<std::string> args = { })
-			{
-				return Part(TYPE_PROC, 0, std::move(name), std::move(args));
-			}
-
-			static Part of_file(std::string name)
-			{
-				return Part(TYPE_FILE, 0, std::move(name), { });
-			}
-
-			static Part of_split(std::vector<impl::Pipeline> splits, std::vector<impl::Pipeline*> ptrs)
-			{
-				auto ret = Part(TYPE_SPLIT, 0, "split", { });
-				ret.split_vals = std::move(splits);
-				ret.split_ptrs = std::move(ptrs);
-				return ret;
-			}
-
-		private:
 			Part(int type, int flags, std::string name, std::vector<std::string> args)
 				: _type(type)
 				, _flags(flags)
@@ -2461,8 +2462,19 @@ namespace nabs
 		}
 
 
-		os::Proc Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
+		std::pair<os::Proc, bool> Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
 		{
+		#if defined(_WIN32)
+			// need to disable inheritance on the child_close handle
+			if(child_close != os::FD_NONE)
+			{
+				if(!SetHandleInformation(child_close, HANDLE_FLAG_INHERIT, 0))
+					impl::int_error("SetHandleInformation(): {}", GetLastErrorAsString());
+			}
+		#endif
+
+
+
 			if(this->type() == TYPE_PROC)
 			{
 			#if defined(_WIN32)
@@ -2474,21 +2486,38 @@ namespace nabs
 						return fd;
 				};
 
-				STARTUPINFO info;
+				STARTUPINFOEX info;
 				memset(&info, 0, sizeof(info));
 
-				info.cb = sizeof(STARTUPINFO);
-				info.hStdInput  = get_handle(in_fd, GetStdHandle(STD_INPUT_HANDLE));
-				info.hStdOutput = get_handle(out_fd, GetStdHandle(STD_OUTPUT_HANDLE));
-				info.hStdError  = get_handle(err_fd, GetStdHandle(STD_ERROR_HANDLE));
-				info.dwFlags |= STARTF_USESTDHANDLES;
+				info.StartupInfo.cb = sizeof(STARTUPINFOEX);
+				info.StartupInfo.hStdInput  = get_handle(in_fd, GetStdHandle(STD_INPUT_HANDLE));
+				info.StartupInfo.hStdOutput = get_handle(out_fd, GetStdHandle(STD_OUTPUT_HANDLE));
+				info.StartupInfo.hStdError  = get_handle(err_fd, GetStdHandle(STD_ERROR_HANDLE));
+				info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
-				// need to disable inheritance on the child_close handle
-				if(child_close != os::FD_NONE)
-				{
-					if(!SetHandleInformation(child_close, HANDLE_FLAG_INHERIT, 0))
-						impl::int_error("SetHandleInformation(): {}", GetLastErrorAsString());
-				}
+				std::vector<HANDLE> inherited_handles = {
+					info.StartupInfo.hStdInput,
+					info.StartupInfo.hStdOutput,
+					info.StartupInfo.hStdError
+				};
+
+				SIZE_T attrib_size = 0;
+				InitializeProcThreadAttributeList(nullptr, 1, 0, &attrib_size);
+
+				auto attrib_buffer = new char[attrib_size];
+				auto attrib_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrib_buffer);
+
+				if(!InitializeProcThreadAttributeList(attrib_list, 1, 0, &attrib_size))
+					impl::int_error("InitializeProcThreadAttributeList(): {}", GetLastErrorAsString());
+
+				auto succ = UpdateProcThreadAttribute(attrib_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+					inherited_handles.data(), inherited_handles.size() * sizeof(HANDLE),
+					nullptr, nullptr);
+
+				if(!succ)
+					impl::int_error("UpdateProcThreadAttribute(): {}", GetLastErrorAsString());
+
+				info.lpAttributeList = attrib_list;
 
 				PROCESS_INFORMATION procinfo;
 				memset(&procinfo, 0, sizeof(procinfo));
@@ -2497,23 +2526,26 @@ namespace nabs
 				auto cmdline_ = const_cast<LPSTR>(cmdline.c_str());
 
 				auto result = CreateProcessA(
-					nullptr,    // LPCSTR                   lpApplicationName
-					cmdline_,   // LPSTR                    lpCommandLine
-					nullptr,    // LPSECURITY_ATTRIBUTES    lpProcessAttributes
-					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
-					true,       // BOOL                     bInheritHandles
-					0,          // DWORD                    dwCreationFlags
-					nullptr,    // LPVOID                   lpEnvironment
-					nullptr,    // LPCSTR                   lpCurrentDirectory
-					&info,      // LPSTARTUPINFO            lpStartupInfo
-					&procinfo   // LPPROCESS_INFORMATION    lpProcessInformation
+					nullptr,                        // LPCSTR                   lpApplicationName
+					cmdline_,                       // LPSTR                    lpCommandLine
+					nullptr,                        // LPSECURITY_ATTRIBUTES    lpProcessAttributes
+					nullptr,                        // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					true,                           // BOOL                     bInheritHandles
+					EXTENDED_STARTUPINFO_PRESENT,   // DWORD                    dwCreationFlags
+					nullptr,                        // LPVOID                   lpEnvironment
+					nullptr,                        // LPCSTR                   lpCurrentDirectory
+					&info.StartupInfo,              // LPSTARTUPINFO            lpStartupInfo
+					&procinfo                       // LPPROCESS_INFORMATION    lpProcessInformation
 				);
 
 				if(!result)
 					impl::int_error("CreateProcess('{}'): {}", cmdline, GetLastErrorAsString());
 
+				DeleteProcThreadAttributeList(attrib_list);
+				delete[] attrib_buffer;
+
 				CloseHandle(procinfo.hThread);
-				return procinfo.hProcess;
+				return { procinfo.hProcess, false };
 
 			#else
 				if(auto child = fork(); child < 0)
@@ -2549,7 +2581,7 @@ namespace nabs
 				}
 				else
 				{
-					return child;
+					return { child, false };
 				}
 			#endif // _WIN32
 			}
@@ -2621,7 +2653,7 @@ namespace nabs
 				if(proc == os::PROC_NONE)
 					int_error("CreateThread(): {}", GetLastErrorAsString());
 
-				return proc;
+				return { proc, false };
 
 			#else
 
@@ -2656,7 +2688,7 @@ namespace nabs
 				}
 				else
 				{
-					return child;
+					return { child, false };
 				}
 
 			#endif
@@ -2679,8 +2711,8 @@ namespace nabs
 				// responsible for freeing it. this is because it executes in a separate thread,
 				// so we cannot allocate it on this stack.
 				auto args = new SplitProgArgs;
-				args->read_fd = os::dupe_fd(in_fd);
-				args->write_fd = os::dupe_fd(out_fd);
+				args->read_fd = in_fd;
+				args->write_fd = out_fd;
 				args->split_vals = this->split_vals;
 				args->split_ptrs = this->split_ptrs;
 
@@ -2694,7 +2726,7 @@ namespace nabs
 					return 0;
 				};
 
-				auto proc = CreateThread(
+				auto thr = CreateThread(
 					nullptr,            // LPSECURITY_ATTRIBUTES    lpThreadAttributes
 					0,                  // DWORD                    dwStackSize
 					func,               // LPTHREAD_START_ROUTINE   lpStartAddress
@@ -2703,12 +2735,16 @@ namespace nabs
 					nullptr             // LPDWORD                  lpThreadId
 				);
 
-				if(proc == os::PROC_NONE)
+				if(thr == os::PROC_NONE)
 					int_error("CreateThread(): {}", GetLastErrorAsString());
 
 				// since we are not in a separate process, we cannot close in_fd nor out_fd.
-				ResumeThread(proc);
-				return proc;
+				if(!ResumeThread(thr))
+					int_error("ResumeThread(): {}", GetLastErrorAsString());
+
+				return { thr, /* dont_close_pipes: */ true };
+				// CloseHandle(thr);
+				// return { os::PROC_NONE, /* dont_close_pipes: */ true };
 
 			#else
 				// basically we have to emulate what the `tee` program does.
@@ -2732,7 +2768,7 @@ namespace nabs
 				}
 				else
 				{
-					return child;
+					return { child, false };
 				}
 			#endif
 			}
@@ -2744,7 +2780,7 @@ namespace nabs
 
 		int Part::run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
 		{
-			auto child_pid = this->runAsync(in_fd, out_fd, err_fd);
+			auto [ child_pid, _ ] = this->runAsync(in_fd, out_fd, err_fd);
 			if(child_pid == os::PROC_NONE)
 				return 0;
 
@@ -2773,18 +2809,18 @@ namespace nabs
 
 				// TODO: stderr is not handled here
 				// we don't really know how to link them together from proc to proc.
-				auto child = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE,
+				auto [ child, dont_close_pipes ] = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE,
 					/* child_close: */ close_in_children);
 
 				if(child != os::PROC_NONE)
 					children.push_back(child);
 
 				// setup the read end for the next process.
-				if(predecessor_pipe != os::FD_NONE)
+				if(predecessor_pipe != os::FD_NONE && !dont_close_pipes)
 					os::close_file(predecessor_pipe);
 
 				predecessor_pipe = pipe_read;
-				if(!is_last)
+				if(!is_last && !dont_close_pipes)
 					os::close_file(pipe_write);
 			}
 
@@ -2818,7 +2854,7 @@ namespace nabs
 				if(did < 0)
 					impl::int_error("read(): {}", strerror(errno));
 
-				if(did == 0)
+				if(did <= 0)
 					break;
 
 				if(os::write_file(out_fd, buf, did) < 0)
@@ -2839,7 +2875,7 @@ namespace nabs
 				assert(pl != nullptr);
 				auto [ p_read, p_write ] = os::make_pipe();
 
-				auto cs = pl->runAsync(p_read, /* close_in_children: */ p_write);
+				auto cs = pl->runAsync(p_read, os::FD_NONE);
 				children.insert(children.end(), cs.begin(), cs.end());
 				fds.push_back(p_write);
 			};
@@ -2854,10 +2890,11 @@ namespace nabs
 			while(true)
 			{
 				auto n = os::read_file(args.read_fd, buf, 4096);
+
 				if(n < 0)
 					zpr::fprintln(stderr, "split(stdin): read error: {}", strerror(errno));
 
-				if(n == 0)
+				if(n <= 0)
 					break;
 
 				if(os::write_file(args.write_fd, buf, n) < 0)
@@ -2939,7 +2976,7 @@ namespace nabs
 	inline impl::Pipeline split(Args&&... args)
 	{
 	#if defined(_WIN32)
-		static_assert(std::conjunction_v<std::is_same<int, char>>, "split() does not work on windows");
+		// static_assert(std::conjunction_v<std::is_same<int, char>>, "split() does not work on windows");
 	#endif
 
 		static_assert(sizeof...(args) > 0, "split() requires at least one argument");
@@ -2958,7 +2995,7 @@ namespace nabs
 	inline impl::Pipeline tee(Args&&... args)
 	{
 	#if defined(_WIN32)
-		static_assert(std::conjunction_v<std::is_same<int, char>>, "tee() does not work on windows");
+		// static_assert(std::conjunction_v<std::is_same<int, char>>, "tee() does not work on windows");
 	#endif
 
 		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
