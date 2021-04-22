@@ -2053,8 +2053,11 @@ namespace nabs
 	{
 	#if defined(_WIN32)
 
-		using Fd = int;
-		static constexpr Fd FD_NONE = -1;
+		// using Fd = int;
+		// static constexpr Fd FD_NONE = -1;
+
+		using Fd = HANDLE;
+		static constexpr Fd FD_NONE = nullptr;
 
 		using Proc = HANDLE;
 		static constexpr Proc PROC_NONE = nullptr;
@@ -2064,6 +2067,10 @@ namespace nabs
 		inline fs::path msvc_windows_sdk();
 		inline fs::path msvc_toolchain_libraries();
 		inline fs::path msvc_toolchain_binaries();
+
+		static constexpr const char* MAGIC_PROGRAM_FILE  = "__@please_read_from_a_file_thanks";
+		static constexpr const char* MAGIC_PROGRAM_SPLIT = "__@please_split_my_file_descriptors_thanks";
+
 	#else
 		using Fd = int;
 		static constexpr Fd FD_NONE = -1;
@@ -2081,7 +2088,15 @@ namespace nabs
 		inline ssize_t read_file(Fd fd, void* buf, size_t len)
 		{
 		#if defined(_WIN32)
-			return static_cast<ssize_t>(_read(fd, buf, len));
+			DWORD did = 0;
+
+			// annoyingly, this shit returns false and sets error to broken pipe even if bytes could be read.
+			if(!ReadFile(fd, buf, static_cast<DWORD>(len), &did, nullptr) && GetLastError() !=  ERROR_BROKEN_PIPE)
+			{
+				impl::int_warn("ReadFile(): {}", GetLastErrorAsString());
+				return -1;
+			}
+			return static_cast<ssize_t>(did);
 		#else
 			return read(fd, buf, len);
 		#endif
@@ -2090,7 +2105,16 @@ namespace nabs
 		inline ssize_t write_file(Fd fd, void* buf, size_t len)
 		{
 		#if defined(_WIN32)
-			return static_cast<ssize_t>(_write(fd, buf, len));
+			DWORD did = 0;
+
+			// annoyingly, this shit returns false and sets error to broken pipe even if bytes could be written.
+			if(!WriteFile(fd, buf, static_cast<DWORD>(len), &did, nullptr) && GetLastError() !=  ERROR_BROKEN_PIPE)
+			{
+				impl::int_warn("WriteFile(): {}", GetLastErrorAsString());
+				return -1;
+			}
+
+			return static_cast<ssize_t>(did);
 		#else
 			return write(fd, buf, len);
 		#endif
@@ -2099,11 +2123,18 @@ namespace nabs
 		inline PipeDes make_pipe()
 		{
 		#if defined(_WIN32)
-			if(int p[2]; _pipe(p, PIPE_BUFFER_SIZE, _O_BINARY) < 0)
-				impl::int_error("_pipe(): {}", strerror(errno));
+			Fd p_read;
+			Fd p_write;
+			SECURITY_ATTRIBUTES attr { };
+			memset(&attr, 0, sizeof(attr));
+			attr.nLength = sizeof(attr);
+			attr.bInheritHandle = true;
 
-			else
-				return PipeDes { p[0], p[1] };
+			if(!CreatePipe(&p_read, &p_write, &attr, 0))
+				impl::int_error("CreatePipe(): {}", GetLastErrorAsString());
+
+			return PipeDes { p_read, p_write };
+
 		#else
 			if(int p[2]; pipe(p) < 0)
 			{
@@ -2127,27 +2158,26 @@ namespace nabs
 		inline void close_file(Fd fd)
 		{
 		#if defined(_WIN32)
-			if(_close(fd) < 0)
+			// if(_close(fd) < 0)
+			if(!CloseHandle(fd))
+				impl::int_error("CloseHandle(): {}", GetLastErrorAsString());
 		#else
 			if(close(fd) < 0)
-		#endif
 				impl::int_error("close(): {}", strerror(errno));
+		#endif
 		}
 
+	#if !defined(_WIN32)
 		inline int dupe_fd(os::Fd src, os::Fd dst, bool close_src = true)
 		{
-		#if defined(_WIN32)
-			constexpr auto f_dup2 = ::_dup2;
-		#else
-			constexpr auto f_dup2 = ::dup2;
-		#endif
 			// dup2 closes dst for us.
-			if(f_dup2(src, dst) < 0)
+			if(dup2(src, dst) < 0)
 				impl::int_error("dup2({}, {}): {}", src, dst, strerror(errno));
 
 			if(close_src)
 				os::close_file(src);
 		}
+	#endif
 
 		inline os::Fd dupe_fd(os::Fd src)
 		{
@@ -2155,16 +2185,24 @@ namespace nabs
 				return src;
 
 		#if defined(_WIN32)
-			constexpr auto f_dup = ::_dup;
+
+			auto proc = GetCurrentProcess();
+			HANDLE dst { };
+
+			// note: by default don't let this be inheritable...
+			if(!DuplicateHandle(proc, src, proc, &dst, 0, false, DUPLICATE_SAME_ACCESS))
+				impl::int_error("DuplicateHandle(): {}", GetLastErrorAsString());
+
+			return dst;
+
 		#else
-			constexpr auto f_dup = ::dup;
-		#endif
 			// dup2 closes dst for us.
-			if(auto ret = f_dup(src); ret < 0)
+			if(auto ret = dup(src); ret < 0)
 				impl::int_error("dup({}): {}", src, strerror(errno));
 
 			else
 				return ret;
+		#endif
 		}
 
 		inline Fd open_file(const char* path, FileOpenFlags fof)
@@ -2173,20 +2211,24 @@ namespace nabs
 			Fd fd = 0;
 
 		#if defined(_WIN32)
-			if(fof._need_write)         flags |= _O_RDWR;
-			else                        flags |= _O_RDONLY;
 
-			if(fof._should_create)      flags |= _O_CREAT;
-			if(fof._truncate_mode)      flags |= _O_TRUNC;
-			else if(fof._append_mode)   flags |= _O_APPEND;
+			SECURITY_ATTRIBUTES attr { };
+			memset(&attr, 0, sizeof(attr));
+			attr.nLength = sizeof(attr);
+			attr.bInheritHandle = true;
 
-			if(fof._should_create)
-				fd = _open(path, flags, _S_IREAD | _S_IWRITE);
-			else
-				fd = _open(path, flags);
+			fd = CreateFile(
+				path,
+				GENERIC_READ | (fof._need_write ? GENERIC_WRITE : 0),
+				FILE_SHARE_READ,
+				&attr,
+				fof._should_create ? OPEN_ALWAYS : OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL,
+				nullptr
+			);
 
-			if(fd < 0)
-				impl::int_error("open('{}'): {}", path, strerror(errno));
+			if(fd == INVALID_HANDLE_VALUE)
+				impl::int_error("CreateFile(): {}", GetLastErrorAsString());
 
 		#else
 			if(fof._need_write)         flags |= O_RDWR;
@@ -2425,11 +2467,11 @@ namespace nabs
 			{
 			#if defined(_WIN32)
 
-				auto get_handle = [](os::Fd fd, HANDLE def) -> HANDLE {
+				auto get_handle = [](os::Fd fd, os::Fd def) -> HANDLE {
 					if(fd == os::FD_NONE)
 						return def;
 					else
-						return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+						return fd;
 				};
 
 				STARTUPINFO info;
@@ -2444,9 +2486,7 @@ namespace nabs
 				// need to disable inheritance on the child_close handle
 				if(child_close != os::FD_NONE)
 				{
-					// TODO: handle error for _get_osfhandle
-					auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(child_close));
-					if(!SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0))
+					if(!SetHandleInformation(child_close, HANDLE_FLAG_INHERIT, 0))
 						impl::int_error("SetHandleInformation(): {}", GetLastErrorAsString());
 				}
 
@@ -2628,7 +2668,7 @@ namespace nabs
 
 			#if defined(_WIN32)
 				if(out_fd == os::FD_NONE)
-					out_fd = STDOUT_FILENO;
+					out_fd = GetStdHandle(STD_OUTPUT_HANDLE);
 
 				// since we cannot fork(), we just use a thread. this is necessary
 				// so we can return and let the rest of the pipeline proceed. since
@@ -2929,6 +2969,43 @@ namespace nabs
 		});
 	}
 }
+
+
+
+/*
+	something that we shouldn't need to do, but have to do anyway.
+
+	basically, the idea is this -- a build recipe should call nabs::init(argc, argv) upon
+	startup. right now, the only purpose of that is so we can hijack the program and use
+	it to run our two helper functions (split_transfer and fd_transfer) in a separate
+	process context. we do this by first CreateProcess() our own executable, and passing
+	in some magic strings as argv[0] instead of using the path. We are guaranteed (probably)
+	that our own (original) argv[0] is a real path, so there should be no problems spawning it.
+*/
+namespace nabs
+{
+	// global state -- this is slightly somewhat very dangerous in a header-only library
+	static std::string __program_path;
+	inline void init(int argc, char** argv)
+	{
+		__program_path = argv[0];
+
+		// of course we only need to do this on windows
+	#if defined(_WIN32)
+		if(__program_path == os::MAGIC_PROGRAM_SPLIT)
+		{
+
+		}
+		else if(__program_path == os::MAGIC_PROGRAM_FILE)
+		{
+		}
+	#endif
+	}
+}
+
+
+
+
 
 
 
@@ -3690,7 +3767,7 @@ namespace nabs::impl
 		{
 			auto path = zpr::sprint("{}\\Auxiliary\\Build\\Microsoft.VCToolsVersion.default.txt", vsRoot);
 			auto file = os::open_file(path.c_str(), { });
-			if(file == os::FD_NONE)
+			if(file == INVALID_HANDLE_VALUE)
 				impl::int_error("msvc_finder(): VCToolsVersion file missing");
 
 			while(true)
