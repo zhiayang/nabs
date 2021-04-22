@@ -1936,36 +1936,28 @@ namespace zpr
 }
 
 
-
-
-
-
-
-
 #include <set>
 #include <string>
 #include <vector>
 #include <filesystem>
 #include <type_traits>
 
-#include <stdio.h>
-#include <errno.h>
+#include <cstdio>
+#include <cerrno>
+#include <cassert>
+#include <cstring>
+#include <cstdlib>
+
 #include <fcntl.h>
-#include <assert.h>
-#include <string.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #if defined(_WIN32)
 
-#include <thread>
-
-#include <io.h>
-
 #define WIN32_LEAN_AND_MEAN 1
 #define NOMINMAX            1
 #include <windows.h>
+#include <io.h>
 
 static constexpr int STDIN_FILENO   = 0;
 static constexpr int STDOUT_FILENO  = 1;
@@ -1973,32 +1965,94 @@ static constexpr int STDERR_FILENO  = 2;
 
 using ssize_t = long long;
 
-LPSTR GetLastErrorAsString()
-{
-	// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
-
-	DWORD errorMessageId = GetLastError();
-	assert(errorMessageId != 0);
-
-	LPSTR messageBuffer = nullptr;
-
-	DWORD size = FormatMessage(
-		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-		nullptr, errorMessageId, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
-
-	return messageBuffer;
-}
+LPSTR GetLastErrorAsString();
 
 #else
-
 #include <unistd.h>
-
 #endif // _WIN32
+
+
+#define NABS_DO_EXPAND(VAL)  VAL ## 1
+#define NABS_EXPAND(VAL)     NABS_DO_EXPAND(VAL)
+
+#if !defined(NABS_DECLARATION_ONLY)
+	#define NABS_DECLARATION_ONLY 0
+#elif (NABS_EXPAND(NABS_DECLARATION_ONLY) == 1)
+	#undef NABS_DECLARATION_ONLY
+	#define NABS_DECLARATION_ONLY 1
+#endif
+
+#if !defined(NABS_NO_COLOURS)
+	#define NABS_NO_COLOURS 0
+#elif (NABS_EXPAND(NABS_NO_COLOURS) == 1)
+	#undef NABS_NO_COLOURS
+	#define NABS_NO_COLOURS 1
+#endif
+
+
 
 // standard stuff for everybody
 namespace nabs
 {
+	// logging
+	namespace impl
+	{
+	#if !NABS_NO_COLOURS
+
+		static constexpr const char* COLOUR_LOG = "\x1b[30;1m";
+		static constexpr const char* COLOUR_WARN = "\x1b[1m\x1b[33m";
+		static constexpr const char* COLOUR_ERROR = "\x1b[1m\x1b[31m";
+		static constexpr const char* COLOUR_RESET = "\x1b[0m";
+	#else
+
+		static constexpr const char* COLOUR_LOG = "";
+		static constexpr const char* COLOUR_WARN = "";
+		static constexpr const char* COLOUR_ERROR = "";
+		static constexpr const char* COLOUR_RESET = "";
+	#endif
+	}
+
+	template <typename... Args>
+	void __logger(int level, std::string_view fmt, Args&&... args)
+	{
+		const char* colour = nullptr;
+		const char* heading = nullptr;
+
+		if(level == 0)      colour = impl::COLOUR_LOG, heading = "[log]";
+		else if(level == 1) colour = impl::COLOUR_WARN, heading = "[wrn]";
+		else if(level == 2) colour = impl::COLOUR_ERROR, heading = "[err]";
+		else                colour = impl::COLOUR_ERROR, heading = "[???]";
+
+		auto output = (level > 0 ? stderr : stdout);
+		zpr::fprintln(output, "{}{}{} {}", colour, heading, impl::COLOUR_RESET,
+			zpr::sprint(fmt, static_cast<Args&&>(args)...));
+	}
+
+	template <typename... Args>
+	void log(std::string_view fmt, Args&&... args)
+	{
+		__logger(0, fmt, static_cast<Args&&>(args)...);
+	}
+
+	template <typename... Args>
+	void warn(std::string_view fmt, Args&&... args)
+	{
+		__logger(1, fmt, static_cast<Args&&>(args)...);
+	}
+
+	template <typename... Args>
+	void error(std::string_view fmt, Args&&... args)
+	{
+		__logger(2, fmt, static_cast<Args&&>(args)...);
+	}
+
+	template <typename... Args>
+	[[noreturn]] void error_and_exit(int code, std::string_view fmt, Args&&... args)
+	{
+		__logger(2, fmt, static_cast<Args&&>(args)...);
+		exit(code);
+	}
+
 	namespace fs
 	{
 		using namespace std::filesystem;
@@ -2009,14 +2063,13 @@ namespace nabs
 		template <typename... Args>
 		[[noreturn]] void int_error(Args&&... args)
 		{
-			zpr::fprintln(stderr, "internal error: {}", zpr::sprint(std::forward<Args>(args)...));
-			exit(1);
+			error_and_exit(69, static_cast<Args&&>(args)...);
 		}
 
 		template <typename... Args>
 		void int_warn(Args&&... args)
 		{
-			zpr::fprintln(stderr, "internal warning: {}", zpr::sprint(std::forward<Args>(args)...));
+			warn(static_cast<Args&&>(args)...);
 		}
 	}
 
@@ -2030,11 +2083,11 @@ namespace nabs
 			bool _truncate_mode = false;
 			int _create_perms = 0664;
 
-			FileOpenFlags& needs_write(bool x)      { _need_write = x; return *this; }
-			FileOpenFlags& should_create(bool x)    { _should_create = x; return *this; }
-			FileOpenFlags& append_mode(bool x)      { _append_mode = x; return *this; }
-			FileOpenFlags& truncate_mode(bool x)    { _truncate_mode = x; return *this; }
-			FileOpenFlags& create_perms(int x)      { _create_perms = x; return *this; }
+			inline FileOpenFlags& needs_write(bool x)   { _need_write = x; return *this; }
+			inline FileOpenFlags& should_create(bool x) { _should_create = x; return *this; }
+			inline FileOpenFlags& append_mode(bool x)   { _append_mode = x; return *this; }
+			inline FileOpenFlags& truncate_mode(bool x) { _truncate_mode = x; return *this; }
+			inline FileOpenFlags& create_perms(int x)   { _create_perms = x; return *this; }
 		};
 	}
 
@@ -2044,8 +2097,6 @@ namespace nabs
 		std::vector<fs::path> include_paths;
 	};
 }
-
-
 
 
 // pipes and commands
@@ -2076,6 +2127,8 @@ namespace nabs
 
 		using Proc = pid_t;
 		static constexpr Proc PROC_NONE = -1;
+
+		void dupe_fd(os::Fd src, os::Fd dst);
 	#endif
 
 		struct PipeDes
@@ -2084,7 +2137,212 @@ namespace nabs
 			Fd write_end;
 		};
 
-		inline ssize_t read_file(Fd fd, void* buf, size_t len)
+		ssize_t read_file(Fd fd, void* buf, size_t len);
+		ssize_t write_file(Fd fd, void* buf, size_t len);
+
+		PipeDes make_pipe();
+		os::Fd dupe_fd(os::Fd src);
+		int wait_for_pid(Proc proc);
+
+		void close_file(Fd fd);
+		Fd open_file(const char* path, FileOpenFlags fof);
+	}
+
+	namespace impl
+	{
+		struct Part;
+		struct SplitProgArgs;
+
+		void split_transfer(SplitProgArgs args);
+		void fd_transfer(os::Fd in_fd, os::Fd out_fd);
+
+		struct Pipeline
+		{
+			inline Pipeline(std::vector<Part> parts) : parts(std::move(parts)) { }
+			inline bool empty() const { return this->parts.empty(); }
+
+			int run();
+			std::vector<os::Proc> runAsync();
+
+			std::vector<Part> parts;
+
+			friend struct Part;
+			friend void split_transfer(SplitProgArgs args);
+
+		private:
+			std::vector<os::Proc> runAsync(os::Fd in_fd, os::Fd close_in_children);
+		};
+
+		struct Part
+		{
+			Part(Part&&) = default;
+			Part(const Part&) = default;
+
+			Part& operator= (Part&&) = default;
+			Part& operator= (const Part&) = default;
+
+			static constexpr int TYPE_PROC  = 1;
+			static constexpr int TYPE_FILE  = 2;
+			static constexpr int TYPE_SPLIT = 3;
+
+			inline int type() const  { return this->_type; }
+			inline int flags() const { return this->_flags; }
+
+			// used to check... certain things.
+			inline bool is_passive() const { return this->type() == TYPE_FILE; }
+
+			static inline Part of_command(std::string name, std::vector<std::string> args = { })
+			{
+				return Part(TYPE_PROC, 0, std::move(name), std::move(args));
+			}
+
+			static inline Part of_file(std::string name)
+			{
+				return Part(TYPE_FILE, 0, std::move(name), { });
+			}
+
+			static inline Part of_split(std::vector<impl::Pipeline> splits, std::vector<impl::Pipeline*> ptrs)
+			{
+				auto ret = Part(TYPE_SPLIT, 0, "split", { });
+				ret.split_vals = std::move(splits);
+				ret.split_ptrs = std::move(ptrs);
+				return ret;
+			}
+
+		private:
+			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
+			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
+
+		#if defined(_WIN32)
+			std::string make_args();
+		#else
+			char** make_args();
+		#endif // _WIN32
+
+			inline Part(int type, int flags, std::string name, std::vector<std::string> args)
+				: _type(type)
+				, _flags(flags)
+				, name(std::move(name))
+				, arguments(std::move(args))
+			{ }
+
+			int _type;
+			int _flags;
+			std::string name;
+			std::vector<std::string> arguments;
+
+			std::vector<impl::Pipeline> split_vals;
+			std::vector<impl::Pipeline*> split_ptrs;
+
+			friend struct Pipeline;
+		};
+
+		struct SplitProgArgs
+		{
+			os::Fd read_fd;
+			os::Fd write_fd;
+			std::vector<os::Fd> write_fds;
+
+			std::vector<impl::Pipeline> split_vals;
+			std::vector<impl::Pipeline*> split_ptrs;
+		};
+
+		// ADL should let us find this operator.
+		Pipeline operator| (Pipeline head, const Pipeline& tail);
+	}
+
+
+	template <typename... Args>
+	inline impl::Pipeline cmd(std::string exe, Args&&... args)
+	{
+		static_assert(((std::is_convertible_v<Args, std::string>) && ...),
+			"arguments to cmd() must be convertible to std::string");
+
+		return impl::Pipeline({
+			impl::Part::of_command(std::move(exe), std::vector<std::string>{std::forward<Args>(args)...})
+		});
+	}
+
+	inline impl::Pipeline cmd(std::string exe, std::vector<std::string> args)
+	{
+		return impl::Pipeline({
+			impl::Part::of_command(std::move(exe), std::move(args))
+		});
+	}
+
+	inline impl::Pipeline file(fs::path path)
+	{
+		return impl::Pipeline({
+			impl::Part::of_file(path.string())
+		});
+	}
+
+	namespace impl
+	{
+		template <typename T>
+		inline void split_helper(std::vector<Pipeline>& vals, std::vector<Pipeline*>& ptrs, T&& thing)
+		{
+			static_assert(std::is_same_v<std::decay_t<T>, Pipeline>, "split() requires pipes");
+			static_assert(std::is_rvalue_reference_v<decltype(thing)> || std::is_lvalue_reference_v<decltype(thing)>,
+				"split() requires either lvalue or rvalue references as arguments");
+
+			if constexpr (std::is_rvalue_reference_v<decltype(thing)>)
+				vals.push_back(std::move(thing));
+
+			else
+				ptrs.push_back(&thing);
+		}
+
+		template <typename T, typename... Args>
+		inline void split_helper(std::vector<Pipeline>& vals, std::vector<Pipeline*>& ptrs, T&& thing, Args&&... things)
+		{
+			split_helper(vals, ptrs, std::forward<T>(thing));
+			split_helper(vals, ptrs, std::forward<Args>(things)...);
+		}
+	}
+
+	template <typename... Args>
+	inline impl::Pipeline split(Args&&... args)
+	{
+	#if defined(_WIN32)
+		// static_assert(std::conjunction_v<std::is_same<int, char>>, "split() does not work on windows");
+	#endif
+
+		static_assert(sizeof...(args) > 0, "split() requires at least one argument");
+
+		std::vector<impl::Pipeline> vals;
+		std::vector<impl::Pipeline*> ptrs;
+
+		impl::split_helper(vals, ptrs, std::forward<Args>(args)...);
+
+		return impl::Pipeline({
+			impl::Part::of_split(std::move(vals), std::move(ptrs))
+		});
+	}
+
+	template <typename... Args>
+	inline impl::Pipeline tee(Args&&... args)
+	{
+	#if defined(_WIN32)
+		// static_assert(std::conjunction_v<std::is_same<int, char>>, "tee() does not work on windows");
+	#endif
+
+		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
+			"tee() requires std::filesystem::path");
+
+		return impl::Pipeline({
+			impl::Part::of_split(std::vector<impl::Pipeline> { nabs::file(args)... }, { })
+		});
+	}
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	namespace os
+	{
+		ssize_t read_file(Fd fd, void* buf, size_t len)
 		{
 		#if defined(_WIN32)
 			DWORD did = 0;
@@ -2101,7 +2359,7 @@ namespace nabs
 		#endif
 		}
 
-		inline ssize_t write_file(Fd fd, void* buf, size_t len)
+		ssize_t write_file(Fd fd, void* buf, size_t len)
 		{
 		#if defined(_WIN32)
 			DWORD did = 0;
@@ -2119,7 +2377,7 @@ namespace nabs
 		#endif
 		}
 
-		inline PipeDes make_pipe()
+		PipeDes make_pipe()
 		{
 		#if defined(_WIN32)
 			Fd p_read;
@@ -2154,7 +2412,7 @@ namespace nabs
 		#endif
 		}
 
-		inline void close_file(Fd fd)
+		void close_file(Fd fd)
 		{
 		#if defined(_WIN32)
 			if(!CloseHandle(fd))
@@ -2166,18 +2424,17 @@ namespace nabs
 		}
 
 	#if !defined(_WIN32)
-		inline void dupe_fd(os::Fd src, os::Fd dst, bool close_src = true)
+		void dupe_fd(os::Fd src, os::Fd dst)
 		{
 			// dup2 closes dst for us.
 			if(dup2(src, dst) < 0)
 				impl::int_error("dup2({}, {}): {}", src, dst, strerror(errno));
 
-			if(close_src)
-				os::close_file(src);
+			os::close_file(src);
 		}
 	#endif
 
-		inline os::Fd dupe_fd(os::Fd src)
+		os::Fd dupe_fd(os::Fd src)
 		{
 			if(src == os::FD_NONE)
 				return src;
@@ -2203,7 +2460,7 @@ namespace nabs
 		#endif
 		}
 
-		inline Fd open_file(const char* path, FileOpenFlags fof)
+		Fd open_file(const char* path, FileOpenFlags fof)
 		{
 			int flags = 0;
 			Fd fd = 0;
@@ -2248,7 +2505,7 @@ namespace nabs
 			return fd;
 		}
 
-		inline int wait_for_pid(Proc proc)
+		int wait_for_pid(Proc proc)
 		{
 		#if defined(_WIN32)
 			auto result = WaitForSingleObject(proc, INFINITE);
@@ -2278,169 +2535,75 @@ namespace nabs
 
 	namespace impl
 	{
-		struct Part;
-		struct SplitProgArgs;
-
-		inline void split_transfer(SplitProgArgs args);
-		inline void fd_transfer(os::Fd in_fd, os::Fd out_fd);
-
-		struct Pipeline
+	#if defined(_WIN32)
+		std::string Part::make_args()
 		{
-			Pipeline(std::vector<Part> parts) : parts(std::move(parts)) { }
+			std::string ret;
 
-			bool empty() const { return this->parts.empty(); }
+			auto quote_thing = [](const std::string& s) -> std::string {
+				if(s.find_first_of(" \t\n\v\f") == std::string::npos)
+					return s;
 
-			int run();
-			std::vector<os::Proc> runAsync();
+				std::string ret = "\"";
+				int backs = 0;
+				for(size_t i = 0; i < s.size(); i++)
+				{
+					char c = s[i];
 
-			std::vector<Part> parts;
-
-			friend struct Part;
-			friend inline void split_transfer(SplitProgArgs args);
-
-		private:
-			std::vector<os::Proc> runAsync(os::Fd in_fd, os::Fd close_in_children);
-		};
-
-		struct Part
-		{
-			Part(Part&&) = default;
-			Part(const Part&) = default;
-
-			Part& operator= (Part&&) = default;
-			Part& operator= (const Part&) = default;
-
-			static constexpr int TYPE_PROC  = 1;
-			static constexpr int TYPE_FILE  = 2;
-			static constexpr int TYPE_SPLIT = 3;
-
-			int type() const  { return this->_type; }
-			int flags() const { return this->_flags; }
-
-			// used to check... certain things.
-			bool is_passive() const { return this->type() == TYPE_FILE; }
-
-			static Part of_command(std::string name, std::vector<std::string> args = { })
-			{
-				return Part(TYPE_PROC, 0, std::move(name), std::move(args));
-			}
-
-			static Part of_file(std::string name)
-			{
-				return Part(TYPE_FILE, 0, std::move(name), { });
-			}
-
-			static Part of_split(std::vector<impl::Pipeline> splits, std::vector<impl::Pipeline*> ptrs)
-			{
-				auto ret = Part(TYPE_SPLIT, 0, "split", { });
-				ret.split_vals = std::move(splits);
-				ret.split_ptrs = std::move(ptrs);
-				return ret;
-			}
-
-		private:
-			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
-			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
-
-		#if defined(_WIN32)
-
-			std::string make_args()
-			{
-				std::string ret;
-
-				auto quote_thing = [](const std::string& s) -> std::string {
-					if(s.find_first_of(" \t\n\v\f") == std::string::npos)
-						return s;
-
-					std::string ret = "\"";
-					int backs = 0;
-					for(size_t i = 0; i < s.size(); i++)
+					if(c == '\\')
 					{
-						char c = s[i];
-
-						if(c == '\\')
-						{
-							backs++;
-							continue;
-						}
-
-						if(i == s.size() - 1)
-						{
-							ret.append(backs * 2, '\\');
-						}
-						else if(c == '"')
-						{
-							ret.append(backs * 2, '\\');
-							ret += '"';
-						}
-						else
-						{
-							ret.append(backs, '\\');
-							ret += c;
-						}
-
-						backs = 0;
+						backs++;
+						continue;
 					}
 
-					ret += '"';
-					return ret;
-				};
+					if(i == s.size() - 1)
+					{
+						ret.append(backs * 2, '\\');
+					}
+					else if(c == '"')
+					{
+						ret.append(backs * 2, '\\');
+						ret += '"';
+					}
+					else
+					{
+						ret.append(backs, '\\');
+						ret += c;
+					}
 
-
-				ret += quote_thing(this->name);
-				for(auto& arg : this->arguments)
-				{
-					ret += " ";
-					ret += quote_thing(arg);
+					backs = 0;
 				}
 
+				ret += '"';
 				return ret;
-			}
+			};
 
-		#else
-			char** make_args()
+
+			ret += quote_thing(this->name);
+			for(auto& arg : this->arguments)
 			{
-				char** args_array = new char*[this->arguments.size() + 2];
-				for(size_t i = 0; i < arguments.size(); i++)
-					args_array[1 + i] = const_cast<char*>(this->arguments[i].c_str());
-
-				args_array[0] = const_cast<char*>(this->name.c_str());
-				args_array[this->arguments.size() + 1] = nullptr;
-				return args_array;
+				ret += " ";
+				ret += quote_thing(arg);
 			}
-		#endif // _WIN32
 
-			Part(int type, int flags, std::string name, std::vector<std::string> args)
-				: _type(type)
-				, _flags(flags)
-				, name(std::move(name))
-				, arguments(std::move(args))
-			{ }
+			return ret;
+		}
 
-			int _type;
-			int _flags;
-			std::string name;
-			std::vector<std::string> arguments;
-
-			std::vector<impl::Pipeline> split_vals;
-			std::vector<impl::Pipeline*> split_ptrs;
-
-			friend struct Pipeline;
-		};
-
-		struct SplitProgArgs
+	#else
+		char** Part::make_args()
 		{
-			os::Fd read_fd;
-			os::Fd write_fd;
-			std::vector<os::Fd> write_fds;
+			char** args_array = new char*[this->arguments.size() + 2];
+			for(size_t i = 0; i < arguments.size(); i++)
+				args_array[1 + i] = const_cast<char*>(this->arguments[i].c_str());
 
-			std::vector<impl::Pipeline> split_vals;
-			std::vector<impl::Pipeline*> split_ptrs;
-		};
-
+			args_array[0] = const_cast<char*>(this->name.c_str());
+			args_array[this->arguments.size() + 1] = nullptr;
+			return args_array;
+		}
+	#endif // _WIN32
 
 		// ADL should let us find this operator.
-		inline Pipeline operator| (Pipeline head, const Pipeline& tail)
+		Pipeline operator| (Pipeline head, const Pipeline& tail)
 		{
 			constexpr auto TYPE_FILE = Part::TYPE_FILE;
 
@@ -2457,7 +2620,6 @@ namespace nabs
 			head.parts.insert(head.parts.end(), tail.parts.begin(), tail.parts.end());
 			return head;
 		}
-
 
 		std::pair<os::Proc, bool> Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
 		{
@@ -2480,20 +2642,17 @@ namespace nabs
 			{
 			#if defined(_WIN32)
 
-				auto get_handle = [](os::Fd fd, os::Fd def) -> HANDLE {
-					if(fd == os::FD_NONE)
-						return def;
-					else
-						return fd;
+				auto default_handle = [](os::Fd fd, DWORD def) -> HANDLE {
+					return fd == os::FD_NONE ? GetStdHandle(def) : fd;
 				};
 
 				STARTUPINFOEX info;
 				memset(&info, 0, sizeof(info));
 
 				info.StartupInfo.cb = sizeof(STARTUPINFOEX);
-				info.StartupInfo.hStdInput  = get_handle(in_fd, GetStdHandle(STD_INPUT_HANDLE));
-				info.StartupInfo.hStdOutput = get_handle(out_fd, GetStdHandle(STD_OUTPUT_HANDLE));
-				info.StartupInfo.hStdError  = get_handle(err_fd, GetStdHandle(STD_ERROR_HANDLE));
+				info.StartupInfo.hStdInput  = default_handle(in_fd, STD_INPUT_HANDLE);
+				info.StartupInfo.hStdOutput = default_handle(out_fd, STD_OUTPUT_HANDLE);
+				info.StartupInfo.hStdError  = default_handle(err_fd, STD_ERROR_HANDLE);
 				info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
 				std::vector<HANDLE> inherited_handles = {
@@ -2844,7 +3003,7 @@ namespace nabs
 			return status;
 		}
 
-		inline void fd_transfer(os::Fd in_fd, os::Fd out_fd)
+		void fd_transfer(os::Fd in_fd, os::Fd out_fd)
 		{
 			char buf[4096] { };
 			while(true)
@@ -2861,7 +3020,7 @@ namespace nabs
 			}
 		}
 
-		inline void split_transfer(SplitProgArgs args)
+		void split_transfer(SplitProgArgs args)
 		{
 			std::vector<os::Fd> fds;
 			std::vector<os::Proc> children;
@@ -2914,100 +3073,8 @@ namespace nabs
 				os::wait_for_pid(c);
 		}
 	}
-
-
-
-
-
-
-
-
-	template <typename... Args>
-	inline impl::Pipeline cmd(std::string exe, Args&&... args)
-	{
-		static_assert(((std::is_convertible_v<Args, std::string>) && ...),
-			"arguments to cmd() must be convertible to std::string");
-
-		return impl::Pipeline({
-			impl::Part::of_command(std::move(exe), std::vector<std::string>{std::forward<Args>(args)...})
-		});
-	}
-
-	inline impl::Pipeline cmd(std::string exe, std::vector<std::string> args)
-	{
-		return impl::Pipeline({
-			impl::Part::of_command(std::move(exe), std::move(args))
-		});
-	}
-
-	inline impl::Pipeline file(fs::path path)
-	{
-		return impl::Pipeline({
-			impl::Part::of_file(path.string())
-		});
-	}
-
-	namespace impl
-	{
-		template <typename T>
-		inline void split_helper(std::vector<Pipeline>& vals, std::vector<Pipeline*>& ptrs, T&& thing)
-		{
-			static_assert(std::is_same_v<std::decay_t<T>, Pipeline>, "split() requires pipes");
-			static_assert(std::is_rvalue_reference_v<decltype(thing)> || std::is_lvalue_reference_v<decltype(thing)>,
-				"split() requires either lvalue or rvalue references as arguments");
-
-			if constexpr (std::is_rvalue_reference_v<decltype(thing)>)
-				vals.push_back(std::move(thing));
-
-			else
-				ptrs.push_back(&thing);
-		}
-
-		template <typename T, typename... Args>
-		inline void split_helper(std::vector<Pipeline>& vals, std::vector<Pipeline*>& ptrs, T&& thing, Args&&... things)
-		{
-			split_helper(vals, ptrs, std::forward<T>(thing));
-			split_helper(vals, ptrs, std::forward<Args>(things)...);
-		}
-	}
-
-	template <typename... Args>
-	inline impl::Pipeline split(Args&&... args)
-	{
-	#if defined(_WIN32)
-		// static_assert(std::conjunction_v<std::is_same<int, char>>, "split() does not work on windows");
-	#endif
-
-		static_assert(sizeof...(args) > 0, "split() requires at least one argument");
-
-		std::vector<impl::Pipeline> vals;
-		std::vector<impl::Pipeline*> ptrs;
-
-		impl::split_helper(vals, ptrs, std::forward<Args>(args)...);
-
-		return impl::Pipeline({
-			impl::Part::of_split(std::move(vals), std::move(ptrs))
-		});
-	}
-
-	template <typename... Args>
-	inline impl::Pipeline tee(Args&&... args)
-	{
-	#if defined(_WIN32)
-		// static_assert(std::conjunction_v<std::is_same<int, char>>, "tee() does not work on windows");
-	#endif
-
-		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
-			"tee() requires std::filesystem::path");
-
-		return impl::Pipeline({
-			impl::Part::of_split(std::vector<impl::Pipeline> { nabs::file(args)... }, { })
-		});
-	}
 }
-
-
-
+#endif // !NABS_DECLARATION_ONLY
 
 
 
@@ -3032,44 +3099,56 @@ namespace nabs
 
 	namespace impl
 	{
-		inline std::vector<fs::path> get_path_variable()
-		{
-			std::vector<fs::path> ret;
-			std::string var = getenv("PATH");
-
-			while(true)
-			{
-				auto i = var.find(':');
-				if(i == std::string::npos)
-				{
-					ret.push_back(var);
-					break;
-				}
-				else
-				{
-					auto comp = var.substr(0, i);
-					ret.push_back(comp);
-					var = var.substr(i + 1);
-				}
-			}
-
-			return ret;
-		}
-
-		inline fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path)
-		{
-			for(auto& p : path)
-			{
-				auto tmp = (p / file);
-				if(fs::exists(tmp))
-					return tmp;
-			}
-
-			return { };
-		}
+		std::vector<fs::path> get_path_variable();
+		fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path);
 	}
 
-	inline Compiler find_c_compiler()
+	Compiler find_c_compiler();
+	Compiler find_cpp_compiler();
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	std::vector<fs::path> impl::get_path_variable()
+	{
+		std::vector<fs::path> ret;
+		std::string var = getenv("PATH");
+
+		while(true)
+		{
+			auto i = var.find(':');
+			if(i == std::string::npos)
+			{
+				ret.push_back(var);
+				break;
+			}
+			else
+			{
+				auto comp = var.substr(0, i);
+				ret.push_back(comp);
+				var = var.substr(i + 1);
+			}
+		}
+
+		return ret;
+	}
+
+	fs::path impl::find_file_in_path(const fs::path& file, const std::vector<fs::path>& path)
+	{
+		for(auto& p : path)
+		{
+			auto tmp = (p / file);
+			if(fs::exists(tmp))
+				return tmp;
+		}
+
+		return { };
+	}
+
+	// TODO: `find_c_compiler()` and `find_cpp_compiler()` should be able to return failure.
+	Compiler find_c_compiler()
 	{
 		// TODO: support cross-compilation better
 		// basically we need a way to define the target, provide a sysroot, and
@@ -3094,6 +3173,7 @@ namespace nabs
 		#error "unknown host architecture"
 	#endif
 
+		// TODO: not sure how msvc-finder deals with the situation where msvc is not installed
 		Compiler ret { };
 		ret.path = os::msvc_toolchain_binaries() / ARCH / "cl.exe";
 		ret.kind = Compiler::KIND_MSVC_CL;
@@ -3118,7 +3198,7 @@ namespace nabs
 	#endif // _WIN32
 	}
 
-	inline Compiler find_cpp_compiler()
+	Compiler find_cpp_compiler()
 	{
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
@@ -3145,6 +3225,10 @@ namespace nabs
 	#endif // _WIN32
 	}
 }
+#endif // !NABS_DECLARATION_ONLY
+
+
+
 
 
 
@@ -3152,7 +3236,20 @@ namespace nabs
 // actual compiling
 namespace nabs
 {
-	inline bool compile_files(const CompilerFlags& opts, const fs::path& output, const std::vector<fs::path>& files)
+	int compile_files(const CompilerFlags& opts, const fs::path& output, const std::vector<fs::path>& files);
+
+	template <typename... Args, typename = std::enable_if_t<((std::is_convertible_v<Args, fs::path>) && ...)>>
+	inline int compile_files(const CompilerFlags& opts, const fs::path& output, Args&&... inputs)
+	{
+		return compile_files(opts, output, std::vector<fs::path> { inputs... });
+	}
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	int compile_files(const CompilerFlags& opts, const fs::path& output, const std::vector<fs::path>& files)
 	{
 		bool is_cpp = false;
 		for(auto& p : files)
@@ -3175,11 +3272,24 @@ namespace nabs
 			for(auto& inc : opts.include_paths)
 				args.push_back(zpr::sprint("-I{}", inc.string()));
 
-			// TODO: need a way to specify default c/c++ standard
-			if(cmp.lang == Compiler::LANG_CPP)      args.push_back("-std=c++17");
-			else if(cmp.lang == Compiler::LANG_C)   args.push_back("-std=c11");
-
 			args.push_back("-o");
+			args.push_back(output.string());
+		}
+		else if(cmp.kind == Compiler::KIND_MSVC_CL)
+		{
+			for(auto& inc : opts.include_paths)
+			{
+				// MSDN says that directories with spaces must be double-quoted, but
+				// idk if it is OK if we double quote the entire thing (including /I)
+				// which we do in CreateProcess. So to be safe, just put it as two separate
+				// arguments, so that the path will get quoted on its own if it has spaces.
+				args.push_back("/I");
+				args.push_back(inc.string());
+			}
+
+			// similar thing with the spaces here. note that `/Fe name` won't work (the space)
+			// but `/Fe: name` does work, for some reason.
+			args.push_back("/Fe:");
 			args.push_back(output.string());
 		}
 		else
@@ -3194,13 +3304,11 @@ namespace nabs
 		// construct the command, and run it.
 		return cmd(cmp.path.string(), std::move(args)).run();
 	}
-
-	template <typename... Args, typename = std::enable_if_t<((std::is_convertible_v<Args, fs::path>) && ...)>>
-	inline bool compile_files(const CompilerFlags& opts, const fs::path& output, Args&&... inputs)
-	{
-		return compile_files(opts, output, std::vector<fs::path> { inputs... });
-	}
 }
+#endif // !NABS_DECLARATION_ONLY
+
+
+
 
 
 
@@ -3209,49 +3317,12 @@ namespace nabs::dep
 {
 	struct Item
 	{
-		void depend(Item item)
-		{
-			if(std::find(this->deps.begin(), this->deps.end(), item) != this->deps.end())
-			{
-				impl::int_warn("'{}' already depends on '{}'", this->str(), item.str());
-				return;
-			}
+		void depend(Item item);
+		bool operator== (const Item& other) const;
+		bool operator!= (const Item& item) const;
+		bool operator< (const Item& item) const;
+		std::string str() const;
 
-			this->deps.push_back(std::move(item));
-		}
-
-		// two items are equal if their names/paths are the same.
-		// dependencies are NOT considered in equality checks.
-		bool operator== (const Item& other) const
-		{
-			if(this->phony != other.phony)
-				return false;
-
-			if(this->phony)
-				return this->name == other.name;
-
-			else
-				return fs::equivalent(this->path, other.path);
-		}
-
-		bool operator!= (const Item& item) const
-		{
-			return !(*this == item);
-		}
-
-		bool operator< (const Item& item) const
-		{
-			return this->str() < item.str();
-		}
-
-		std::string str() const
-		{
-			if(this->phony)
-				return this->name;
-
-			else
-				return this->path.string();
-		}
 
 		fs::path path;
 
@@ -3268,36 +3339,38 @@ namespace nabs::dep
 		{ }
 	};
 
-	inline Item create(fs::path path)
-	{
-		return Item(/* phony: */ false, "", std::move(path));
-	}
-
-	inline Item create_phony(std::string name)
-	{
-		return Item(/* phony: */ true, std::move(name), "");
-	}
+	Item create(fs::path path);
+	Item create_phony(std::string name);
 
 	namespace impl
 	{
-		inline void topological_sort(const Item& root, std::vector<std::vector<Item>>& result, std::set<Item>& seen)
-		{
-			if(seen.find(root) != seen.end())
-				nabs::impl::int_error("circular dependency: '{}'", root.str());
-
-			seen.insert(root);
-			std::vector<Item> current;
-			for(auto& dep : root.deps)
-			{
-				current.push_back(dep);
-				topological_sort(dep, result, seen);
-			}
-
-			result.push_back(std::move(current));
-		}
+		void topological_sort(const Item& root, std::vector<std::vector<Item>>& result, std::set<Item>& seen);
 	}
 
-	inline std::vector<std::vector<Item>> topological_sort(const Item& root)
+	std::vector<std::vector<Item>> topological_sort(const Item& root);
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs::dep
+{
+	void impl::topological_sort(const Item& root, std::vector<std::vector<Item>>& result, std::set<Item>& seen)
+	{
+		if(seen.find(root) != seen.end())
+			nabs::impl::int_error("circular dependency: '{}'", root.str());
+
+		seen.insert(root);
+		std::vector<Item> current;
+		for(auto& dep : root.deps)
+		{
+			current.push_back(dep);
+			topological_sort(dep, result, seen);
+		}
+
+		result.push_back(std::move(current));
+	}
+
+	std::vector<std::vector<Item>> topological_sort(const Item& root)
 	{
 		std::vector<std::vector<Item>> ret;
 		ret.push_back({ root });
@@ -3308,7 +3381,44 @@ namespace nabs::dep
 		std::reverse(ret.begin(), ret.end());
 		return ret;
 	}
+
+	void Item::depend(Item item)
+	{
+		if(std::find(this->deps.begin(), this->deps.end(), item) != this->deps.end())
+		{
+			nabs::impl::int_warn("'{}' already depends on '{}'", this->str(), item.str());
+			return;
+		}
+
+		this->deps.push_back(std::move(item));
+	}
+
+	// two items are equal if their names/paths are the same.
+	// dependencies are NOT considered in equality checks.
+	bool Item::operator== (const Item& other) const
+	{
+		if(this->phony != other.phony)  return false;
+
+		if(this->phony) return this->name == other.name;
+		else            return fs::equivalent(this->path, other.path);
+	}
+
+	bool Item::operator!= (const Item& item) const { return !(*this == item); }
+	bool Item::operator< (const Item& item) const { return this->str() < item.str(); }
+
+	std::string Item::str() const
+	{
+		if(this->phony) return this->name;
+		else            return this->path.string();
+	}
+
+	Item create(fs::path path) { return Item(/* phony: */ false, "", std::move(path)); }
+	Item create_phony(std::string name) { return Item(/* phony: */ true, std::move(name), ""); }
 }
+#endif // !NABS_DECLARATION_ONLY
+
+
+
 
 
 
@@ -3358,6 +3468,159 @@ namespace nabs::fs
 
 
 
+// self-rebuilding
+namespace nabs
+{
+	namespace impl
+	{
+		void rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include);
+	}
+
+	void self_update(int argc, char** argv, const std::string& file);
+	void self_update(int argc, char** argv, std::vector<std::string> filenames, bool auto_find_include = false);
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	void impl::rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include)
+	{
+		log("build recipe changed, rebuilding...");
+
+		auto cpp = find_cpp_compiler();
+		if(!fs::exists(cpp.path))
+		{
+			impl::int_warn("C++ compiler (at path '{}') does not exist, aborting self-rebuild");
+			return;
+		}
+
+		// convert the filenames to paths. the caller should have already checked that
+		// all the provided files actually exist.
+		std::vector<fs::path> files;
+		for(auto& f : filenames)
+			files.push_back(fs::canonical(f));
+
+		CompilerFlags flags;
+
+		// find the required include directory
+		if(auto_find_include)
+		{
+			fs::path include_dir;
+
+			auto this_path = fs::path(__FILE__);
+			if(!fs::exists(this_path))
+			{
+				impl::int_warn("somehow, the current header ('{}') does not exist, aborting self-rebuild", __FILE__);
+				return;
+			}
+
+			// i can't be bothered to do some magic where we get the "shallowest" file and then
+			// compose the relative path from that. so, for every file, if the include path does
+			// not already exist, just include it again.
+			for(auto& file : files)
+			{
+				auto& tmp = flags.include_paths;
+
+				auto inc = this_path.lexically_relative(file);
+				if(!inc.empty() && std::find(tmp.begin(), tmp.end(), inc) == tmp.end())
+					tmp.push_back(inc);
+			}
+		}
+
+		if(cpp.kind == Compiler::KIND_GCC_CLANG)
+		{
+			flags.options.push_back("-std=c++17");
+			flags.options.push_back("-Wextra");
+			flags.options.push_back("-Wall");
+			flags.options.push_back("-O2");
+		}
+		else if(cpp.kind == Compiler::KIND_MSVC_CL)
+		{
+			flags.options.push_back("/std:c++17");
+			flags.options.push_back("/O2");
+			flags.options.push_back("/W3");
+		}
+		else
+		{
+			impl::int_warn("unsupported C++ compiler kind, aborting self-rebuild");
+			return;
+		}
+
+		auto this_path = fs::path(argv[0]);
+		assert(fs::exists(this_path));
+
+		auto new_name = fs::temp_directory_path() / (".__" + this_path.filename().string());
+		int status = compile_files(flags, new_name, std::move(files));
+		if(status != 0)
+			impl::int_error("self-rebuild failed");
+
+		// on windows of course, this is a massive fucking pain.
+	#if defined(_WIN32)
+
+
+	#else
+		// ok, now just rename it to ourselves. ez.
+		fs::rename(new_name, this_path);
+
+		// now just exec without forking.
+		if(execvp(this_path.string().c_str(), argv) < 0)
+			impl::int_error("execvp(): {}", strerror(errno));
+	#endif
+	}
+
+	void self_update(int argc, char** argv, std::vector<std::string> filenames, bool auto_find_include)
+	{
+		if(argc < 1)
+		{
+			impl::int_warn("argc < 1??");
+			return;
+		}
+
+		// first, get the modification time of this file:
+		auto this_path = fs::path(argv[0]);
+		if(!fs::exists(this_path))
+		{
+			impl::int_warn("argv[0] (= '{}') does not exist, something fishy is going on",
+				fs::canonical(this_path).string());
+			return;
+		}
+
+		bool need_rebuild = false;
+
+		auto this_time = fs::last_write_time(this_path);
+		for(auto& file : filenames)
+		{
+			// note: there's no requirement for any of the recipe sources to exist;
+			// maybe you want to distribute a binary or something. if any of
+			// the files don't exist we obviously can't rebuild, so exit.
+			auto p = fs::path(file);
+			if(!fs::exists(p))
+				return;
+
+			if(fs::last_write_time(p) > this_time)
+			{
+				need_rebuild = true;
+				break;
+			}
+		}
+
+		if(need_rebuild)
+			impl::rebuild_self(argv, std::move(filenames), auto_find_include);
+	}
+
+	void self_update(int argc, char** argv, const std::string& file)
+	{
+		self_update(argc, argv, std::vector<std::string> { file });
+	}
+}
+#endif // !NABS_DECLARATION_ONLY
+
+
+
+
+
+
 
 
 
@@ -3371,7 +3634,15 @@ namespace nabs::fs
 
 // msvc finder
 // taken almost verbatim from flax; https://github.com/flax-lang/flax/blob/master/source/platform/msvcfinder.cpp
+namespace nabs
+{
+	fs::path msvc_windows_sdk();
+	fs::path msvc_toolchain_binaries();
+	fs::path msvc_toolchain_libraries();
+}
 
+// implementation
+#if !NABS_DECLARATION_ONLY
 #if defined(_WIN32)
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -3420,8 +3691,6 @@ namespace nabs::impl
 			_Out_ PULONGLONG pullMaxVersion) = 0;
 	};
 
-
-
 	struct VersionData
 	{
 		int32_t bestVersion[4];
@@ -3436,7 +3705,7 @@ namespace nabs::impl
 		std::string vsLibDirectory;
 	};
 
-	inline std::wstring convertStringToWChar(const std::string& s)
+	std::wstring convertStringToWChar(const std::string& s)
 	{
 		if(s.empty())
 			return L"";
@@ -3460,7 +3729,7 @@ namespace nabs::impl
 		return wstr;
 	}
 
-	inline std::string convertWCharToString(const std::wstring& s)
+	std::string convertWCharToString(const std::wstring& s)
 	{
 		if(s.empty())
 			return "";
@@ -3484,14 +3753,14 @@ namespace nabs::impl
 	}
 
 
-	inline bool checkFileExists(const std::wstring& name)
+	bool checkFileExists(const std::wstring& name)
 	{
 		auto attrib = GetFileAttributesW(name.c_str());
 		return attrib != INVALID_FILE_ATTRIBUTES;
 	}
 
 	template <typename Visitor>
-	inline bool visitFiles(const std::wstring& dir, VersionData* vd, Visitor&& visitor)
+	bool visitFiles(const std::wstring& dir, VersionData* vd, Visitor&& visitor)
 	{
 		auto wildcard = dir + L"\\*";
 
@@ -3517,8 +3786,7 @@ namespace nabs::impl
 		return true;
 	}
 
-
-	inline std::wstring readRegistryString(HKEY key, const std::wstring& name)
+	std::wstring readRegistryString(HKEY key, const std::wstring& name)
 	{
 		// If the registry data changes between the first and second calls to RegQueryValueExW,
 		// we may fail to get the entire key, even though it told us initially that our buffer length
@@ -3566,7 +3834,7 @@ namespace nabs::impl
 		return ret;
 	}
 
-	inline void getBestWin10Version(const std::wstring& shortName, const std::wstring& fullName, VersionData* vd)
+	void getBestWin10Version(const std::wstring& shortName, const std::wstring& fullName, VersionData* vd)
 	{
 		// find the win10 subdir with the highest version number.
 		int i0 = 0;
@@ -3593,7 +3861,7 @@ namespace nabs::impl
 		vd->bestVersion[3] = i3;
 	}
 
-	inline void getBestWin8Version(const std::wstring& shortName, const std::wstring& fullName, VersionData* vd)
+	void getBestWin8Version(const std::wstring& shortName, const std::wstring& fullName, VersionData* vd)
 	{
 		// find the win8 subdir with the highest version number.
 		int i0 = 0;
@@ -3616,7 +3884,7 @@ namespace nabs::impl
 	}
 
 
-	inline void findWindowsKitRoot(FindResult* result)
+	void findWindowsKitRoot(FindResult* result)
 	{
 		HKEY key;
 		auto rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots", 0,
@@ -3670,8 +3938,7 @@ namespace nabs::impl
 		return;
 	}
 
-
-	inline std::string trim(std::string s)
+	std::string trim(std::string s)
 	{
 		auto ltrim = [](std::string& s) -> std::string& {
 			s.erase(0, s.find_first_not_of(" \t\n\r\f\v"));
@@ -3686,9 +3953,7 @@ namespace nabs::impl
 		return ltrim(rtrim(s));
 	}
 
-
-
-	inline bool findVSToolchain(FindResult* result)
+	bool findVSToolchain(FindResult* result)
 	{
 		// for vs >= 2017, we need to do some COM stupidity.
 
@@ -3817,8 +4082,7 @@ namespace nabs::impl
 		}
 	}
 
-
-	inline FindResult* performMSVCSearch()
+	FindResult* performMSVCSearch()
 	{
 		static bool cached = false;
 		static FindResult cachedResult;
@@ -3840,7 +4104,7 @@ namespace nabs::impl
 
 namespace nabs::os
 {
-	inline fs::path msvc_windows_sdk()
+	fs::path msvc_windows_sdk()
 	{
 		auto ret = impl::performMSVCSearch()->windowsSDKRoot;
 		if(fs::exists(ret))
@@ -3849,16 +4113,7 @@ namespace nabs::os
 			return ret;
 	}
 
-	inline fs::path msvc_toolchain_libraries()
-	{
-		auto ret = impl::performMSVCSearch()->vsLibDirectory;
-		if(fs::exists(ret))
-			return fs::canonical(ret);
-		else
-			return ret;
-	}
-
-	inline fs::path msvc_toolchain_binaries()
+	fs::path msvc_toolchain_binaries()
 	{
 		auto ret = impl::performMSVCSearch()->vsBinDirectory;
 		if(fs::exists(ret))
@@ -3866,5 +4121,67 @@ namespace nabs::os
 		else
 			return ret;
 	}
+
+	fs::path msvc_toolchain_libraries()
+	{
+		auto ret = impl::performMSVCSearch()->vsLibDirectory;
+		if(fs::exists(ret))
+			return fs::canonical(ret);
+		else
+			return ret;
+	}
 }
-#endif
+#endif // _WIN32
+#endif // !NABS_DECLARATION_ONLY
+
+
+
+
+
+
+// implementation of misc things
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+#if defined(_WIN32)
+	LPSTR GetLastErrorAsString()
+	{
+		// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
+
+		DWORD errorMessageId = GetLastError();
+		assert(errorMessageId != 0);
+
+		LPSTR messageBuffer = nullptr;
+
+		DWORD size = FormatMessage(
+			FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+			nullptr, errorMessageId, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+			reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
+
+		return messageBuffer;
+	}
+#endif // _WIN32
+}
+#endif // !NABS_DECLARATION_ONLY
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

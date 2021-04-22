@@ -4,14 +4,21 @@
 
 #include "nabs.h"
 
-int main()
+int main(int argc, char** argv)
 {
+	nabs::self_update(argc, argv, __FILE__);
+
+	zpr::println("got {} argument{}:", argc, argc == 1 ? "" : "s");
+	for(int i = 0; i < argc; i++)
+		zpr::println("  {}", argv[i]);
+
+
 	using namespace nabs;
 
 	auto x
 		= cmd("cat", "README.md")
 		| split(
-			cmd("reverse") | file("asdf.txt"),
+			cmd("rev") | file("asdf.txt"),
 			file("bsdf.txt"))
 		| cmd("hexdump", "-C")
 		| file("foozle.txt");
