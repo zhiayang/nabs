@@ -2070,9 +2070,6 @@ namespace nabs
 		inline fs::path msvc_toolchain_libraries();
 		inline fs::path msvc_toolchain_binaries();
 
-		static constexpr const char* MAGIC_PROGRAM_FILE  = "__@please_read_from_a_file_thanks";
-		static constexpr const char* MAGIC_PROGRAM_SPLIT = "__@please_split_my_file_descriptors_thanks";
-
 	#else
 		using Fd = int;
 		static constexpr Fd FD_NONE = -1;
@@ -2169,7 +2166,7 @@ namespace nabs
 		}
 
 	#if !defined(_WIN32)
-		inline int dupe_fd(os::Fd src, os::Fd dst, bool close_src = true)
+		inline void dupe_fd(os::Fd src, os::Fd dst, bool close_src = true)
 		{
 			// dup2 closes dst for us.
 			if(dup2(src, dst) < 0)
@@ -2464,16 +2461,20 @@ namespace nabs
 
 		std::pair<os::Proc, bool> Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
 		{
-		#if defined(_WIN32)
-			// need to disable inheritance on the child_close handle
-			if(child_close != os::FD_NONE)
-			{
-				if(!SetHandleInformation(child_close, HANDLE_FLAG_INHERIT, 0))
-					impl::int_error("SetHandleInformation(): {}", GetLastErrorAsString());
-			}
-		#endif
+			/*
+				small explanation of `child_close`: on unix, we set the CLOEXEC flag on the
+				pipe descriptors, so they automatically close when the child process execs, so it does
+				not have an open handle to the write end of its own input pipe.
 
+				this is only relevant for split() pipes, because split() itself spawns a child process
+				(only only on unix), but it doesn't exec(). so, if we are not careful, the children
+				spawned by the split() (ie. the grandchildren of the main program) will inherit the
+				write-end of split()'s input pipe, causing split() to never exit. thus, it needs to be
+				closed manually.
 
+				on windows, this is irrelevant, because we always specify exactly the 3 handles (In, Out, Err)
+				that we want the child to inherit, so we can safely ignore `child_close` on windows.
+			*/
 
 			if(this->type() == TYPE_PROC)
 			{
@@ -2559,7 +2560,7 @@ namespace nabs
 
 					if(in_fd != os::FD_NONE)
 					{
-						dupe_fd(in_fd, STDIN_FILENO);
+						os::dupe_fd(in_fd, STDIN_FILENO);
 					}
 					else
 					{
@@ -2569,10 +2570,10 @@ namespace nabs
 					}
 
 					if(out_fd != os::FD_NONE)
-						dupe_fd(out_fd, STDOUT_FILENO);
+						os::dupe_fd(out_fd, STDOUT_FILENO);
 
 					if(err_fd != os::FD_NONE)
-						dupe_fd(err_fd, STDERR_FILENO);
+						os::dupe_fd(err_fd, STDERR_FILENO);
 
 					if(execvp(this->name.c_str(), this->make_args()) < 0)
 						int_error("execvp('{}'): {}", this->name, strerror(errno));
@@ -2743,8 +2744,6 @@ namespace nabs
 					int_error("ResumeThread(): {}", GetLastErrorAsString());
 
 				return { thr, /* dont_close_pipes: */ true };
-				// CloseHandle(thr);
-				// return { os::PROC_NONE, /* dont_close_pipes: */ true };
 
 			#else
 				// basically we have to emulate what the `tee` program does.
@@ -2875,7 +2874,7 @@ namespace nabs
 				assert(pl != nullptr);
 				auto [ p_read, p_write ] = os::make_pipe();
 
-				auto cs = pl->runAsync(p_read, os::FD_NONE);
+				auto cs = pl->runAsync(p_read, /* close_in_children: */ p_write);
 				children.insert(children.end(), cs.begin(), cs.end());
 				fds.push_back(p_write);
 			};
@@ -3006,40 +3005,6 @@ namespace nabs
 		});
 	}
 }
-
-
-
-/*
-	something that we shouldn't need to do, but have to do anyway.
-
-	basically, the idea is this -- a build recipe should call nabs::init(argc, argv) upon
-	startup. right now, the only purpose of that is so we can hijack the program and use
-	it to run our two helper functions (split_transfer and fd_transfer) in a separate
-	process context. we do this by first CreateProcess() our own executable, and passing
-	in some magic strings as argv[0] instead of using the path. We are guaranteed (probably)
-	that our own (original) argv[0] is a real path, so there should be no problems spawning it.
-*/
-namespace nabs
-{
-	// global state -- this is slightly somewhat very dangerous in a header-only library
-	static std::string __program_path;
-	inline void init(int argc, char** argv)
-	{
-		__program_path = argv[0];
-
-		// of course we only need to do this on windows
-	#if defined(_WIN32)
-		if(__program_path == os::MAGIC_PROGRAM_SPLIT)
-		{
-
-		}
-		else if(__program_path == os::MAGIC_PROGRAM_FILE)
-		{
-		}
-	#endif
-	}
-}
-
 
 
 
