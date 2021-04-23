@@ -4,6 +4,20 @@
 
 #include "nabs.h"
 
+namespace zpr
+{
+	template <>
+	struct print_formatter<nabs::dep::Item*>
+	{
+		template <typename Cb>
+		void print(nabs::dep::Item* item, Cb&& cb, format_args args)
+		{
+			(void) args;
+			cb(item->str());
+		}
+	};
+}
+
 int main(int argc, char** argv)
 {
 	nabs::self_update(argc, argv, __FILE__);
@@ -21,13 +35,34 @@ int main(int argc, char** argv)
 		| cmd("hexdump", "-C")
 		| file("foozle.txt");
 
-	zpr::println("hi");
-
-	// auto x = file("test.cpp") | cmd("reverse") | cmd("hexdump", "-C") | file("foozle.txt");
-	// auto x = cmd("cat", "test.cpp") | cmd("hexdump", "-C") | cmd("reverse");
 	zpr::println("status = {}", x.run());
 
-	auto c = find_c_compiler().path.string();
-	zpr::println("path = {}", c);
-	// compile_files({ }, "owo", "owo.c", "uwu.c");
+
+
+	namespace nd = nabs::dep;
+	{
+		nd::Graph graph;
+		auto a = graph.add_phony("A");
+		auto b = graph.add_phony("B");
+		auto c = graph.add_phony("C");
+		auto d = graph.add_phony("D");
+		auto e = graph.add_phony("E");
+		auto f = graph.add_phony("F");
+
+		// a->depend(b);
+		// d->depend(b);
+		// c->depend(d);
+		// e->depend(b);
+		// b->depend(f);
+
+		a->depend(b);
+		// c->depend(d);
+		b->depend(a);
+
+		// c->depend(d);
+		// d->depend(b);
+
+		auto sorted = graph.topological_sort();
+		zpr::println("sorted = {}", sorted);
+	}
 }

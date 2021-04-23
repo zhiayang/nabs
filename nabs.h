@@ -49,8 +49,6 @@
 
 #endif
 
-
-
 /*
 	zpr is included here to maintain a single-header strategy.
 	it is available from https://github.com/zhiayang/ztl
@@ -1936,6 +1934,355 @@ namespace zpr
 }
 
 
+/*
+	the Result type is not (yet) available in standalone form, but it is
+	included here because it seems like a nice, useful type that people
+	would want to have. because CTAD (class template argument deduction)
+	only works on class templates (and not template usings), we change
+	the original namespace from `zst` to `nabs` so everyone has a good time.
+
+	zst::Result
+	Copyright 2020 - 2021, zhiayang
+
+	Licensed under the Apache License, Version 2.0 (the "License");
+	you may not use this file except in compliance with the License.
+	You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+	Unless required by applicable law or agreed to in writing, software
+	distributed under the License is distributed on an "AS IS" BASIS,
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	See the License for the specific language governing permissions and
+	limitations under the License.
+*/
+
+namespace nabs
+{
+	template <typename T>
+	struct Ok
+	{
+		Ok() = default;
+		~Ok() = default;
+
+		Ok(Ok&&) = delete;
+		Ok(const Ok&) = delete;
+
+		Ok(T&& value) : m_value(static_cast<T&&>(value)) { }
+		Ok(const T& value) : m_value(value) { }
+
+		template <typename... Args>
+		Ok(Args&&... args) : m_value(static_cast<Args&&>(args)...) { }
+
+		template <typename, typename> friend struct Result;
+
+	private:
+		T m_value;
+	};
+
+	template <>
+	struct Ok<void>
+	{
+		Ok() = default;
+		~Ok() = default;
+
+		Ok(Ok&&) = delete;
+		Ok(const Ok&) = delete;
+
+		template <typename, typename> friend struct Result;
+		template <typename, typename> friend struct zpr::print_formatter;
+	};
+
+	template <typename E>
+	struct Err
+	{
+		Err() = default;
+		~Err() = default;
+
+		Err(Err&&) = delete;
+		Err(const Err&) = delete;
+
+		Err(E&& error) : m_error(static_cast<E&&>(error)) { }
+		Err(const E& error) : m_error(error) { }
+
+		template <typename... Args>
+		Err(Args&&... args) : m_error(static_cast<Args&&>(args)...) { }
+
+		template <typename, typename> friend struct Result;
+		template <typename, typename> friend struct zpr::print_formatter;
+
+	private:
+		E m_error;
+	};
+
+
+
+
+	template <typename T, typename E>
+	struct Result
+	{
+	private:
+		static constexpr int STATE_NONE = 0;
+		static constexpr int STATE_VAL  = 1;
+		static constexpr int STATE_ERR  = 2;
+
+		struct tag_ok { };
+		struct tag_err { };
+
+		Result(tag_ok _, const T& x)  : state(STATE_VAL), val(x) { (void) _; }
+		Result(tag_ok _, T&& x)       : state(STATE_VAL), val(static_cast<T&&>(x)) { (void) _; }
+
+		Result(tag_err _, const E& e) : state(STATE_ERR), err(e) { (void) _; }
+		Result(tag_err _, E&& e)      : state(STATE_ERR), err(static_cast<E&&>(e)) { (void) _; }
+
+	public:
+		using value_type = T;
+		using error_type = E;
+
+		~Result()
+		{
+			if(state == STATE_VAL) this->val.~T();
+			if(state == STATE_ERR) this->err.~E();
+		}
+
+		template <typename T1 = T>
+		Result(Ok<T1>&& ok) : Result(tag_ok(), static_cast<T1&&>(ok.m_value)) { }
+
+		template <typename E1 = E>
+		Result(Err<E1>&& err) : Result(tag_err(), static_cast<E1&&>(err.m_error)) { }
+
+		Result(const Result& other)
+		{
+			this->state = other.state;
+			if(this->state == STATE_VAL) new(&this->val) T(other.val);
+			if(this->state == STATE_ERR) new(&this->err) E(other.err);
+		}
+
+		Result(Result&& other)
+		{
+			this->state = other.state;
+			other.state = STATE_NONE;
+
+			if(this->state == STATE_VAL) new(&this->val) T(static_cast<T&&>(other.val));
+			if(this->state == STATE_ERR) new(&this->err) E(static_cast<E&&>(other.err));
+		}
+
+		Result& operator=(const Result& other)
+		{
+			if(this != &other)
+			{
+				if(this->state == STATE_VAL) this->val.~T();
+				if(this->state == STATE_ERR) this->err.~E();
+
+				this->state = other.state;
+				if(this->state == STATE_VAL) new(&this->val) T(other.val);
+				if(this->state == STATE_ERR) new(&this->err) E(other.err);
+			}
+			return *this;
+		}
+
+		Result& operator=(Result&& other)
+		{
+			if(this != &other)
+			{
+				if(this->state == STATE_VAL) this->val.~T();
+				if(this->state == STATE_ERR) this->err.~E();
+
+				this->state = other.state;
+				other.state = STATE_NONE;
+
+				if(this->state == STATE_VAL) new(&this->val) T(static_cast<T&&>(other.val));
+				if(this->state == STATE_ERR) new(&this->err) E(static_cast<E&&>(other.err));
+			}
+			return *this;
+		}
+
+		T* operator -> () { assert(this->state == STATE_VAL); return &this->val; }
+		const T* operator -> () const { assert(this->state == STATE_VAL); return &this->val; }
+
+		T& operator* () { assert(this->state == STATE_VAL); return this->val; }
+		const T& operator* () const  { assert(this->state == STATE_VAL); return this->val; }
+
+		operator bool() const { return this->state == STATE_VAL; }
+		bool ok() const { return this->state == STATE_VAL; }
+
+		const T& unwrap() const { assert(this->state == STATE_VAL); return this->val; }
+		const E& error() const { assert(this->state == STATE_ERR); return this->err; }
+
+		T& unwrap() { assert(this->state == STATE_VAL); return this->val; }
+		E& error() { assert(this->state == STATE_ERR); return this->err; }
+
+		// enable implicit upcast to a base type
+		template <typename U, typename = std::enable_if_t<
+			std::is_pointer_v<T> && std::is_pointer_v<U>
+			&& std::is_base_of_v<std::remove_pointer_t<U>, std::remove_pointer_t<T>>
+		>>
+		operator Result<U, E> () const
+		{
+			if(state == STATE_VAL)  return Result<U, E>(this->val);
+			if(state == STATE_ERR)  return Result<U, E>(this->err);
+
+			assert(false);
+		}
+
+	private:
+		// 0 = schrodinger -- no error, no value.
+		// 1 = valid
+		// 2 = error
+		int state = 0;
+		union {
+			T val;
+			E err;
+		};
+	};
+
+
+	template <typename E>
+	struct Result<void, E>
+	{
+	private:
+		static constexpr int STATE_NONE = 0;
+		static constexpr int STATE_VAL  = 1;
+		static constexpr int STATE_ERR  = 2;
+
+	public:
+		using value_type = void;
+		using error_type = E;
+
+		Result() : state(STATE_VAL) { }
+
+		Result(Ok<void>&& ok) : Result() { (void) ok; }
+
+		template <typename E1 = E>
+		Result(Err<E1>&& err) : state(STATE_ERR), err(static_cast<E1&&>(err.m_error)) { }
+
+
+		Result(const Result& other)
+		{
+			this->state = other.state;
+			if(this->state == STATE_ERR)
+				this->err = other.err;
+		}
+
+		Result(Result&& other)
+		{
+			this->state = other.state;
+			other.state = STATE_NONE;
+
+			if(this->state == STATE_ERR)
+				this->err = static_cast<E&&>(other.err);
+		}
+
+		Result& operator=(const Result& other)
+		{
+			if(this != &other)
+			{
+				this->state = other.state;
+				if(this->state == STATE_ERR)
+					this->err = other.err;
+			}
+			return *this;
+		}
+
+		Result& operator=(Result&& other)
+		{
+			if(this != &other)
+			{
+				this->state = other.state;
+				other.state = STATE_NONE;
+
+				if(this->state == STATE_ERR)
+					this->err = static_cast<E&&>(other.err);
+			}
+			return *this;
+		}
+
+		operator bool() const { return this->state == STATE_VAL; }
+		bool ok() const { return this->state == STATE_VAL; }
+
+		const E& error() const { assert(this->state == STATE_ERR); return this->err; }
+		E& error() { assert(this->state == STATE_ERR); return this->err; }
+
+		static Result of_value()
+		{
+			return Result<void, E>();
+		}
+
+		template <typename E1 = E>
+		static Result of_error(E1&& err)
+		{
+			return Result<void, E>(E(static_cast<E1&&>(err)));
+		}
+
+		template <typename... Args>
+		static Result of_error(Args&&... xs)
+		{
+			return Result<void, E>(E(static_cast<Args&&>(xs)...));
+		}
+
+	private:
+		int state = 0;
+		E err;
+	};
+}
+
+// now that zpr is seen, we can add printer specialisations
+namespace zpr
+{
+	template <typename T>
+	struct print_formatter<nabs::Ok<T>, std::enable_if_t<detail::has_formatter_v<T>>>
+	{
+		template <typename Cb>
+		void print(const nabs::Ok<T>& ok, Cb&& cb, format_args args)
+		{
+			cb("Ok(");
+			detail::print_one(cb, std::move(args), ok.m_value);
+			cb(")");
+		}
+	};
+
+	template <typename E>
+	struct print_formatter<nabs::Err<E>, std::enable_if_t<detail::has_formatter_v<E>>>
+	{
+		template <typename Cb>
+		void print(const nabs::Err<E>& err, Cb&& cb, format_args args)
+		{
+			cb("Err(");
+			detail::print_one(cb, std::move(args), err.m_error);
+			cb(")");
+		}
+	};
+
+	template <typename E, typename T>
+	struct print_formatter<nabs::Result<T, E>, std::enable_if_t<detail::has_formatter_v<T> && detail::has_formatter_v<E>>>
+	{
+		template <typename Cb>
+		void print(const nabs::Result<T, E>& res, Cb&& cb, format_args args)
+		{
+			if(res.ok())
+			{
+				cb("Ok(");
+				detail::print_one(cb, std::move(args), res.unwrap());
+				cb(")");
+			}
+			else
+			{
+				cb("Err(");
+				detail::print_one(cb, std::move(args), res.error());
+				cb(")");
+			}
+		}
+	};
+}
+
+
+
+
+
+
+
+
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -2305,10 +2652,6 @@ namespace nabs
 	template <typename... Args>
 	inline impl::Pipeline split(Args&&... args)
 	{
-	#if defined(_WIN32)
-		// static_assert(std::conjunction_v<std::is_same<int, char>>, "split() does not work on windows");
-	#endif
-
 		static_assert(sizeof...(args) > 0, "split() requires at least one argument");
 
 		std::vector<impl::Pipeline> vals;
@@ -2324,10 +2667,6 @@ namespace nabs
 	template <typename... Args>
 	inline impl::Pipeline tee(Args&&... args)
 	{
-	#if defined(_WIN32)
-		// static_assert(std::conjunction_v<std::is_same<int, char>>, "tee() does not work on windows");
-	#endif
-
 		static_assert(((std::is_convertible_v<Args, fs::path>) && ...),
 			"tee() requires std::filesystem::path");
 
@@ -3329,103 +3668,225 @@ namespace nabs::dep
 {
 	struct Item
 	{
-		void depend(Item item);
-		bool operator== (const Item& other) const;
-		bool operator!= (const Item& item) const;
-		bool operator< (const Item& item) const;
+		void depend(Item* item);
 		std::string str() const;
-
-
-		fs::path path;
 
 		std::string name;
 		bool phony = false;
 
-		std::vector<Item> deps;
+		std::vector<Item*> deps;
 
+	private:
 		Item() { }
-		Item(bool phony, std::string name, fs::path path)
-			: path(std::move(path))
-			, name(std::move(name))
+		Item(bool phony, std::string name)
+			: name(std::move(name))
 			, phony(phony)
 		{ }
+
+		// note: don't set these manually please. helper vars for toposort.
+		size_t level = 0;
+		size_t dependents = 0;
+
+		friend struct Graph;
 	};
 
-	Item create(fs::path path);
-	Item create_phony(std::string name);
-
-	namespace impl
+	struct Graph
 	{
-		void topological_sort(const Item& root, std::vector<std::vector<Item>>& result, std::set<Item>& seen);
-	}
+		~Graph();
 
-	std::vector<std::vector<Item>> topological_sort(const Item& root);
+		Item* add(fs::path path);
+		Item* add_phony(std::string name);
+		Item* get(const std::string& name);
+
+		// returns a Result<T, E>, where T is a list of lists of items; the top-level
+		// list indicates the correct, dependency-order traversal, while each sub-list
+		// contains nodes that do not have dependencies between each other; this facilitates
+		// multi-processing of item jobs.
+
+		// in case of error (circular dependencies), E is a (possibly incomplete) list of items
+		// that are part of the circular dependency.
+		Result<std::vector<std::vector<Item*>>, std::vector<Item*>> topological_sort();
+
+	private:
+		std::map<std::string, Item*> items;
+
+		// this is a helper method that tries as hard as possible to find the list of circular items
+		std::vector<Item*> get_circular_depends(Item* root);
+	};
 }
 
 // implementation
 #if !NABS_DECLARATION_ONLY
 namespace nabs::dep
 {
-	void impl::topological_sort(const Item& root, std::vector<std::vector<Item>>& result, std::set<Item>& seen)
-	{
-		if(seen.find(root) != seen.end())
-			nabs::impl::int_error("circular dependency: '{}'", root.str());
-
-		seen.insert(root);
-		std::vector<Item> current;
-		for(auto& dep : root.deps)
-		{
-			current.push_back(dep);
-			topological_sort(dep, result, seen);
-		}
-
-		result.push_back(std::move(current));
-	}
-
-	std::vector<std::vector<Item>> topological_sort(const Item& root)
-	{
-		std::vector<std::vector<Item>> ret;
-		ret.push_back({ root });
-
-		std::set<Item> seen;
-		impl::topological_sort(root, ret, seen);
-
-		std::reverse(ret.begin(), ret.end());
-		return ret;
-	}
-
-	void Item::depend(Item item)
+	void Item::depend(Item* item)
 	{
 		if(std::find(this->deps.begin(), this->deps.end(), item) != this->deps.end())
 		{
-			nabs::impl::int_warn("'{}' already depends on '{}'", this->str(), item.str());
+			nabs::impl::int_warn("'{}' already depends on '{}'", this->str(), item->str());
 			return;
 		}
 
-		this->deps.push_back(std::move(item));
+		item->dependents += 1;
+		this->deps.push_back(item);
 	}
 
-	// two items are equal if their names/paths are the same.
-	// dependencies are NOT considered in equality checks.
-	bool Item::operator== (const Item& other) const
+	std::string Item::str() const { return this->name; }
+
+	Graph::~Graph()
 	{
-		if(this->phony != other.phony)  return false;
-
-		if(this->phony) return this->name == other.name;
-		else            return fs::equivalent(this->path, other.path);
+		for(auto& [ _, i ] : this->items)
+			delete i;
 	}
 
-	bool Item::operator!= (const Item& item) const { return !(*this == item); }
-	bool Item::operator< (const Item& item) const { return this->str() < item.str(); }
-
-	std::string Item::str() const
+	std::vector<Item*> Graph::get_circular_depends(Item* root)
 	{
-		if(this->phony) return this->name;
-		else            return this->path.string();
+		// note that this function can be slow, because it's only called on the error path.
+		if(root == nullptr)
+		{
+			// if the root is empty, then we couldn't find any root nodes;
+			// so what we do is to sort the graph by # of dependents, get
+			// a least-depended-on node (since there might be multiple),
+			// and just traverse that.
+			Item* shallowest = nullptr;
+
+			for(auto& [ _, item ] : this->items)
+			{
+				if(shallowest == nullptr || item->dependents < shallowest->dependents)
+					shallowest = item;
+			}
+
+			// we know this must be true, because the graph must have at least one
+			// item, because if it was empty we would not have a circular chain.
+			assert(shallowest != nullptr);
+			return this->get_circular_depends(shallowest);
+		}
+
+		// perform a DFS until we find a chain that leads us back to the root.
+		struct {
+			std::vector<Item*> operator() (Item* root, Item* item, std::vector<Item*> chain)
+			{
+				chain.push_back(item);
+
+				if(item == root)
+					return chain;
+
+				for(auto dep : item->deps)
+				{
+					auto foo = (*this)(root, dep, chain);
+					if(!foo.empty())
+						return foo;
+				}
+
+				return { };
+			}
+
+			std::vector<Item*> operator() (Item* root)
+			{
+				for(auto d : root->deps)
+				{
+					if(auto chain = (*this)(root, d, { }); !chain.empty())
+						return chain;
+				}
+				return { };
+			}
+		} dfs;
+
+		return dfs(root);
 	}
 
-	Item create(fs::path path) { return Item(/* phony: */ false, "", std::move(path)); }
-	Item create_phony(std::string name) { return Item(/* phony: */ true, std::move(name), ""); }
+	// based on https://stackoverflow.com/questions/4073119/topological-sort-with-grouping
+	Result<std::vector<std::vector<Item*>>, std::vector<Item*>> Graph::topological_sort()
+	{
+		if(this->items.empty())
+			return Ok(std::vector<std::vector<Item*>> { });
+
+		std::vector<Item*> queue;
+		std::set<Item*> visited;
+
+		// find the root items (ie. items that are not depended on by anyone else)
+		for(auto& [ name, item ] : this->items)
+		{
+			item->level = 0;
+			if(item->dependents == 0)
+				queue.push_back(item);
+		}
+
+		if(queue.empty())
+			return Err(this->get_circular_depends(nullptr));
+
+		size_t max_level = 0;
+		while(!queue.empty())
+		{
+			auto item = queue.back();
+			queue.pop_back();
+
+			if(visited.find(item) != visited.end())
+				return Err(this->get_circular_depends(item));
+
+			visited.insert(item);
+			for(auto dep : item->deps)
+			{
+				if(dep->level < item->level && visited.find(dep) != visited.end())
+					return Err(this->get_circular_depends(item));
+
+				if(item->level + 1 > dep->level)
+				{
+					dep->level = item->level + 1;
+					max_level = std::max(dep->level, max_level);
+
+					queue.push_back(dep);
+					visited.erase(dep);
+				}
+			}
+		}
+
+		// finally, build the list based on the levels.
+		auto sorted = std::vector<std::vector<Item*>>(1 + max_level);
+		for(auto& [ _, item ] : this->items)
+		{
+			// first, verify that the item was visited! if it was not visited,
+			// it means that it (and its friends) were part of some disconnected island,
+			// and that island has circular dependencies.
+			if(visited.find(item) == visited.end())
+				return Err(this->get_circular_depends(item));
+
+			sorted[item->level].push_back(item);
+		}
+
+		return Ok(sorted);
+	}
+
+	Item* Graph::add(fs::path path)
+	{
+		auto name = path.string();
+		if(auto it = this->items.find(name); it != this->items.end())
+		{
+			nabs::impl::int_warn("item '{}' already exists in the dependency graph", name);
+			return it->second;
+		}
+
+		return (this->items[name] = new Item(/* phony: */ false, name));
+	}
+
+	Item* Graph::add_phony(std::string name)
+	{
+		if(auto it = this->items.find(name); it != this->items.end())
+		{
+			nabs::impl::int_warn("item '{}' already exists in the dependency graph", name);
+			return it->second;
+		}
+
+		return (this->items[name] = new Item(/* phony: */ true, name));
+	}
+
+	Item* Graph::get(const std::string& name)
+	{
+		if(auto it = this->items.find(name); it != this->items.end())
+			return it->second;
+		else
+			return nullptr;
+	}
 }
 #endif // !NABS_DECLARATION_ONLY
 
@@ -3619,6 +4080,14 @@ namespace nabs
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
 				flags.options.push_back("-O2");
+
+				// TODO: checking for stdc++fs and/or c++fs needs to be more robust
+				// eg. we should check if we were linked with libstdc++ or libc++, first of all
+				// then, we also need to check the compiler version (or... the lib version?) properly
+
+				// TODO: expose stdc++fs checking to the user
+				// whatever we know about the STL we want the user to be able to know also,
+				// so that they can compile files using std::filesystem seamlessly as well.
 
 				// this is a little annoying, but for older gcc we need to explicitly link std::filesystem.
 			#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 9)
@@ -4236,6 +4705,22 @@ namespace nabs::os
 #endif // !NABS_DECLARATION_ONLY
 
 
+
+
+// give the users a way to print std::filesystem::path
+namespace zpr
+{
+	template <>
+	struct print_formatter<std::filesystem::path>
+	{
+		template <typename Cb>
+		void print(const std::filesystem::path& x, Cb&& cb, format_args args)
+		{
+			auto s = x.string();
+			detail::print_string(static_cast<Cb&&>(cb), s.c_str(), s.size(), std::move(args));
+		}
+	};
+}
 
 
 
