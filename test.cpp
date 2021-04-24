@@ -38,7 +38,7 @@ int main(int argc, char** argv)
 	zpr::println("status = {}", x.run());
 
 
-
+#if 0
 	namespace nd = nabs::dep;
 	{
 		nd::Graph graph;
@@ -65,4 +65,5 @@ int main(int argc, char** argv)
 		auto sorted = graph.topological_sort();
 		zpr::println("sorted = {}", sorted);
 	}
+#endif
 }
