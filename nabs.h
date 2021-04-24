@@ -1941,7 +1941,7 @@ namespace zpr
 	only works on class templates (and not template usings), we change
 	the original namespace from `zst` to `nabs` so everyone has a good time.
 
-	zst::Result
+	zst::Result (version 1.1)
 	Copyright 2020 - 2021, zhiayang
 
 	Licensed under the Apache License, Version 2.0 (the "License");
@@ -1955,10 +1955,20 @@ namespace zpr
 	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 	See the License for the specific language governing permissions and
 	limitations under the License.
+
+
+	Version 1.1 - 24/04/2021
+	========================
+
+	Updated from baseline with:
+	1. expect()
 */
 
 namespace nabs
 {
+	// we need a forward-declaration of error_and_exit for expect().
+	template <typename... Args> [[noreturn]] void error_and_exit(std::string_view fmt, Args&&... args);
+
 	template <typename T>
 	struct Ok
 	{
@@ -1968,8 +1978,8 @@ namespace nabs
 		Ok(Ok&&) = delete;
 		Ok(const Ok&) = delete;
 
-		Ok(T&& value) : m_value(static_cast<T&&>(value)) { }
 		Ok(const T& value) : m_value(value) { }
+		Ok(T&& value) : m_value(static_cast<T&&>(value)) { }
 
 		template <typename... Args>
 		Ok(Args&&... args) : m_value(static_cast<Args&&>(args)...) { }
@@ -2002,8 +2012,8 @@ namespace nabs
 		Err(Err&&) = delete;
 		Err(const Err&) = delete;
 
-		Err(E&& error) : m_error(static_cast<E&&>(error)) { }
 		Err(const E& error) : m_error(error) { }
+		Err(E&& error) : m_error(static_cast<E&&>(error)) { }
 
 		template <typename... Args>
 		Err(Args&&... args) : m_error(static_cast<Args&&>(args)...) { }
@@ -2014,9 +2024,6 @@ namespace nabs
 	private:
 		E m_error;
 	};
-
-
-
 
 	template <typename T, typename E>
 	struct Result
@@ -2123,6 +2130,12 @@ namespace nabs
 			if(state == STATE_ERR)  return Result<U, E>(this->err);
 
 			assert(false);
+		}
+
+		const T& expect(std::string_view msg) const
+		{
+			if(this->ok())  return this->unwrap();
+			else            nabs::error_and_exit("{}: {}", msg, this->error());
 		}
 
 	private:
@@ -2397,6 +2410,13 @@ namespace nabs
 	{
 		__logger(2, fmt, static_cast<Args&&>(args)...);
 		exit(code);
+	}
+
+	template <typename... Args>
+	[[noreturn]] void error_and_exit(std::string_view fmt, Args&&... args)
+	{
+		__logger(2, fmt, static_cast<Args&&>(args)...);
+		exit(1);
 	}
 
 	namespace fs
@@ -3687,8 +3707,8 @@ namespace nabs
 		fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path);
 	}
 
-	Compiler find_c_compiler();
-	Compiler find_cpp_compiler();
+	Result<Compiler, std::string> find_c_compiler();
+	Result<Compiler, std::string> find_cpp_compiler();
 }
 
 // implementation
@@ -3744,8 +3764,7 @@ namespace nabs
 	}
 
 	// TODO: `find_c_compiler()` and `find_cpp_compiler()` should be able to return failure.
-	// TODO: change these to use the Result<> thing we just introduced.
-	Compiler find_c_compiler()
+	Result<Compiler, std::string> find_c_compiler()
 	{
 		// TODO: support cross-compilation better
 		// basically we need a way to define the target, provide a sysroot, and
@@ -3779,51 +3798,55 @@ namespace nabs
 		// TODO: not sure how msvc-finder deals with the situation where msvc is not installed
 		Compiler ret { };
 		ret.path = os::msvc_toolchain_binaries() / ARCH / "cl.exe";
+		if(!fs::exists(ret.path))
+			return Err(std::string("'cl.exe' does not exist"));
+
 		ret.kind = Compiler::KIND_MSVC_CL;
 		ret.lang = Compiler::LANG_C;
-		return ret;
+		return Ok(ret);
 
 	#else
 		// basically, find 'cc' in the path.
 		auto path_env = impl::get_path_variable();
 		if(auto clang = impl::find_file_in_path("clang", path_env); !clang.empty())
-			return { .path = clang, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C };
+			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C });
 
 		else if(auto gcc = impl::find_file_in_path("gcc", path_env); !gcc.empty())
-			return { .path = gcc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C };
+			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C });
 
 		else if(auto cc = impl::find_file_in_path("cc", path_env); !cc.empty())
-			return { .path = cc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C };
+			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C });
 
 		else
-			impl::int_error("could not find any C compiler in the $PATH");
+			return Err<std::string>("no compiler in $PATH");
 
 	#endif // _WIN32
 	}
 
-	Compiler find_cpp_compiler()
+	Result<Compiler, std::string> find_cpp_compiler()
 	{
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
 		// msvc uses cl.exe for both C and C++ -- the hard part is actually finding the damn thing.
-		auto ret = find_c_compiler();
-		ret.lang = Compiler::LANG_CPP;
+		if(auto ret = find_c_compiler(); ret.ok())
+			ret->lang = Compiler::LANG_CPP;
+
 		return ret;
 
 	#else
 		// basically, find 'c++' in the path.
 		auto path_env = impl::get_path_variable();
 		if(auto clang = impl::find_file_in_path("clang++", path_env); !clang.empty())
-			return { .path = clang, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP };
+			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP });
 
 		else if(auto cc = impl::find_file_in_path("c++", path_env); !cc.empty())
-			return { .path = cc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP };
+			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP });
 
 		else if(auto gcc = impl::find_file_in_path("g++", path_env); !gcc.empty())
-			return { .path = gcc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP };
+			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP });
 
 		else
-			impl::int_error("could not find any C++ compiler in the $PATH");
+			return Err<std::string>("no compiler in $PATH");
 
 	#endif // _WIN32
 	}
@@ -3838,28 +3861,26 @@ namespace nabs
 namespace nabs
 {
 	// compiles the provided *source* files straight to an executable.
-	int compile_files(const CompilerFlags& opts, const std::optional<fs::path>& output, const std::vector<fs::path>& files);
+	int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const std::vector<fs::path>& files);
 
 	// passes -c (or /c) to the compiler to get an object file.
-	int compile_to_object_file(const CompilerFlags& opts, const std::optional<fs::path>& output, const std::vector<fs::path>& files);
+	int compile_to_object_file(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const fs::path& files);
 
 	// passes -c (or /c) to the compiler to get an object file, but also uses `-MP -MMD` (or /showIncludes)
 	// to extract the headers that the file depends on. this one only takes 1 file. this might be an unnecessary
 	// limitation, but we'll have this limitation for now. the dependency info is written to the file specified
 	// by `dep_output_file` (either by the compiler, or by us).
-	int compile_to_object_file_with_dependencies(const CompilerFlags& opts, const std::optional<fs::path>& output,
-		fs::path& dep_output_file, const fs::path& file);
+	int compile_to_object_file_with_dependencies(const Compiler& compiler, const CompilerFlags& opts,
+		const std::optional<fs::path>& output, fs::path& dep_output_file, const fs::path& file);
+
 
 	template <typename... Args, typename = std::enable_if_t<((std::is_convertible_v<Args, fs::path>) && ...)>>
-	inline int compile_files(const CompilerFlags& opts, const std::optional<fs::path>& output, Args&&... inputs)
+	inline int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		Args&&... inputs)
 	{
-		return compile_files(opts, output, std::vector<fs::path> { inputs... });
-	}
-
-	template <typename... Args, typename = std::enable_if_t<((std::is_convertible_v<Args, fs::path>) && ...)>>
-	int compile_to_object_file(const CompilerFlags& opts, const std::optional<fs::path>& output, Args&&... inputs)
-	{
-		return compile_to_object_file(opts, output, std::vector<fs::path> { inputs... });
+		return compile_files(compiler, opts, output, std::vector<fs::path> { inputs... });
 	}
 }
 
@@ -3869,18 +3890,7 @@ namespace nabs
 {
 	namespace impl
 	{
-		static bool is_cpp(const std::vector<fs::path>& files)
-		{
-			for(auto& p : files)
-			{
-				auto ext = p.extension();
-				if(ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".c++")
-					return true;
-			}
-			return false;
-		}
-
-		static std::vector<std::string> setup_basic_args(Compiler& cmp, const CompilerFlags& opts)
+		static std::vector<std::string> setup_basic_args(const Compiler& cmp, const CompilerFlags& opts)
 		{
 			auto args = opts.options;
 
@@ -4026,22 +4036,19 @@ namespace nabs
 		}
 
 		static void setup_args_for_compiling_to_obj(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts,
-			const std::optional<fs::path>& output, const std::vector<fs::path>& files)
+			const std::optional<fs::path>& output, const fs::path& file)
 		{
 			if(cmp.kind == Compiler::KIND_GCC_CLANG)
 			{
 				args.push_back("-c");
-				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, files);
+				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 			}
 			else if(cmp.kind == Compiler::KIND_MSVC_CL)
 			{
 				args.push_back("/nologo");
 
-				if(files.size() > 1)
-					nabs::impl::int_error("MSVC cl.exe does not support more than one source file when using '/c'");
-
 				args.push_back("/c");
-				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, files);
+				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 			}
 			else
 			{
@@ -4051,13 +4058,9 @@ namespace nabs
 	}
 
 
-	int compile_to_object_file_with_dependencies(const CompilerFlags& opts, const std::optional<fs::path>& output,
+	int compile_to_object_file_with_dependencies(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
 		fs::path& dep_output_file, const fs::path& file)
 	{
-		auto cmp = impl::is_cpp({ file })
-			? find_cpp_compiler()
-			: find_c_compiler();
-
 		auto args = impl::setup_basic_args(cmp, opts);
 		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
 
@@ -4092,6 +4095,7 @@ namespace nabs
 
 		args.push_back(file.string());
 
+
 		if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
 			impl::int_error("unsupported compiler");
@@ -4104,18 +4108,13 @@ namespace nabs
 	}
 
 
-	int compile_to_object_file(const CompilerFlags& opts, const std::optional<fs::path>& output, const std::vector<fs::path>& files)
+	int compile_to_object_file(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const fs::path& file)
 	{
-		auto cmp = impl::is_cpp(files)
-			? find_cpp_compiler()
-			: find_c_compiler();
-
 		auto args = impl::setup_basic_args(cmp, opts);
-		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, files);
 
-		// assume all compilers let you just throw the input files at the end with no regard.
-		for(auto& f : files)
-			args.push_back(f.string());
+		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
+		args.push_back(file.string());
 
 		// construct the command, and run it.
 		return cmd(cmp.path.string(), std::move(args)).run();
@@ -4124,12 +4123,9 @@ namespace nabs
 
 
 
-	int compile_files(const CompilerFlags& opts, const std::optional<fs::path>& output, const std::vector<fs::path>& files)
+	int compile_files(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const std::vector<fs::path>& files)
 	{
-		auto cmp = impl::is_cpp(files)
-			? find_cpp_compiler()
-			: find_c_compiler();
-
 		auto args = impl::setup_basic_args(cmp, opts);
 		if(cmp.kind == Compiler::KIND_GCC_CLANG)
 		{
@@ -4311,12 +4307,14 @@ namespace nabs
 		{
 			log("build recipe changed, rebuilding...");
 
-			auto cpp = find_cpp_compiler();
-			if(!fs::exists(cpp.path))
+			auto _cpp = find_cpp_compiler();
+			if(!_cpp.ok())
 			{
-				impl::int_warn("C++ compiler (at path '{}') does not exist, aborting self-rebuild");
+				impl::int_warn("aborting self-rebuild, could not find C++ compiler: {}", _cpp.error());
 				return;
 			}
+
+			auto& cpp = _cpp.unwrap();
 
 			// convert the filenames to paths. the caller should have already checked that
 			// all the provided files actually exist.
@@ -4353,7 +4351,7 @@ namespace nabs
 
 			if(cpp.kind == Compiler::KIND_GCC_CLANG)
 			{
-				flags.options.push_back("-std=c++17");
+				flags.language_standard = "c++17";
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
 				flags.options.push_back("-O2");
@@ -4373,7 +4371,7 @@ namespace nabs
 			}
 			else if(cpp.kind == Compiler::KIND_MSVC_CL)
 			{
-				flags.options.push_back("/std:c++17");
+				flags.language_standard = "c++17";
 				flags.options.push_back("/O2");
 				flags.options.push_back("/W3");
 			}
@@ -4387,7 +4385,7 @@ namespace nabs
 			assert(fs::exists(this_path));
 
 			auto new_name = fs::path("__" + this_path.filename().string());
-			int status = compile_files(flags, new_name, std::move(files));
+			int status = compile_files(cpp, flags, new_name, std::move(files));
 			if(status != 0)
 				impl::int_error("self-rebuild failed");
 
