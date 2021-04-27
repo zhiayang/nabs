@@ -4,20 +4,6 @@
 
 #include "nabs.h"
 
-namespace zpr
-{
-	template <>
-	struct print_formatter<nabs::dep::Item*>
-	{
-		template <typename Cb>
-		void print(nabs::dep::Item* item, Cb&& cb, format_args args)
-		{
-			(void) args;
-			cb(item->str());
-		}
-	};
-}
-
 int main(int argc, char** argv)
 {
 	nabs::self_update(argc, argv, __FILE__);
@@ -38,16 +24,16 @@ int main(int argc, char** argv)
 	zpr::println("status = {}", x.run());
 
 
-#if 0
+#if 1
 	namespace nd = nabs::dep;
 	{
 		nd::Graph graph;
-		auto a = graph.add_phony("A");
-		auto b = graph.add_phony("B");
-		auto c = graph.add_phony("C");
-		auto d = graph.add_phony("D");
-		auto e = graph.add_phony("E");
-		auto f = graph.add_phony("F");
+		auto a = graph.add(nd::KIND_PHONY, "A");
+		auto b = graph.add(nd::KIND_PHONY, "B");
+		auto c = graph.add(nd::KIND_PHONY, "C");
+		auto d = graph.add(nd::KIND_PHONY, "D");
+		auto e = graph.add(nd::KIND_PHONY, "E");
+		auto f = graph.add(nd::KIND_PHONY, "F");
 
 		// a->depend(b);
 		// d->depend(b);
@@ -56,13 +42,14 @@ int main(int argc, char** argv)
 		// b->depend(f);
 
 		a->depend(b);
-		// c->depend(d);
-		b->depend(a);
+		b->depend(c);
+		c->depend(d);
+		d->depend(b);
 
 		// c->depend(d);
 		// d->depend(b);
 
-		auto sorted = graph.topological_sort();
+		auto sorted = graph.topological_sort({ a });
 		zpr::println("sorted = {}", sorted);
 	}
 #endif

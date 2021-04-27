@@ -96,8 +96,8 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 
-	Version 2.1.13
-	==============
+	Version 2.2.0
+	=============
 */
 
 #include <cfloat>
@@ -1870,21 +1870,27 @@ namespace zpr
 		{
 			if(begin(x) == end(x))
 			{
-				cb("[ ]");
+				if(!args.alternate())
+					cb("[ ]");
 				return;
 			}
 
-			cb("[");
+			if(!args.alternate())
+				cb("[");
+
 			for(auto it = begin(x);;)
 			{
 				detail::print_one(static_cast<Cb&&>(cb), args, *it);
 				++it;
 
-				if(it != end(x)) cb(", ");
-				else             break;
+				if(it != end(x) && !args.alternate())
+					cb(", ");
+				else
+					break;
 			}
 
-			cb("]");
+			if(!args.alternate())
+				cb("]");
 		}
 	};
 
@@ -2002,6 +2008,10 @@ namespace nabs
 		template <typename, typename> friend struct Result;
 		template <typename, typename> friend struct zpr::print_formatter;
 	};
+
+	// deduction guide
+	Ok() -> Ok<void>;
+
 
 	template <typename E>
 	struct Err
@@ -2369,59 +2379,61 @@ namespace nabs
 		static constexpr const char* COLOUR_ERROR = "";
 		static constexpr const char* COLOUR_RESET = "";
 	#endif
-	}
 
-	template <typename... Args>
-	void __logger(int level, std::string_view fmt, Args&&... args)
-	{
-		const char* colour = nullptr;
-		const char* heading = nullptr;
+		template <typename... Args>
+		void __logger(int level, std::string_view fmt, Args&&... args)
+		{
+			const char* colour = nullptr;
+			const char* heading = nullptr;
 
-		if(level == 0)      colour = impl::COLOUR_LOG, heading = "[log]";
-		else if(level == 1) colour = impl::COLOUR_WARN, heading = "[wrn]";
-		else if(level == 2) colour = impl::COLOUR_ERROR, heading = "[err]";
-		else                colour = impl::COLOUR_ERROR, heading = "[???]";
+			if(level == 0)      colour = impl::COLOUR_LOG, heading = "[log]";
+			else if(level == 1) colour = impl::COLOUR_WARN, heading = "[wrn]";
+			else if(level == 2) colour = impl::COLOUR_ERROR, heading = "[err]";
+			else                colour = impl::COLOUR_ERROR, heading = "[???]";
 
-		auto output = (level > 0 ? stderr : stdout);
-		zpr::fprintln(output, "{}{}{} {}", colour, heading, impl::COLOUR_RESET,
-			zpr::sprint(fmt, static_cast<Args&&>(args)...));
+			auto output = (level > 0 ? stderr : stdout);
+			zpr::fprintln(output, "{}{}{} {}", colour, heading, impl::COLOUR_RESET,
+				zpr::sprint(fmt, static_cast<Args&&>(args)...));
+		}
 	}
 
 	template <typename... Args>
 	void log(std::string_view fmt, Args&&... args)
 	{
-		__logger(0, fmt, static_cast<Args&&>(args)...);
+		impl::__logger(0, fmt, static_cast<Args&&>(args)...);
 	}
 
 	template <typename... Args>
 	void warn(std::string_view fmt, Args&&... args)
 	{
-		__logger(1, fmt, static_cast<Args&&>(args)...);
+		impl::__logger(1, fmt, static_cast<Args&&>(args)...);
 	}
 
 	template <typename... Args>
 	void error(std::string_view fmt, Args&&... args)
 	{
-		__logger(2, fmt, static_cast<Args&&>(args)...);
+		impl::__logger(2, fmt, static_cast<Args&&>(args)...);
 	}
 
 	template <typename... Args>
 	[[noreturn]] void error_and_exit(int code, std::string_view fmt, Args&&... args)
 	{
-		__logger(2, fmt, static_cast<Args&&>(args)...);
+		impl::__logger(2, fmt, static_cast<Args&&>(args)...);
 		exit(code);
 	}
 
 	template <typename... Args>
 	[[noreturn]] void error_and_exit(std::string_view fmt, Args&&... args)
 	{
-		__logger(2, fmt, static_cast<Args&&>(args)...);
+		impl::__logger(2, fmt, static_cast<Args&&>(args)...);
 		exit(1);
 	}
 
 	namespace fs
 	{
 		using namespace std::filesystem;
+
+		Result<std::string, std::string> read_file(const fs::path& file);
 	}
 
 	namespace impl
@@ -2455,11 +2467,92 @@ namespace nabs
 			inline FileOpenFlags& truncate_mode(bool x) { _truncate_mode = x; return *this; }
 			inline FileOpenFlags& create_perms(int x)   { _create_perms = x; return *this; }
 		};
+
+		std::string get_environment_var(const std::string& name);
 	}
 
+	/*
+		Returns a copy of `s` with leading and trailing whitespace (\t, \n, ' ', \v, \f, \r)
+		removed. Also has a string_view version.
+	*/
+	std::string trim_whitespace(std::string s);
+	std::string_view trim_whitespace(std::string_view s);
+
+	/*
+		Split a given string into lines. This handles both the dumb windows \r\n line ending,
+		and the sane \n Unix line ending.
+	*/
+	std::vector<std::string_view> split_string_lines(std::string& s);
+
+	/*
+		Functional map of an iterable container.
+	*/
+	template <typename... T, template<typename...> class Con, typename Func>
+	auto map(const Con<T...>& container, Func&& fn)
+	{
+		using U = decltype(fn(std::declval<typename Con<T...>::value_type>()));
+		Con<U> ret;
+		for(auto& x : container)
+			ret.push_back(fn(x));
+
+		return ret;
+	}
+
+	/*
+		Functional filter of an iterable container.
+	*/
+	template <typename Con, typename Func, typename = std::enable_if_t<
+		std::is_same_v<decltype(std::declval<Func>()(std::declval<typename Con::value_type>())), bool>
+	>>
+	auto filter(const Con& container, Func&& fn)
+	{
+		Con ret;
+		for(auto& x : container)
+		{
+			if(fn(x))
+				ret.push_back(x);
+		}
+		return ret;
+	}
+
+	/*
+		A helper method to check if the string `sv` ends with the given `suffix`, since this
+		only exists as a method of std::string(_view) in C++20.
+	*/
+	inline bool ends_with(std::string_view sv, std::string_view suffix)
+	{
+		return sv.size() >= suffix.size()
+			&& suffix == sv.substr(sv.size() - suffix.size(), suffix.size());
+	}
+
+	/*
+		Encapsulates a particular binary as a compiler. This can actually represent a compiler, a linker,
+		an assembler, objcopy, whatever you want.
+	*/
+	struct Compiler
+	{
+		fs::path path;
+		int kind;
+		int lang;
+
+		std::function<void (const fs::path&, const std::vector<fs::path>&, const std::vector<std::string>&)> log_hook;
+
+		static constexpr int KIND_CLANG     = 1;
+		static constexpr int KIND_GCC       = 2;
+		static constexpr int KIND_MSVC_CL   = 3;
+
+		static constexpr int LANG_C         = 1;
+		static constexpr int LANG_CPP       = 2;
+	};
+
+	/*
+		Encapsulates a set of flags that you pass to a compiler-like binary. Some of the fields
+		only make sense for C/C++ compilers (eg. include flags, language standard), but you can
+		just use the `options` field to pass whatever flags you want.
+	*/
 	struct CompilerFlags
 	{
-		// additional options to pass to the compiler; these are not checked
+		// additional options to pass to the compiler; these are not checked, and are passed as-is.
 		std::vector<std::string> options;
 
 		// names of libraries to pass to the compiler; they are passed as
@@ -2484,7 +2577,52 @@ namespace nabs
 		// the language standard. this is a string because i can't be bothered right now
 		// (also because there's like c++latest on msvc, 0x/1y/1z/2a on gcc/clang)
 		std::string language_standard;
+
+		// generate header dependencies using -MMD (gcc/clang) or /showIncludes (msvc cl.exe)
+		bool generate_header_dependencies = false;
+
+		// a header to use as a precompiled header (optional)
+		fs::path precompiled_header;
 	};
+
+	namespace dep
+	{
+		struct Item;
+	}
+
+	struct Toolchain
+	{
+		Compiler cc;
+		CompilerFlags cflags;
+
+		Compiler cxx;
+		CompilerFlags cxxflags;
+
+		Compiler ld;
+		CompilerFlags ldflags;
+	};
+
+
+	// a very strange function. its sole purpose is to be used as `log_hook` in the Compiler. because we
+	// cannot easily use string literals in template parameters (pre-C++20), it is taken as a normal
+	// parameter, and this function returns a lambda.
+	// Name: what to print, eg. "cc" or "cxx". Note -- don't pass the c_str() of a temporary in here,
+	// because the pointer is captured by value, and you'll have a bad time.
+	// Output: whether the the printed should be the input or the output. For linking, you probably
+	// want to show "link foo.exe" instead of "link a.o b.o" etc, so use `true` in this case.
+	auto default_compiler_logger(bool output, const char* name)
+	{
+		return [=](const fs::path& out, const std::vector<fs::path>& in, const std::vector<std::string>& args) {
+			(void) args;
+
+			auto relative_path = [](const auto& p) -> auto {
+				return p.lexically_relative(fs::path(__FILE__).parent_path());
+			};
+
+			if(output)  nabs::log("{} {}", name, relative_path(out).string());
+			else        nabs::log("{} {#}", name, map(in, [&](const auto& x) { return relative_path(x).string(); }));
+		};
+	}
 }
 
 
@@ -2517,6 +2655,8 @@ namespace nabs
 
 		void dupe_fd(os::Fd src, os::Fd dst);
 	#endif
+
+		const char* strerror_wrapper();
 
 		struct PipeDes
 		{
@@ -2919,6 +3059,17 @@ namespace nabs
 			return status;
 		#endif
 		}
+
+		const char* strerror_wrapper()
+		{
+		#if defined(_WIN32)
+			static char buf[512] { };
+			strerror_s(buf, 512, errno);
+			return buf;
+		#else
+			return strerror(errno);
+		#endif
+		}
 	}
 
 	namespace impl
@@ -3100,7 +3251,7 @@ namespace nabs
 			#else
 				if(auto child = fork(); child < 0)
 				{
-					int_error("fork(): {}", strerror(errno));
+					int_error("fork(): {}", os::strerror_wrapper());
 				}
 				else if(child == 0)
 				{
@@ -3125,7 +3276,7 @@ namespace nabs
 						os::dupe_fd(err_fd, STDERR_FILENO);
 
 					if(execvp(this->name.c_str(), this->make_args()) < 0)
-						int_error("execvp('{}'): {}", this->name, strerror(errno));
+						int_error("execvp('{}'): {}", this->name, os::strerror_wrapper());
 
 					abort();
 				}
@@ -3209,7 +3360,7 @@ namespace nabs
 
 				if(auto child = fork(); child < 0)
 				{
-					impl::int_error("fork(): {}", strerror(errno));
+					impl::int_error("fork(): {}", os::strerror_wrapper());
 				}
 				else if(child == 0)
 				{
@@ -3298,7 +3449,7 @@ namespace nabs
 				// basically we have to emulate what the `tee` program does.
 				if(auto child = fork(); child < 0)
 				{
-					int_error("fork(): {}", strerror(errno));
+					int_error("fork(): {}", os::strerror_wrapper());
 				}
 				else if(child == 0)
 				{
@@ -3458,72 +3609,211 @@ namespace nabs
 // dependency stuff
 namespace nabs::dep
 {
+	/*
+		A dependency item; it can have different 'kinds', which can include source files, object files,
+		phony targets, etc. An Item has zero or more dependencies, which are other Items. `Item` instances
+		are managed by the `Graph` (see below) -- don't manually create these (although you can't because
+		the constructor is private)
+
+		To create a dependency on another item, use the `.depend()` method; for example, to
+		make the Item 'a' depend on 'b', do `a->depend(b)`. The `deps` field is public, so it
+		is ok to add/remove items from the dependency list (it is managed solely by the Item,
+		and there is no magic).
+
+		There is also the `produced_by` field; this is similar to, but distinct from, the dependencies
+		of an item. For example, an object file might depend on its C source file, but it might also
+		depend on the headers included by the source file (so that it can be rebuilt if they change).
+		In this scenario, while the object file depends on all those, it is *produced* solely by
+		the source file -- so that should be placed in `produced_by`.
+
+		Finally, there are two fields -- `user_data` and `user_flags` that are used to store user data:
+		whatever you want.
+
+		Note that the 'kind' of an item is purely theoretical unless you use any of the auto_compile
+		functions. They are only used to determine how to 'produce' the file; for example, an object file
+		is produced by calling `compile_to_object_file()` on the `produced_by` item, while an executable
+		must be produced by calling `link_object_files()`. Again, if you are running the entire compilation
+		process "manually", then the kind of an Item is up to you to use (or not use) and interpret.
+
+		Importantly, the Graph does not differentiate two items with the same name but different kinds; the
+		name is the only identifying key.
+	*/
 	struct Item
 	{
+		// add a dependency from this item to the provided item.
+		// If the dependency already exists, it is ignored.
 		void depend(Item* item);
-		std::string str() const;
 
-		std::string name;
-		bool phony = false;
+		// add an item to the produced_by, *AND* add it to the dependencies as well.
+		void add_produced_by(Item* item);
+
+		inline int kind() const { return this->_kind; }
+		inline const std::string& name() const { return this->_name; }
 
 		std::vector<Item*> deps;
+		std::vector<Item*> produced_by;
+
+		// this is for your own use.
+		uint64_t user_flags = 0;
+		void* user_data = nullptr;
+
+		std::vector<std::string> dependecies_as_array() const;
 
 	private:
 		Item() { }
-		Item(bool phony, std::string name)
-			: name(std::move(name))
-			, phony(phony)
+		Item(int kind, std::string name)
+			: _kind(kind)
+			, _name(std::move(name))
 		{ }
 
 		// note: don't set these manually please. helper vars for toposort.
-		size_t level = 0;
+		int _kind = 0;
+		std::string _name;
 		size_t dependents = 0;
+		mutable size_t level = 0;
 
 		friend struct Graph;
 	};
 
+	inline constexpr int KIND_NONE          = 0;
+	inline constexpr int KIND_C_SOURCE      = 1;
+	inline constexpr int KIND_CPP_SOURCE    = 2;
+	inline constexpr int KIND_OBJECT        = 3;
+	inline constexpr int KIND_EXE           = 4;
+	inline constexpr int KIND_PHONY         = 5;
+	inline constexpr int KIND_PCH           = 6;
+
+	/*
+		A dependency graph, containing zero or more items. The graph is the owner of items created by it, and
+		its items will be destroyed when the graph is destroyed.
+
+		The graph serves two main purposes:
+		1. centralised place to store/retrieve Item instances. Items are uniqued by their name (for obvious reasons),
+			so there must be a place to associate a name with a particular instance of item.
+
+		2. topologically sorting the known items in dependency order and verifying that there are no circular
+			dependencies.
+
+		When adding non-phony items, `std::filesystem::weakly_canonical(path)` is called to mitigate the effect
+		of relative paths on the ability to uniquely identify files by path.
+	*/
 	struct Graph
 	{
 		~Graph();
 
-		Item* add(fs::path path);
-		Item* add_phony(std::string name);
-		Item* get(const std::string& name);
+		// Add an item with the specified kind to the dependency graph, and return the Item representing it.
+		// While it is not an error to call add() on an existing path, a warning will be emitted. In most
+		// cases, you should prefer using get_or_add() instead.
+		Item* add(int kind, std::string name);
+		Item* add(int kind, const char* name);
 
-		// returns a Result<T, E>, where T is a list of lists of items; the top-level
-		// list indicates the correct, dependency-order traversal, while each sub-list
-		// contains nodes that do not have dependencies between each other; this facilitates
-		// multi-processing of item jobs.
+		// add a file with the given path as an item; fs::weakly_canonical() is called on the given path.
+		Item* add(int kind, const fs::path& path);
 
-		// in case of error (circular dependencies), E is a (possibly incomplete) list of items
-		// that are part of the circular dependency.
-		Result<std::vector<std::vector<Item*>>, std::vector<Item*>> topological_sort();
+		// add a file, but infer the kind from the filename
+		Item* add(const fs::path& path);
+
+		// Get the item with the given name. For items representing files, the name should be `path.string()`.
+		// if the item with this name/path does not exist, NULL is returned.
+		Item* get(const std::string& name) const;
+		Item* get(const char* name) const;
+
+		// get the file with the given path; fs::weakly_canonical() is called on the path.
+		Item* get(const fs::path& path) const;
+
+		// If an item with the name already exists, return it; else, create a new item, and return that. Note
+		// that the `kind` argument is only used for creating new items.
+		Item* get_or_add(int kind, std::string name);
+		Item* get_or_add(int kind, const char* name);
+
+		// same same, fs::weakly_canonical, etc.
+		Item* get_or_add(int kind, const fs::path& path);
+
+		// same, but infer the kind from the filename
+		Item* get_or_add(const fs::path& path);
+
+		/*
+			Sort the items in the graph topologically (in dependency order). The returned array (if valid) contains
+			a list (A) of lists (B), where the items in list (A) are sorted such that an in-order traversal (ie.
+			starting at index 0) will ensure that, for any item, its dependencies are visited before it.
+
+			The `roots` parameter specifies where to 'start' the sort; if it is empty, then an empty list is returned
+			(it is not an error). Otherwise, the sorting algorithm treats the items in `roots` as the root of the search.
+
+			In short, to generate the dependencies of (eg.) 'a.out', pass roots = { 'a.out' }.
+
+			Each item in the list (B) can be compiled/built/whatever-ed in parallel -- items in the same sublist (B)
+			do not have any inter-dependencies. This facilitates parallelisation of the build process, since you
+			can build those items simultaneously.
+
+			The return value is either Ok(the list of lists), or Err(a list of circular dependencies). In the error
+			case, a chain of circularly-depending items are generated; for example, if [A, B, C] is returned, then
+			there is a circle [A -> B -> C -> A].
+		*/
+		Result<std::vector<std::vector<Item*>>, std::vector<Item*>> topological_sort(std::vector<Item*> roots) const;
 
 	private:
 		std::map<std::string, Item*> items;
 
 		// this is a helper method that tries as hard as possible to find the list of circular items
-		std::vector<Item*> get_circular_depends(Item* root);
+		std::vector<Item*> get_circular_depends(Item* root) const;
 	};
+
+	/*
+		Return one of the KIND_* kinds, based on the filename. The rules are:
+		1. If there is no extension, or the extension is '.exe', return KIND_EXE
+		2. If the extension is '.o' or '.obj', return KIND_OBJECT
+		3. If the extension is '.c', return KIND_C_SOURCE
+		4. If the extension is one of '.cpp', '.cc', '.cxx', 'c++', return KIND_CPP_SOURCE
+		5. If the extension is '.pch' or '.gch', return KIND_PCH
+		6. otherwise, return KIND_NONE
+	*/
+	int infer_kind_from_filename(const fs::path& filename);
+
+	bool read_dependencies_from_file(Graph& graph, const fs::path& dependency_file);
 }
 
 // implementation
 #if !NABS_DECLARATION_ONLY
 namespace nabs::dep
 {
+	int infer_kind_from_filename(const fs::path& filename)
+	{
+		auto ext = filename.extension().string();
+		if(ext == "" || ext == ".exe")
+			return KIND_EXE;
+
+		else if(ext == ".o" || ext == ".obj")
+			return KIND_OBJECT;
+
+		else if(ext == ".c")
+			return KIND_C_SOURCE;
+
+		else if(ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".c++")
+			return KIND_CPP_SOURCE;
+
+		else if(ext == ".pch" || ext == ".gch")
+			return KIND_PCH;
+
+		else
+			return KIND_NONE;
+	}
+
 	void Item::depend(Item* item)
 	{
 		if(std::find(this->deps.begin(), this->deps.end(), item) != this->deps.end())
-		{
-			nabs::impl::int_warn("'{}' already depends on '{}'", this->str(), item->str());
 			return;
-		}
 
 		item->dependents += 1;
 		this->deps.push_back(item);
 	}
 
-	std::string Item::str() const { return this->name; }
+	void Item::add_produced_by(Item* item)
+	{
+		this->depend(item);
+		if(std::find(this->produced_by.begin(), this->produced_by.end(), item) == this->produced_by.end())
+			this->produced_by.push_back(item);
+	}
 
 	Graph::~Graph()
 	{
@@ -3531,7 +3821,7 @@ namespace nabs::dep
 			delete i;
 	}
 
-	std::vector<Item*> Graph::get_circular_depends(Item* root)
+	std::vector<Item*> Graph::get_circular_depends(Item* root) const
 	{
 		// note that this function can be slow, because it's only called on the error path.
 		if(root == nullptr)
@@ -3588,33 +3878,21 @@ namespace nabs::dep
 	}
 
 	// based on https://stackoverflow.com/questions/4073119/topological-sort-with-grouping
-	Result<std::vector<std::vector<Item*>>, std::vector<Item*>> Graph::topological_sort()
+	Result<std::vector<std::vector<Item*>>, std::vector<Item*>> Graph::topological_sort(std::vector<Item*> queue) const
 	{
-		if(this->items.empty())
+		if(this->items.empty() || queue.empty())
 			return Ok(std::vector<std::vector<Item*>> { });
 
-		std::vector<Item*> queue;
 		std::set<Item*> visited;
 
-		// find the root items (ie. items that are not depended on by anyone else)
 		for(auto& [ name, item ] : this->items)
-		{
 			item->level = 0;
-			if(item->dependents == 0)
-				queue.push_back(item);
-		}
-
-		if(queue.empty())
-			return Err(this->get_circular_depends(nullptr));
 
 		size_t max_level = 0;
 		while(!queue.empty())
 		{
 			auto item = queue.back();
 			queue.pop_back();
-
-			if(visited.find(item) != visited.end())
-				return Err(this->get_circular_depends(item));
 
 			visited.insert(item);
 			for(auto dep : item->deps)
@@ -3637,31 +3915,28 @@ namespace nabs::dep
 		auto sorted = std::vector<std::vector<Item*>>(1 + max_level);
 		for(auto& [ _, item ] : this->items)
 		{
-			// first, verify that the item was visited! if it was not visited,
-			// it means that it (and its friends) were part of some disconnected island,
-			// and that island has circular dependencies.
-			if(visited.find(item) == visited.end())
-				return Err(this->get_circular_depends(item));
-
-			sorted[item->level].push_back(item);
+			// we use `max_level - item->level` because obviously it must be
+			// in reverse order (the level 0 ones must be built last)
+			if(visited.find(item) != visited.end())
+				sorted[max_level - item->level].push_back(item);
 		}
 
 		return Ok(sorted);
 	}
 
-	Item* Graph::add(fs::path path)
+	Item* Graph::add(int kind, const fs::path& path)
 	{
-		auto name = path.string();
+		auto name = fs::weakly_canonical(path).string();
 		if(auto it = this->items.find(name); it != this->items.end())
 		{
 			nabs::impl::int_warn("item '{}' already exists in the dependency graph", name);
 			return it->second;
 		}
 
-		return (this->items[name] = new Item(/* phony: */ false, name));
+		return (this->items[name] = new Item(kind, name));
 	}
 
-	Item* Graph::add_phony(std::string name)
+	Item* Graph::add(int kind, std::string name)
 	{
 		if(auto it = this->items.find(name); it != this->items.end())
 		{
@@ -3669,16 +3944,155 @@ namespace nabs::dep
 			return it->second;
 		}
 
-		return (this->items[name] = new Item(/* phony: */ true, name));
+		return (this->items[name] = new Item(kind, name));
 	}
 
-	Item* Graph::get(const std::string& name)
+	Item* Graph::get_or_add(int kind, const fs::path& path)
+	{
+		auto canon = fs::weakly_canonical(path).string();
+		if(auto item = this->get(canon); item != nullptr)
+			return item;
+
+		return this->add(kind, std::move(canon));
+	}
+
+	Item* Graph::get_or_add(int kind, std::string name)
+	{
+		if(auto item = this->get(name); item != nullptr)
+			return item;
+
+		return this->add(kind, std::move(name));
+	}
+
+	Item* Graph::get(const std::string& name) const
 	{
 		if(auto it = this->items.find(name); it != this->items.end())
 			return it->second;
 		else
 			return nullptr;
 	}
+
+	Item* Graph::get(const fs::path& path) const
+	{
+		if(auto it = this->items.find(fs::weakly_canonical(path).string()); it != this->items.end())
+			return it->second;
+		else
+			return nullptr;
+	}
+
+	Item* Graph::add(const fs::path& path) { return this->add(infer_kind_from_filename(path), path); }
+	Item* Graph::get_or_add(const fs::path& path) { return this->get_or_add(infer_kind_from_filename(path), path); }
+
+	Item* Graph::get(const char* name) const { return this->get(std::string(name)); }
+	Item* Graph::add(int kind, const char* name) { return this->add(kind, std::string(name)); }
+	Item* Graph::get_or_add(int kind, const char* name) { return this->get_or_add(kind, std::string(name)); }
+
+	bool read_dependencies_from_file(Graph& graph, const fs::path& dependency_file)
+	{
+		// it is *NOT* an error to not have this file!
+		if(!fs::exists(dependency_file))
+			return false;
+
+		auto contents = fs::read_file(dependency_file).expect("failed to read file");
+		auto lines = split_string_lines(contents);
+
+		// TODO: good job, we need to handle unescaping spaces in this filename.
+		// spaces are prepended with a backslash. good thing we can't have backslashes in filenames, right?
+		// WRONG, linux lets you have \ in filenames.
+
+		auto parse_till_space = [](std::string_view& line) -> std::string {
+			std::string ret;
+			line = trim_whitespace(line);
+
+			// TODO: this is not very efficient, really.
+			while(line.size() > 0)
+			{
+				char k = line.front();
+				line.remove_prefix(1);
+
+				if(k == ' ' || k == '\t')
+					return ret;
+
+				if(k == '\\')
+				{
+					char kk = line.front();
+					line.remove_prefix(1);
+					ret += kk;
+				}
+				else
+				{
+					ret += k;
+				}
+			}
+
+			return ret;
+		};
+
+		// note: wrt. ':' in filenames, gcc correctly generates \: in the output, but clang *does not*.
+		// if you do this (put ':' in your filenames), then this is entirely your fault, and i do not care.
+		for(size_t i = 0; i < lines.size(); i++)
+		{
+			auto line = trim_whitespace(lines[i]);
+			if(line.empty())
+				continue;
+
+			auto target = parse_till_space(line);
+			if(target.empty() || target.back() != ':')
+			{
+				impl::int_warn("depfile: expected ':' following target");
+				return true;
+			}
+
+			std::vector<std::string> deps;
+
+			target.pop_back();
+			while(true)
+			{
+				line = trim_whitespace(line);
+				if(line.empty())
+					break;
+
+				if(line.front() != '\\')
+				{
+					auto dep = parse_till_space(line);
+					if(!dep.empty())
+						deps.push_back(std::move(dep));
+				}
+
+				line = trim_whitespace(line);
+				if(line.empty())
+				{
+					break;
+				}
+				else if(line.front() == '\\')
+				{
+					i += 1;
+					line = trim_whitespace(lines[i]);
+				}
+			}
+
+			for(auto& dep : deps)
+			{
+				int tk = infer_kind_from_filename(target);
+				int dk = infer_kind_from_filename(dep);
+				graph.get_or_add(tk, target)->depend(graph.get_or_add(dk, dep));
+			}
+		}
+
+		return true;
+	}
+}
+
+namespace zpr
+{
+	template <>
+	struct print_formatter<nabs::dep::Item*>
+	{
+		template <typename Cb> void print(nabs::dep::Item* item, Cb&& cb, format_args args)
+		{
+			detail::print_one(static_cast<Cb&&>(cb), static_cast<format_args&&>(args), item->name());
+		}
+	};
 }
 #endif // !NABS_DECLARATION_ONLY
 
@@ -3688,82 +4102,76 @@ namespace nabs::dep
 // compiler specifics
 namespace nabs
 {
-	struct Compiler
-	{
-		fs::path path;
-		int kind;
-		int lang;
-
-		static constexpr int KIND_GCC_CLANG = 1;
-		static constexpr int KIND_MSVC_CL   = 2;
-
-		static constexpr int LANG_C         = 1;
-		static constexpr int LANG_CPP       = 2;
-	};
-
-	namespace impl
-	{
-		std::vector<fs::path> get_path_variable();
-		fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path);
-	}
-
 	Result<Compiler, std::string> find_c_compiler();
 	Result<Compiler, std::string> find_cpp_compiler();
+
+	CompilerFlags get_default_cflags();
+	CompilerFlags get_default_cxxflags();
 }
 
 // implementation
 #if !NABS_DECLARATION_ONLY
 namespace nabs
 {
-	std::vector<fs::path> impl::get_path_variable()
+	namespace impl
 	{
-		std::vector<fs::path> ret;
+		static std::vector<fs::path> get_path_variable()
+		{
+			std::vector<fs::path> ret;
+			auto var = os::get_environment_var("PATH");
 
-	#if defined(_WIN32)
-		char buf[4096] { };
-		size_t len = 0;
-		getenv_s(&len, buf, 4096, "PATH");
-		auto var = std::string_view(buf, len);
-	#else
-		char* buf = getenv("PATH");
-		auto var = std::string_view(buf);
-	#endif
+			if(var.empty())
+				return { };
 
-		if(var.empty())
+			while(true)
+			{
+				auto i = var.find(':');
+				if(i == std::string::npos)
+				{
+					ret.push_back(std::string(var));
+					break;
+				}
+				else
+				{
+					auto comp = var.substr(0, i);
+					ret.push_back(std::string(comp));
+					var = var.substr(i + 1);
+				}
+			}
+
+			return ret;
+		}
+
+		static fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path)
+		{
+			for(auto& p : path)
+			{
+				auto tmp = (p / file);
+				if(fs::exists(tmp))
+					return tmp;
+			}
+
 			return { };
-
-		while(true)
-		{
-			auto i = var.find(':');
-			if(i == std::string::npos)
-			{
-				ret.push_back(std::string(var));
-				break;
-			}
-			else
-			{
-				auto comp = var.substr(0, i);
-				ret.push_back(std::string(comp));
-				var = var.substr(i + 1);
-			}
 		}
 
-		return ret;
-	}
-
-	fs::path impl::find_file_in_path(const fs::path& file, const std::vector<fs::path>& path)
-	{
-		for(auto& p : path)
+		static Result<Compiler, std::string> get_compiler_from_env_var(const std::vector<fs::path>& path_env,
+			const std::string& var, int lang)
 		{
-			auto tmp = (p / file);
-			if(fs::exists(tmp))
-				return tmp;
-		}
+			// first, check if this file exists "just like that"
+			// TODO: we still need a way to capture stdout of a program
+			// so that we can figure out if this is cl.exe or gcc or clang.
 
-		return { };
+			if(fs::exists(var))
+				return Ok(Compiler { .path = var, .kind = Compiler::KIND_CLANG, .lang = lang });
+
+			// if not, look for it in the path
+			if(auto ccc = impl::find_file_in_path(var, path_env); !ccc.empty())
+				return Ok(Compiler { .path = ccc, .kind = Compiler::KIND_CLANG, .lang = lang });
+
+			return Err<std::string>(zpr::sprint("specified compiler '{}' does not exist", var));
+		}
 	}
 
-	// TODO: `find_c_compiler()` and `find_cpp_compiler()` should be able to return failure.
 	Result<Compiler, std::string> find_c_compiler()
 	{
 		// TODO: support cross-compilation better
@@ -3779,6 +4187,10 @@ namespace nabs
 		// in these situations we also need to be able to have a method of selecting
 		// the kind of compiler. for example, you might compile nabs with cl.exe, but
 		// want to use mingw to compile the project.
+
+		auto path_env = impl::get_path_variable();
+		if(auto cc = os::get_environment_var("CC"); !cc.empty())
+			return impl::get_compiler_from_env_var(path_env, cc, Compiler::LANG_C);
 
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
@@ -3799,7 +4211,7 @@ namespace nabs
 		Compiler ret { };
 		ret.path = os::msvc_toolchain_binaries() / ARCH / "cl.exe";
 		if(!fs::exists(ret.path))
-			return Err(std::string("'cl.exe' does not exist"));
+			return Err<std::string>("'cl.exe' does not exist");
 
 		ret.kind = Compiler::KIND_MSVC_CL;
 		ret.lang = Compiler::LANG_C;
@@ -3807,24 +4219,26 @@ namespace nabs
 
 	#else
 		// basically, find 'cc' in the path.
-		auto path_env = impl::get_path_variable();
 		if(auto clang = impl::find_file_in_path("clang", path_env); !clang.empty())
-			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C });
+			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_CLANG, .lang = Compiler::LANG_C });
 
 		else if(auto gcc = impl::find_file_in_path("gcc", path_env); !gcc.empty())
-			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C });
+			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_C });
 
 		else if(auto cc = impl::find_file_in_path("cc", path_env); !cc.empty())
-			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_C });
+			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_C });
 
 		else
 			return Err<std::string>("no compiler in $PATH");
-
 	#endif // _WIN32
 	}
 
 	Result<Compiler, std::string> find_cpp_compiler()
 	{
+		auto path_env = impl::get_path_variable();
+		if(auto cc = os::get_environment_var("CXX"); !cc.empty())
+			return impl::get_compiler_from_env_var(path_env, cc, Compiler::LANG_CPP);
+
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
 		// msvc uses cl.exe for both C and C++ -- the hard part is actually finding the damn thing.
@@ -3835,20 +4249,66 @@ namespace nabs
 
 	#else
 		// basically, find 'c++' in the path.
-		auto path_env = impl::get_path_variable();
 		if(auto clang = impl::find_file_in_path("clang++", path_env); !clang.empty())
-			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP });
+			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_CLANG, .lang = Compiler::LANG_CPP });
 
 		else if(auto cc = impl::find_file_in_path("c++", path_env); !cc.empty())
-			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP });
+			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_CPP });
 
 		else if(auto gcc = impl::find_file_in_path("g++", path_env); !gcc.empty())
-			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC_CLANG, .lang = Compiler::LANG_CPP });
+			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_CPP });
 
 		else
 			return Err<std::string>("no compiler in $PATH");
 
 	#endif // _WIN32
+	}
+
+	// TODO: again, support cross-compilation, prefix/sysroot, etc.
+	Result<Toolchain, std::string> find_toolchain()
+	{
+		Toolchain ret;
+		if(auto cc = find_c_compiler(); !cc.ok())
+			return Err(cc.error());
+		else
+			ret.cc = cc.unwrap();
+
+		if(auto cxx = find_cpp_compiler(); !cxx.ok())
+			return Err(cxx.error());
+		else
+			ret.cxx = cxx.unwrap();
+
+		// use the c++ compiler to link.
+		ret.ld = ret.cxx;
+
+		ret.cflags = get_default_cflags();
+		ret.cxxflags = get_default_cxxflags();
+
+		ret.cc.log_hook  = default_compiler_logger(false, "cc");
+		ret.cxx.log_hook = default_compiler_logger(false, "cxx");
+		ret.ld.log_hook  = default_compiler_logger(true, "ld");
+
+		return Ok(std::move(ret));
+	}
+
+	CompilerFlags get_default_cflags()
+	{
+		CompilerFlags ret;
+		ret.language_standard = "c11";
+		ret.create_missing_folders = true;
+		ret.generate_header_dependencies = true;
+
+		return ret;
+	}
+
+	CompilerFlags get_default_cxxflags()
+	{
+		CompilerFlags ret;
+		ret.language_standard = "c++17";
+		ret.create_missing_folders = true;
+		ret.generate_header_dependencies = true;
+
+		return ret;
 	}
 }
 #endif // !NABS_DECLARATION_ONLY
@@ -3868,13 +4328,9 @@ namespace nabs
 	int compile_to_object_file(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
 		const fs::path& files);
 
-	// passes -c (or /c) to the compiler to get an object file, but also uses `-MP -MMD` (or /showIncludes)
-	// to extract the headers that the file depends on. this one only takes 1 file. this might be an unnecessary
-	// limitation, but we'll have this limitation for now. the dependency info is written to the file specified
-	// by `dep_output_file` (either by the compiler, or by us).
-	int compile_to_object_file_with_dependencies(const Compiler& compiler, const CompilerFlags& opts,
-		const std::optional<fs::path>& output, fs::path& dep_output_file, const fs::path& file);
-
+	// this actually calls 'c++' or 'cc', and not 'ld'.
+	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const std::vector<fs::path>& files);
 
 	template <typename... Args, typename = std::enable_if_t<((std::is_convertible_v<Args, fs::path>) && ...)>>
 	inline int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
@@ -3882,6 +4338,18 @@ namespace nabs
 	{
 		return compile_files(compiler, opts, output, std::vector<fs::path> { inputs... });
 	}
+
+	// just overloads that don't take the output path.
+	int compile_to_object_file(const Compiler& compiler, const CompilerFlags& opts, const fs::path& file);
+	int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files);
+	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files);
+
+	fs::path get_default_object_filename(const Compiler& compiler, const CompilerFlags& opts, const fs::path& file);
+	fs::path get_dependency_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path file);
+	fs::path get_default_pch_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path header);
+
+	Result<fs::path, int> compile_header_to_pch(const Compiler& compiler, const CompilerFlags& opts,
+		const fs::path& header);
 }
 
 // implementation
@@ -3894,7 +4362,7 @@ namespace nabs
 		{
 			auto args = opts.options;
 
-			if(cmp.kind == Compiler::KIND_GCC_CLANG)
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 			{
 				for(auto& inc : opts.include_paths)
 					args.push_back(zpr::sprint("-I{}", inc.string()));
@@ -3971,7 +4439,7 @@ namespace nabs
 				if(cmp.kind == Compiler::KIND_MSVC_CL)
 					f = f.replace_extension(obj ? ".obj" : ".exe");
 				else
-					f = f.replace_extension(obj ? ".o" : "");
+					f = f.replace_extension(obj ? (f.extension().string() + ".o") : "");
 			}
 
 			/*
@@ -4000,7 +4468,7 @@ namespace nabs
 					if(!obj)
 						args.push_back(zpr::sprint("/Fe:{}", quote_argument(f.string())));
 				}
-				else if(cmp.kind == Compiler::KIND_GCC_CLANG)
+				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 				{
 					// there's no special behaviour for this, because gcc/clang don't throw stupid obj
 					// files everywhere if they're making an executable. so, we can just -o to set the output name.
@@ -4021,7 +4489,7 @@ namespace nabs
 					if(obj) args.push_back(zpr::sprint("/Fo{}", quote_argument(f.string())));
 					else    args.push_back(zpr::sprint("/Fe:{}", quote_argument(f.string())));
 				}
-				else if(cmp.kind == Compiler::KIND_GCC_CLANG)
+				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 				{
 					args.push_back("-o");
 					args.push_back(f.string());
@@ -4038,7 +4506,7 @@ namespace nabs
 		static void setup_args_for_compiling_to_obj(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts,
 			const std::optional<fs::path>& output, const fs::path& file)
 		{
-			if(cmp.kind == Compiler::KIND_GCC_CLANG)
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 			{
 				args.push_back("-c");
 				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
@@ -4055,46 +4523,156 @@ namespace nabs
 				impl::int_error("unsupported compiler");
 			}
 		}
+
+		static void add_flags_for_precompiled_header(std::vector<std::string>& args, const Compiler& cmp,
+			const CompilerFlags& opts)
+		{
+			// if you use a precompiled header, it is *your* responsibility to make sure
+			// that it is updated if/when necessary. the sanest way to do this is to enable
+			// the `generate_header_dependencies` flag in the compiler options, and use the
+			// dependency graph functionality (either via auto_*, or manually on your own) to
+			// ensure that the pch is recompiled if anything it includes changes.
+			if(auto pch = opts.precompiled_header; !pch.empty())
+			{
+				if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				{
+					args.push_back("-include");
+					args.push_back(pch.string());
+				}
+				else
+				{
+					impl::int_error("unsupported compiler");
+				}
+			}
+		}
+
+		static void set_flags_for_dependency_file(std::vector<std::string>& args, const Compiler& cmp,
+			const CompilerFlags& opts, const fs::path& file)
+		{
+			if(opts.generate_header_dependencies)
+			{
+				if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				{
+					args.push_back("-MP");
+					args.push_back("-MMD");
+
+					args.push_back("-MF");
+					args.push_back(get_dependency_filename(cmp, opts, file));
+				}
+				else if(cmp.kind == Compiler::KIND_MSVC_CL)
+				{
+					args.push_back("/showIncludes");
+					impl::int_error("msvc /showIncludes unsupported");
+				}
+				else
+				{
+					impl::int_error("unsupported compiler");
+				}
+			}
+		}
 	}
 
-
-	int compile_to_object_file_with_dependencies(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
-		fs::path& dep_output_file, const fs::path& file)
+	fs::path get_default_object_filename(const Compiler& cmp, const CompilerFlags& opts, const fs::path& file)
 	{
-		auto args = impl::setup_basic_args(cmp, opts);
-		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
+		std::vector<std::string> fake_args;
+		return impl::set_output_name(fake_args, cmp, opts, /* obj: */ true, { }, { file });
+	}
 
-		if(cmp.kind == Compiler::KIND_GCC_CLANG)
+	fs::path get_dependency_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path file)
+	{
+		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
-			auto out_name = impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
-
-			args.push_back("-MP");
-			args.push_back("-MMD");
-
 			if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
 			{
-				dep_output_file = *inter / (out_name.concat(".d"));
-				args.push_back("-MF");
-				args.push_back(dep_output_file);
-
-				impl::create_missing_dirs(opts, dep_output_file);
+				return *inter / (file.concat(".d"));
 			}
 			else
 			{
-				dep_output_file = out_name.replace_extension(".d");
+				return file.concat(".d");
 			}
 		}
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
-			args.push_back("/showIncludes");
+			impl::int_error("unsupported compiler");
 		}
 		else
 		{
 			impl::int_error("unsupported compiler");
 		}
+	}
+
+	fs::path get_default_pch_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path header)
+	{
+		fs::path filename;
+		if(cmp.kind == Compiler::KIND_CLANG)
+			filename = header.concat(".pch");
+		else if(cmp.kind == Compiler::KIND_GCC)
+			filename = header.concat(".gch");
+		else if(cmp.kind == Compiler::KIND_MSVC_CL)
+			filename = header.concat(".pch");
+		else
+			impl::int_error("unsupported compiler");
+
+		if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
+			return *inter / filename;
+
+		else
+			return filename;
+	}
+
+	Result<fs::path, int> compile_header_to_pch(const Compiler& cmp, const CompilerFlags& opts,
+		const fs::path& header)
+	{
+		auto args = impl::setup_basic_args(cmp, opts);
+		impl::set_flags_for_dependency_file(args, cmp, opts, header);
+
+		// the pch either goes next to the header file, or in the intermediate directory
+		// (just like object files)
+		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+		{
+			if(cmp.lang == Compiler::LANG_CPP)      args.push_back("-x"), args.push_back("c++-header");
+			else if(cmp.lang == Compiler::LANG_C)   args.push_back("-x"), args.push_back("c-header");
+
+			auto pch = get_default_pch_filename(cmp, opts, header);
+			args.push_back("-o");
+			args.push_back(pch.string());
+
+			args.push_back(header.string());
+
+			if(cmp.log_hook)
+				cmp.log_hook(pch, { header }, args);
+
+			if(int status = cmd(cmp.path.string(), std::move(args)).run(); status != 0)
+				return Err(status);
+
+			return Ok(pch);
+		}
+		else if(cmp.kind == Compiler::KIND_MSVC_CL)
+		{
+			impl::int_error("unsupported compiler");
+		}
+		else
+		{
+			impl::int_error("unsupported compiler");
+		}
+	}
+
+
+
+	int compile_to_object_file(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const fs::path& file)
+	{
+		auto args = impl::setup_basic_args(cmp, opts);
+		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
+		impl::add_flags_for_precompiled_header(args, cmp, opts);
+
+		auto out_name = impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
+		impl::set_flags_for_dependency_file(args, cmp, opts, file);
 
 		args.push_back(file.string());
 
+		if(cmp.log_hook)
+			cmp.log_hook(out_name, { file }, args);
 
 		if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
@@ -4108,35 +4686,23 @@ namespace nabs
 	}
 
 
-	int compile_to_object_file(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
-		const fs::path& file)
-	{
-		auto args = impl::setup_basic_args(cmp, opts);
-
-		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
-		args.push_back(file.string());
-
-		// construct the command, and run it.
-		return cmd(cmp.path.string(), std::move(args)).run();
-	}
-
-
 
 
 	int compile_files(const Compiler& cmp, const CompilerFlags& opts, const std::optional<fs::path>& output,
 		const std::vector<fs::path>& files)
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
-		if(cmp.kind == Compiler::KIND_GCC_CLANG)
+		impl::add_flags_for_precompiled_header(args, cmp, opts);
+
+		auto out = impl::set_output_name(args, cmp, opts, /* obj: */ false, output, files);
+
+		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
-			impl::set_output_name(args, cmp, opts, /* obj: */ false, output, files);
+
 		}
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
 			args.push_back("/nologo");
-
-			impl::set_output_name(args, cmp, opts, /* obj: */ false, output, files);
-
 			if(!opts.libraries.empty())
 				impl::int_error("libraries unsupported");
 		}
@@ -4150,17 +4716,52 @@ namespace nabs
 			args.push_back(f.string());
 
 		// libraries go after.
-		if(cmp.kind == Compiler::KIND_GCC_CLANG)
+		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
 			for(auto& lib : opts.libraries)
 				args.push_back(zpr::sprint("-l{}", lib));
 		}
 
+		if(cmp.log_hook)
+			cmp.log_hook(out, files, args);
+
 		// construct the command, and run it.
 		return cmd(cmp.path.string(), std::move(args)).run();
 	}
+
+	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const std::vector<fs::path>& files)
+	{
+		// we can just 'compile' them together.
+		return compile_files(compiler, opts, output, files);
+	}
+
+
+
+
+
+	int compile_to_object_file(const Compiler& compiler, const CompilerFlags& opts, const fs::path& file)
+	{
+		return compile_to_object_file(compiler, opts, { }, file);
+	}
+
+	int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files)
+	{
+		return compile_files(compiler, opts, { }, files);
+	}
+
+	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files)
+	{
+		return link_object_files(compiler, opts, { }, files);
+	}
 }
 #endif // !NABS_DECLARATION_ONLY
+
+
+
+
+
+
 
 
 
@@ -4208,7 +4809,49 @@ namespace nabs::fs
 	{
 		return impl::find_files_helper<fs::recursive_directory_iterator>(dir, pred);
 	}
+
+	std::vector<fs::path> find_files_with_extension(const fs::path& dir, std::string_view ext);
+	std::vector<fs::path> find_files_with_extension_recursively(const fs::path& dir, std::string_view ext);
 }
+
+#if !NABS_DECLARATION_ONLY
+namespace nabs::fs
+{
+	std::vector<fs::path> find_files_with_extension(const fs::path& dir, std::string_view ext)
+	{
+		return find_files(dir, [&ext](auto ent) -> bool {
+			return ent.path().extension() == ext;
+		});
+	}
+
+	std::vector<fs::path> find_files_with_extension_recursively(const fs::path& dir, std::string_view ext)
+	{
+		return find_files_recursively(dir, [&ext](auto ent) -> bool {
+			return ent.path().extension() == ext;
+		});
+	}
+
+	Result<std::string, std::string> read_file(const fs::path& file)
+	{
+		FILE* f = fopen(file.string().c_str(), "rb");
+		if(f == nullptr)
+			return Err<std::string>(os::strerror_wrapper());
+
+		std::string input;
+		fseek(f, 0, SEEK_END);
+
+		long fsize = ftell(f);
+		fseek(f, 0, SEEK_SET);  //same as rewind(f);
+
+		input.resize(fsize);
+		if(fread(input.data(), fsize, 1, f) < 0)
+			return Err<std::string>(os::strerror_wrapper());
+
+		fclose(f);
+		return Ok(std::move(input));
+	}
+}
+#endif // !NABS_DECLARATION_ONLY
 
 
 
@@ -4232,7 +4875,7 @@ namespace nabs
 {
 	namespace impl
 	{
-#if defined(_WIN32)
+	#if defined(_WIN32)
 		static constexpr const char* TMP_FILE_NAME = "__please_delete_me.exe";
 
 		static HANDLE create_process(fs::path proc, const char* first, const std::vector<std::string>& args)
@@ -4349,12 +4992,12 @@ namespace nabs
 				}
 			}
 
-			if(cpp.kind == Compiler::KIND_GCC_CLANG)
+			if(cpp.kind == Compiler::KIND_CLANG || cpp.kind == Compiler::KIND_GCC)
 			{
 				flags.language_standard = "c++17";
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
-				flags.options.push_back("-O2");
+				// flags.options.push_back("-O2");
 
 				// TODO: checking for stdc++fs and/or c++fs needs to be more robust
 				// eg. we should check if we were linked with libstdc++ or libc++, first of all
@@ -4402,7 +5045,6 @@ namespace nabs
 				impl::int_error("execvp(): {}", strerror(errno));
 		#endif
 		}
-
 	}
 
 	void self_update(int argc, char** argv, std::vector<std::string> filenames, bool auto_find_include)
@@ -4423,7 +5065,7 @@ namespace nabs
 		if(!fs::exists(this_path))
 		{
 			impl::int_warn("argv[0] (= '{}') does not exist, something fishy is going on",
-				fs::canonical(this_path).string());
+				fs::weakly_canonical(this_path).string());
 			return;
 		}
 
@@ -4787,21 +5429,6 @@ namespace nabs::impl
 		return;
 	}
 
-	std::string trim(std::string s)
-	{
-		auto ltrim = [](std::string& s) -> std::string& {
-			s.erase(0, s.find_first_not_of(" \t\n\r\f\v"));
-			return s;
-		};
-
-		auto rtrim = [](std::string& s) -> std::string& {
-			s.erase(s.find_last_not_of(" \t\n\r\f\v") + 1);
-			return s;
-		};
-
-		return ltrim(rtrim(s));
-	}
-
 	bool findVSToolchain(FindResult* result)
 	{
 		// for vs >= 2017, we need to do some COM stupidity.
@@ -4897,7 +5524,7 @@ namespace nabs::impl
 			}
 
 			os::close_file(file);
-			toolchainVersion = trim(toolchainVersion);
+			toolchainVersion = trim_whitespace(toolchainVersion);
 		}
 
 		std::string toolchainPath = zpr::sprint("{}\\Tools\\MSVC\\{}", vsRoot, toolchainVersion);
@@ -4956,28 +5583,19 @@ namespace nabs::os
 	fs::path msvc_windows_sdk()
 	{
 		auto ret = impl::performMSVCSearch()->windowsSDKRoot;
-		if(fs::exists(ret))
-			return fs::canonical(ret);
-		else
-			return ret;
+		return fs::weakly_canonical(ret);
 	}
 
 	fs::path msvc_toolchain_binaries()
 	{
 		auto ret = impl::performMSVCSearch()->vsBinDirectory;
-		if(fs::exists(ret))
-			return fs::canonical(ret);
-		else
-			return ret;
+		return fs::weakly_canonical(ret);
 	}
 
 	fs::path msvc_toolchain_libraries()
 	{
 		auto ret = impl::performMSVCSearch()->vsLibDirectory;
-		if(fs::exists(ret))
-			return fs::canonical(ret);
-		else
-			return ret;
+		return fs::weakly_canonical(ret);
 	}
 }
 #endif // _WIN32
@@ -5029,6 +5647,95 @@ namespace nabs
 		}
 	#endif // _WIN32
 	}
+
+	std::string trim_whitespace(std::string s)
+	{
+		auto ltrim = [](std::string& s) -> std::string& {
+			s.erase(0, s.find_first_not_of(" \t\n\r\f\v"));
+			return s;
+		};
+
+		auto rtrim = [](std::string& s) -> std::string& {
+			s.erase(s.find_last_not_of(" \t\n\r\f\v") + 1);
+			return s;
+		};
+
+		return ltrim(rtrim(s));
+	}
+
+	std::string_view trim_whitespace(std::string_view s)
+	{
+		auto ltrim = [](std::string_view s) -> std::string_view {
+			auto i = s.find_first_not_of(" \t\n\r\f\v");
+			if(i != std::string::npos)
+				s.remove_prefix(i);
+			return s;
+		};
+
+		auto rtrim = [](std::string_view s) -> std::string_view {
+			auto i = s.find_last_not_of(" \t\n\r\f\v");
+			if(i != std::string::npos)
+				s.remove_suffix(s.size() - i - 1);
+			return s;
+		};
+
+		return ltrim(rtrim(s));
+	}
+
+	std::vector<std::string_view> split_string_lines(std::string& str)
+	{
+		std::vector<std::string_view> ret;
+		std::string_view view = str;
+
+		while(!view.empty())
+		{
+			size_t ln = view.find('\n');
+
+			if(ln != std::string_view::npos)
+			{
+				// the windows ending is \r\n, so if the line ends with \r,
+				// yeet it.
+				if(view.back() == '\r')
+					ln -= 1;
+				ret.emplace_back(view.data(), ln);
+				view.remove_prefix(ln + 1);
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		// account for the case when there's no trailing newline, and we still have some stuff stuck in the view.
+		if(!view.empty())
+		{
+			if(view.back() == '\r')
+				view.remove_suffix(1);
+
+			ret.emplace_back(view.data(), view.length());
+		}
+
+		return ret;
+	}
+
+	std::string os::get_environment_var(const std::string& name)
+	{
+	#if defined(_WIN32)
+		std::string var;
+		var.resize(4096, ' ');
+		size_t len = 0;
+		getenv_s(&len, buf, 4096, name.c_str());
+		var.resize(len);
+
+		return var;
+	#else
+		char* buf = getenv(name.c_str());
+		if(buf == nullptr)
+			return "";
+		else
+			return std::string(buf);
+	#endif
+	}
 }
 #endif // !NABS_DECLARATION_ONLY
 
@@ -5037,19 +5744,264 @@ namespace nabs
 
 
 
+/*
+	"automatic" compilation
+	-----------------------
+	I would put these in a namespace called `auto`, but obviously we can't do that.
+
+	In order to use these functions, your project's compilation setup must be done in a particular way. While
+	effort has been made to allow this to fit more than one particular setup, some restrictions apply:
+
+	TODO: document restrictions
+	1.
 
 
+	TODO: document hooks
+*/
+namespace nabs
+{
+	struct AutoCompileHooks
+	{
+		std::function<bool (dep::Item*, std::vector<dep::Item*>)> pre_compile_hook;
+		std::function<bool (dep::Item*, std::vector<dep::Item*>)> post_compile_hook;
+
+		std::function<void (Compiler&, CompilerFlags&, dep::Item*, std::vector<dep::Item*>)> modify_flags;
+	};
+
+	namespace impl
+	{
+		Result<void, fs::path> auto_compile_one_thing(const dep::Graph& graph, const dep::Item* target,
+			const Toolchain& tc, const AutoCompileHooks& hooks);
+	}
+
+	std::optional<std::pair<Compiler, CompilerFlags>> auto_infer_compiler_from_file(const Toolchain& toolchain,
+		const fs::path& path);
+
+	Result<dep::Item*, fs::path> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& exe, const std::vector<fs::path>& files);
+
+	Result<void, fs::path> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+		const dep::Graph& graph, const std::vector<dep::Item*>& targets);
+
+	Result<void, fs::path> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+		const dep::Graph& graph, dep::Item* target);
+
+	void auto_add_precompiled_header(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& header, int lang);
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	namespace impl
+	{
+		Result<void, fs::path> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
+			const Toolchain& tc, const AutoCompileHooks& hooks)
+		{
+			using namespace nabs::dep;
+
+			bool target_exists = fs::exists(target->name());
+
+			bool rebuild = false;
+			for(auto& dep : target->deps)
+			{
+				bool dep_exists = fs::exists(dep->name());
+				bool dep_phony = dep->kind() == KIND_PHONY;
+
+				if(!dep_phony && !dep_exists)
+					return Err(fs::path(dep->name()));
+
+				if(dep_phony || !dep_exists || !target_exists
+					|| fs::last_write_time(dep->name()) > fs::last_write_time(target->name()))
+				{
+					rebuild = true;
+					auto_compile_one_thing(graph, dep, tc, hooks);
+				}
+			}
+
+			if(!rebuild || target->kind() == KIND_PHONY || target->produced_by.empty())
+				return Ok();
+
+			if(target->kind() == KIND_C_SOURCE || target->kind() == KIND_CPP_SOURCE)
+				return Ok();
+
+			if(hooks.pre_compile_hook && !hooks.pre_compile_hook(target, target->produced_by))
+				return Err<fs::path>(target->name());
+
+			if(target->kind() == KIND_OBJECT)
+			{
+				const auto& prod = target->produced_by;
+				if(prod.size() != 1)
+					impl::int_error("auto_build_targets(): produced_by for object files must have exactly 1 item");
+
+				Compiler cmp;
+				CompilerFlags flags;
+
+				auto src = prod[0];
+				if(src->kind() == KIND_C_SOURCE)
+					cmp = tc.cc, flags = tc.cflags;
+
+				else if(src->kind() == KIND_CPP_SOURCE)
+					cmp = tc.cxx, flags = tc.cxxflags;
+
+				else
+					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
+
+				if(hooks.modify_flags)
+					hooks.modify_flags(cmp, flags, target, target->produced_by);
+
+				if(compile_to_object_file(cmp, flags, target->name(), src->name()) != 0)
+					return Err<fs::path>(target->name());
+			}
+			else if(target->kind() == KIND_PCH)
+			{
+				const auto& prod = target->produced_by;
+				if(prod.size() != 1)
+					impl::int_error("auto_build_targets(): produced_by for precompiled headers must have exactly 1 item");
+
+				Compiler cmp;
+				CompilerFlags flags;
+
+				auto src = prod[0];
+				if(src->kind() == KIND_C_SOURCE)
+					cmp = tc.cc, flags = tc.cflags;
+
+				else if(src->kind() == KIND_CPP_SOURCE)
+					cmp = tc.cxx, flags = tc.cxxflags;
+
+				if(hooks.modify_flags)
+					hooks.modify_flags(cmp, flags, target, target->produced_by);
+
+				if(!compile_header_to_pch(cmp, flags, src->name()).ok())
+					return Err<fs::path>(target->name());
+			}
+			else if(target->kind() == KIND_EXE)
+			{
+				auto ld = tc.ld;
+				auto ldflags = tc.ldflags;
+
+				if(hooks.modify_flags)
+					hooks.modify_flags(ld, ldflags, target, target->produced_by);
+
+				auto prod = map(target->produced_by, [](auto x) { return fs::path(x->name()); });
+				if(link_object_files(ld, ldflags, target->name(), prod) != 0)
+					return Err<fs::path>(target->name());
+			}
+			else
+			{
+				impl::int_error("auto_build_targets(): unknown target kind '{}'", target->kind());
+			}
+
+			if(hooks.post_compile_hook && !hooks.post_compile_hook(target, target->produced_by))
+				return Err<fs::path>(target->name());
+
+			return Ok();
+		}
+	}
+
+	Result<void, fs::path> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+		const dep::Graph& graph, const std::vector<dep::Item*>& targets)
+	{
+		auto order = graph.topological_sort(targets)
+			.expect("failed to find a valid dependency order");
+
+		for(auto& targets : order)
+		{
+			for(auto& target : targets)
+			{
+				if(auto e = impl::auto_compile_one_thing(graph, target, toolchain, hooks); !e.ok())
+					return e;
+			}
+		}
+
+		return Ok();
+	}
+
+	Result<void, fs::path> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+		const dep::Graph& graph, dep::Item* target)
+	{
+		return auto_build_targets(toolchain, hooks, graph, { target });
+	}
 
 
+	Result<dep::Item*, fs::path> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& exe_name, const std::vector<fs::path>& src_files)
+	{
+		using namespace dep;
+		auto exe_file = graph.get_or_add(KIND_EXE, exe_name);
 
+		for(auto& f : src_files)
+		{
+			auto _opt = auto_infer_compiler_from_file(toolchain, f);
+			if(!_opt.has_value())
+			{
+				impl::int_warn("auto_executable_from_sources(): could not infer compiler for source file '{}'", f);
+				return Err(f);
+			}
 
+			auto [ compiler, flags ] = *_opt;
 
+			auto src = graph.get_or_add(f);
+			auto obj = graph.get_or_add(get_default_object_filename(compiler, flags, f));
 
+			// setup the dependency from obj <- source
+			obj->add_produced_by(src);
+			exe_file->add_produced_by(obj);
 
+			// also setup the header depends for the source
+			read_dependencies_from_file(graph, get_dependency_filename(compiler, flags, f));
 
+			// lastly, check precompiled headers.
+			if(auto pch = flags.precompiled_header; !pch.empty())
+			{
+				auto pchname = get_default_pch_filename(compiler, flags, pch);
+				obj->depend(graph.get_or_add(KIND_PCH, pchname));
+			}
+		}
 
+		return Ok(exe_file);
+	}
 
+	std::optional<std::pair<Compiler, CompilerFlags>> auto_infer_compiler_from_file(const Toolchain& toolchain,
+		const fs::path& path)
+	{
+		using namespace dep;
+		auto kind = infer_kind_from_filename(path);
 
+		if(kind == KIND_C_SOURCE)
+			return std::make_pair(toolchain.cc, toolchain.cflags);
 
+		else if(kind == KIND_CPP_SOURCE)
+			return std::make_pair(toolchain.cxx, toolchain.cxxflags);
 
+		else
+			return { };
+	}
 
+	void auto_add_precompiled_header(dep::Graph& graph, const Toolchain& tc, const fs::path& header, int lang)
+	{
+		using namespace dep;
+
+		int hdr_kind = KIND_NONE;
+
+		const Compiler* cmp = nullptr;
+		const CompilerFlags* opts = nullptr;
+
+		if(lang == Compiler::LANG_CPP)      hdr_kind = KIND_CPP_SOURCE, cmp = &tc.cxx, opts = &tc.cxxflags;
+		else if(lang == Compiler::LANG_C)   hdr_kind = KIND_C_SOURCE, cmp = &tc.cc, opts = &tc.cflags;
+		else                                impl::int_error("unsupported language '{}'", lang);
+
+		assert(cmp != nullptr && opts != nullptr);
+		auto pch_name = get_default_pch_filename(*cmp, *opts, header);
+
+		auto hdr = graph.get_or_add(hdr_kind, header);
+		auto pch = graph.get_or_add(KIND_PCH, pch_name);
+
+		pch->add_produced_by(hdr);
+
+		// also read the dependencies
+		read_dependencies_from_file(graph, get_dependency_filename(*cmp, *opts, header));
+	}
+}
+#endif
