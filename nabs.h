@@ -23,7 +23,17 @@
 	Documentation
 	=============
 
-	There is none.
+	nabs is a single-header library for writing build recipes in C++. It is directly inspired by
+	'nobuild' (https://github.com/tsoding/nobuild), but with more feature (bloat) and built-in support
+	for makefile-like dependency resolution.
+
+	The primary objective of this (not a) build system is to allow writing build recipes/scripts that:
+	(a) are written in one language (the best one) -- C++
+	(b) work for all major platforms -- Linux, macOS, BSDs, Windows
+	(c) easily support, with very little boilerplate, standard makefile project patterns
+
+	More documentation will be coming soon.
+
 
 
 
@@ -31,7 +41,7 @@
 	Version History
 	===============
 
-	0.1.0 - 20/04/2021
+	0.1.0 - 28/04/2021
 	------------------
 	Initial release.
 */
@@ -2226,6 +2236,12 @@ namespace nabs
 		const E& error() const { assert(this->state == STATE_ERR); return this->err; }
 		E& error() { assert(this->state == STATE_ERR); return this->err; }
 
+		void expect(std::string_view msg) const
+		{
+			if(!this->ok())
+				nabs::error_and_exit("{}: {}", msg, this->error());
+		}
+
 		static Result of_value()
 		{
 			return Result<void, E>();
@@ -2367,32 +2383,48 @@ namespace nabs
 	namespace impl
 	{
 	#if !NABS_NO_COLOURS
-
 		static constexpr const char* COLOUR_LOG = "\x1b[30;1m";
 		static constexpr const char* COLOUR_WARN = "\x1b[1m\x1b[33m";
 		static constexpr const char* COLOUR_ERROR = "\x1b[1m\x1b[31m";
 		static constexpr const char* COLOUR_RESET = "\x1b[0m";
+		static constexpr const char* COLOUR_BOLD  = "\x1b[1m";
 	#else
-
 		static constexpr const char* COLOUR_LOG = "";
 		static constexpr const char* COLOUR_WARN = "";
 		static constexpr const char* COLOUR_ERROR = "";
 		static constexpr const char* COLOUR_RESET = "";
+		static constexpr const char* COLOUR_BOLD  = "";
 	#endif
 
 		template <typename... Args>
 		void __logger(int level, std::string_view fmt, Args&&... args)
 		{
-			const char* colour = nullptr;
-			const char* heading = nullptr;
+			const char* colour = COLOUR_ERROR;
+			const char* reset = COLOUR_RESET;
+			const char* bold = COLOUR_BOLD;
+			const char* heading = "[???]";
+			const char* heading2 = "";
+			const char* heading3 = "";
 
-			if(level == 0)      colour = impl::COLOUR_LOG, heading = "[log]";
-			else if(level == 1) colour = impl::COLOUR_WARN, heading = "[wrn]";
-			else if(level == 2) colour = impl::COLOUR_ERROR, heading = "[err]";
-			else                colour = impl::COLOUR_ERROR, heading = "[???]";
+			if(level == -2)      colour = COLOUR_ERROR, heading = "[err", heading2 = " (internal)", heading3 = "]";
+			else if(level == -1) colour = COLOUR_WARN, heading = "[wrn", heading2 = " (internal)", heading3 = "]";
+			else if(level == 0)  colour = COLOUR_LOG, heading = "[log]";
+			else if(level == 1)  colour = COLOUR_WARN, heading = "[wrn]";
+			else if(level == 2)  colour = COLOUR_ERROR, heading = "[err]";
+
+			// if we're not printing to a tty, don't output colours. don't be
+			// "one of those" programs.
+		#if defined(_WIN32)
+			if(GetFileType(GetStdHandle(level > 0 ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE)) != FILE_TYPE_CHAR)
+				colour = "", reset = "";
+		#else
+			if(!isatty(level > 0 ? STDERR_FILENO : STDOUT_FILENO))
+				colour = "", reset = "";
+		#endif
 
 			auto output = (level > 0 ? stderr : stdout);
-			zpr::fprintln(output, "{}{}{} {}", colour, heading, impl::COLOUR_RESET,
+			zpr::fprintln(output, "{}{}{}{}{}{}{}{}{} {}", colour, heading, reset, bold,
+				heading2, reset, colour, heading3, reset,
 				zpr::sprint(fmt, static_cast<Args&&>(args)...));
 		}
 	}
@@ -2441,13 +2473,14 @@ namespace nabs
 		template <typename... Args>
 		[[noreturn]] void int_error(Args&&... args)
 		{
-			error_and_exit(69, static_cast<Args&&>(args)...);
+			impl::__logger(-2, static_cast<Args&&>(args)...);
+			exit(69);
 		}
 
 		template <typename... Args>
 		void int_warn(Args&&... args)
 		{
-			warn(static_cast<Args&&>(args)...);
+			impl::__logger(-1, static_cast<Args&&>(args)...);
 		}
 	}
 
@@ -2491,11 +2524,19 @@ namespace nabs
 	auto map(const Con<T...>& container, Func&& fn)
 	{
 		using U = decltype(fn(std::declval<typename Con<T...>::value_type>()));
-		Con<U> ret;
-		for(auto& x : container)
-			ret.push_back(fn(x));
+		if constexpr (std::is_same_v<U, void>)
+		{
+			for(auto& x : container)
+				fn(x);
+		}
+		else
+		{
+			Con<U> ret;
+			for(auto& x : container)
+				ret.push_back(fn(x));
 
-		return ret;
+			return ret;
+		}
 	}
 
 	/*
@@ -2531,10 +2572,18 @@ namespace nabs
 	*/
 	struct Compiler
 	{
+		// the path to the compiler binary. if you used find_*_compiler or find_toolchain, then this should exist.
 		fs::path path;
+
+		// the 'kind' of the compiler, which (for now) is either clang, gcc, or msvc's cl.exe
 		int kind;
+
+		// the language of the compiler, which (for now) is either C or C++.
 		int lang;
 
+		// a log hook that you can set to perform things (mostly logging) before the compiler is invoked.
+		// you can use default_compiler_logger for a default logging style, although compilers returned by
+		// find_toolchain already have this setup appropriately.
 		std::function<void (const fs::path&, const std::vector<fs::path>&, const std::vector<std::string>&)> log_hook;
 
 		static constexpr int KIND_CLANG     = 1;
@@ -2585,11 +2634,17 @@ namespace nabs
 		fs::path precompiled_header;
 	};
 
+	// a forward declaration, don't mind this.
 	namespace dep
 	{
 		struct Item;
 	}
 
+	/*
+		This structure simply encapsulates a set of compilers, so you can pass this around easily.
+		You can use find_toolchain() to get a Toolchain struct with sane defaults for your current
+		environment, if a sane default exists.
+	*/
 	struct Toolchain
 	{
 		Compiler cc;
@@ -2603,14 +2658,17 @@ namespace nabs
 	};
 
 
-	// a very strange function. its sole purpose is to be used as `log_hook` in the Compiler. because we
-	// cannot easily use string literals in template parameters (pre-C++20), it is taken as a normal
-	// parameter, and this function returns a lambda.
-	// Name: what to print, eg. "cc" or "cxx". Note -- don't pass the c_str() of a temporary in here,
-	// because the pointer is captured by value, and you'll have a bad time.
-	// Output: whether the the printed should be the input or the output. For linking, you probably
-	// want to show "link foo.exe" instead of "link a.o b.o" etc, so use `true` in this case.
-	auto default_compiler_logger(bool output, const char* name)
+	/*
+		a very strange function. its sole purpose is to be used as `log_hook` in the Compiler. because we
+		cannot easily use string literals in template parameters (pre-C++20), it is taken as a normal
+		parameter, and this function returns a lambda.
+		 name:   what to print, eg. "cc" or "cxx". Note -- don't pass the c_str() of a temporary in here,
+		         because the pointer is captured by value, and you'll have a bad time.
+
+		 output: whether the the printed should be the input or the output. For linking, you probably
+		         want to show "link foo.exe" instead of "link a.o b.o" etc, so use `true` in this case.
+	*/
+	inline auto default_compiler_logger(bool output, const char* name)
 	{
 		return [=](const fs::path& out, const std::vector<fs::path>& in, const std::vector<std::string>& args) {
 			(void) args;
@@ -2619,11 +2677,41 @@ namespace nabs
 				return p.lexically_relative(fs::path(__FILE__).parent_path());
 			};
 
-			if(output)  nabs::log("{} {}", name, relative_path(out).string());
-			else        nabs::log("{} {#}", name, map(in, [&](const auto& x) { return relative_path(x).string(); }));
+			if(output)
+			{
+				nabs::log("{} {}", name, relative_path(out).string());
+			}
+			else
+			{
+				nabs::log("{} {#}", name, map(in, [&](const auto& x) {
+					return relative_path(x).string();
+				}));
+			}
 		};
 	}
 }
+
+// argument parsing
+namespace nabs
+{
+	std::vector<std::string_view> parse_args(int argc, char** argv, bool include_first = false);
+}
+
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	std::vector<std::string_view> parse_args(int argc, char** argv, bool include_first)
+	{
+		std::vector<std::string_view> ret;
+		for(size_t i = (include_first ? 0 : 1); i < static_cast<size_t>(argc); i++)
+			ret.push_back(std::string_view(argv[i]));
+
+		return ret;
+	}
+}
+#endif
+
+
 
 
 // pipes and commands
@@ -4759,17 +4847,6 @@ namespace nabs
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 // filesystem stuff
 namespace nabs::fs
 {
@@ -4798,19 +4875,34 @@ namespace nabs::fs
 		}
 	}
 
+	/*
+		Search for files in the given directory (non-recursively), returning a list of paths
+		that match the given predicate. Note that the predicate should accept a `std::filesystem::directory_entry`,
+		*NOT* a `std::filesystem::path`.
+	*/
 	template <typename Predicate>
 	inline std::vector<fs::path> find_files(const fs::path& dir, Predicate&& pred)
 	{
 		return impl::find_files_helper<fs::directory_iterator>(dir, pred);
 	}
 
+	/*
+		Same as `find_files`, but recursively traverses directories.
+	*/
 	template <typename Predicate>
 	inline std::vector<fs::path> find_files_recursively(const fs::path& dir, Predicate&& pred)
 	{
 		return impl::find_files_helper<fs::recursive_directory_iterator>(dir, pred);
 	}
 
+	/*
+		Same semantics as `find_files`, but it returns files matching the given extension.
+	*/
 	std::vector<fs::path> find_files_with_extension(const fs::path& dir, std::string_view ext);
+
+	/*
+		Same semantics as `find_files_recursively`, but it returns files matching the given extension.
+	*/
 	std::vector<fs::path> find_files_with_extension_recursively(const fs::path& dir, std::string_view ext);
 }
 
@@ -4857,16 +4949,39 @@ namespace nabs::fs
 
 
 
-// self-rebuilding
+/*
+	Self-rebuilding
+	---------------
+
+	Functionality that allows the build program to check if its source was changed, and if so rebuild
+	itself. The details are not very important here; just know that the 'normal' way to use this is like so:
+
+	int main(int argc, char** argv)
+	{
+		nabs::self_update(argc, argv, __FILE__);
+
+		// your code
+	}
+*/
 namespace nabs
 {
-	namespace impl
-	{
-		void rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include);
-	}
+	/*
+		An "automagic" function that checks if the build recipe changed, and if so rebuilds it automatically,
+		before re-running the recipe. This overload is only relevant if your build recipe comprises more
+		than one source file. If not, use the other overload. Parameters:
 
-	void self_update(int argc, char** argv, const std::string& file);
+		`argc`, `argv`      -- please pass exactly the `argc` and `argv` that you receive from main().
+		`filenames`         -- a list of files that make up the build recipe
+		`auto_find_include` -- whether or not to add '-I' options to the compiler invocation to help find 'nabs.h'
+	*/
 	void self_update(int argc, char** argv, std::vector<std::string> filenames, bool auto_find_include = false);
+
+	/*
+		The same as the overload above, but taking only one file. It is assumed then that in the #include directive
+		for "nabs.h", either the correct relative path is provided, or "nabs.h" is in the same folder as your
+		build recipe.
+	*/
+	void self_update(int argc, char** argv, const std::string& file);
 }
 
 // implementation
@@ -4945,8 +5060,7 @@ namespace nabs
 		}
 	#endif
 
-
-		void rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include)
+		static void rebuild_self(char** argv, std::vector<std::string> filenames, bool auto_find_include)
 		{
 			log("build recipe changed, rebuilding...");
 
@@ -5118,13 +5232,15 @@ namespace nabs
 
 
 
+/*
+	msvc finder
+	taken almost verbatim from flax, which is licensed under the Apache License 2.0:
+	https://github.com/flax-lang/flax/blob/master/source/platform/msvcfinder.cpp
 
-// msvc finder
-// taken almost verbatim from flax, which is licensed under the Apache License 2.0:
-// https://github.com/flax-lang/flax/blob/master/source/platform/msvcfinder.cpp
-
-// that was in-turn adapted from jon blow's "microsoft_craziness.h", which is licensed under MIT:
-// https://gist.github.com/machinamentum/a2b587a68a49094257da0c39a6c4405f
+	that was in-turn adapted from jon blow's "microsoft_craziness.h", which is licensed under MIT:
+	https://gist.github.com/machinamentum/a2b587a68a49094257da0c39a6c4405f
+*/
+#if defined(_WIN32)
 namespace nabs
 {
 	fs::path msvc_windows_sdk();
@@ -5134,7 +5250,6 @@ namespace nabs
 
 // implementation
 #if !NABS_DECLARATION_ONLY
-#if defined(_WIN32)
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -5577,7 +5692,6 @@ namespace nabs::impl
 		return &cachedResult;
 	}
 }
-
 namespace nabs::os
 {
 	fs::path msvc_windows_sdk()
@@ -5598,8 +5712,8 @@ namespace nabs::os
 		return fs::weakly_canonical(ret);
 	}
 }
-#endif // _WIN32
 #endif // !NABS_DECLARATION_ONLY
+#endif // _WIN32
 
 
 
@@ -5749,22 +5863,48 @@ namespace nabs
 	-----------------------
 	I would put these in a namespace called `auto`, but obviously we can't do that.
 
-	In order to use these functions, your project's compilation setup must be done in a particular way. While
-	effort has been made to allow this to fit more than one particular setup, some restrictions apply:
+	These functions allow you to approximate the functionality of a makefile with very few lines of
+	code, and incorporate most of the expected functionality, including:
+	- generating and using include dependencies for source files
+	- topological sorting of targets, to build dependencies before their dependents
+	- automatic usage and rebuilding of precompiled headers
+	- only building a target if its dependencies are newer than it
 
-	TODO: document restrictions
-	1.
+	Notably, as mentioned below, the `generate_header_dependencies` flag should be set for all the
+	compilers in the toolchain. Since a target (object, exe) is only rebuilt if its dependencies change,
+	it is important that a source file 'depends-on' the header files that it includes.
 
+	Otherwise, modifying a header file will not cause a source file to be rebuilt, and so the final
+	executable file will not be rebuilt either. If you do not wish to use dependency information here,
+	then you probably want to always compile all sources for an executable all the time, and these
+	auto_* functions are not appropriate for that use case.
 
-	TODO: document hooks
+	Each of the auto_* functions are themselves documented, but the general workflow of using them
+	is like this:
+
+	1. Create an empty nabs::dep::Graph
+	2. auto_executable_from_sources() -- Add dependency information for building an executable
+		from a set of source files. Again, note the assumptions above, and/or see the documentation
+		for this function for more specific details.
+
+	3. auto_add_precompiled_header() -- If you are using a precompiled header, then you probably
+		want to call this function so that (a) the PCH is rebuilt if the header changes, and (b) the
+		PCH is rebuilt if any of the headers included by the PCH are changed.
+
+	4. auto_build_targets() -- Automatically build the given targets based on the dependency graph
+		that you just set up.
 */
 namespace nabs
 {
+	/*
+		These hooks are functions that are called by `auto_build_target` when compiling a file.
+
+		1. modify_flags(&compiler, &flags, target, produced_by)
+			Via the provided references to Compiler and CompilerFlags, you can change the compiler
+			or its flags for a specific file. The changes only apply to that particular file.
+	*/
 	struct AutoCompileHooks
 	{
-		std::function<bool (dep::Item*, std::vector<dep::Item*>)> pre_compile_hook;
-		std::function<bool (dep::Item*, std::vector<dep::Item*>)> post_compile_hook;
-
 		std::function<void (Compiler&, CompilerFlags&, dep::Item*, std::vector<dep::Item*>)> modify_flags;
 	};
 
@@ -5774,18 +5914,93 @@ namespace nabs
 			const Toolchain& tc, const AutoCompileHooks& hooks);
 	}
 
+	/*
+		Infer the compiler to use (in terms of a pair of Compiler and its CompilerFlags) for a given
+		file, using its extension. Internally, this function uses `infer_kind_from_filename()` to
+		get the kind of a file, and depending on whether it is KIND_C_SOURCE or KIND_CPP_SOURCE, returns
+		`toolchain.cc + cflags` or `toolchain.cxx + cxxflags` respectively. If the inferred kind was not
+		one of those two, then it returns an empty optional.
+
+		There is rarely a need to call this manually, especially if you are already using the auto_* functions.
+	*/
 	std::optional<std::pair<Compiler, CompilerFlags>> auto_infer_compiler_from_file(const Toolchain& toolchain,
 		const fs::path& path);
 
+	/*
+		Automatically populate the dependency graph with the right vertices and edges to build an executable
+		from a set of source files, given just the output executable's path, and the list of source files.
+
+		This function is not responsible for actually building the target (use auto_build_target for that),
+		but it only sets up the dependency chains correctly.
+
+		1. A dependency item is added for the output executable
+		2. Each source file is 'depended-on' by its corresponding object file, named using get_default_object_filename
+			(this function respects the `intermediate_output_folder` setting in the toolchain compilers)
+		3. Read the "makefile-dependency-info" file (the .d file generated by gcc -MD) from disk at the
+			default location (again, respecting `intermediate_output_folder`) to obtain header dependencies
+		4. Add dependencies on the precompiled header, if it is set
+		5. Add a 'produced-by' dependency from the executable file to each object file
+
+		If the compilers in the toolchain are not setup to generate the dependency information
+		(field `generate_header_dependencies`), it is not an error, but obviously you won't have that
+		information. Importantly, this means that changing a header file *WILL NOT* force a recompile of the
+		source files that include it.
+
+		On success, it returns the item that represents the executable file. On failure, it returns the
+		path of the offending source file.
+	*/
 	Result<dep::Item*, fs::path> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
 		const fs::path& exe, const std::vector<fs::path>& files);
 
+	/*
+		Automatically build all the targets provided in the list, by using the dependency graph and
+		sorting it in topological order. In case of success, an empty result is returned. In case of
+		error, the path to the offending file is returned.
+
+		There is nothing in this function that specifically requires the graph be setup using any of
+		the auto_* functions, but it does make some assumptions:
+
+		1. The `kind` field for the items in the graph are accurate. Namely, if a source file should
+			be compiled with a C++ compiler, then it should have KIND_CPP_SOURCE.
+
+		2. Executable files should have kind KIND_EXE, and will be linked together from object files
+			using `toolchain.ld`
+
+		3. Precompiled headers will be compiled using nabs::compile_header_to_pch(). Again, they
+			should have a type KIND_PCH, and the header itself should be set to KIND_C_SOURCE or
+			KIND_CPP_SOURCE correctly. We don't infer the type from the extension here, since some people
+			(me) use `.h` for c++ headers too.
+
+		4. Phony targets are always rebuilt.
+
+		Overall, the principle of operation is that an item is rebuilt if its dependencies have a
+		more recent modification time than the item itself (eg. a source file was modified, so it
+		is "more recent" than its object file). This check is performed using std::filesystem::last_write_time.
+
+		Lastly, you can provide a `AutoCompileHooks` structure which lets you:
+		1. modify the flags just before compilation starts  -- modify_flags
+	*/
 	Result<void, fs::path> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, const std::vector<dep::Item*>& targets);
 
+	/*
+		Identical to auto_build_targets, but it is just a wrapper that builds only one target.
+	*/
 	Result<void, fs::path> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, dep::Item* target);
 
+	/*
+		Automatically add dependency information to build the given header as a precompiled header.
+		This function uses `get_default_pch_filename()` as the name of the precompiled header; typically
+		it will be the name of the header with an appended '.pch' or '.gch' extension. If
+		`intermediate_output_folder` is set, then the header goes in there.
+
+		Note that you must specify the language of the header (via the `lang` parameter), this is either
+		LANG_C or LANG_CPP for now. We will not infer the type of the header from its extension since
+		people (me) use '.h' for C++ headers as well.
+
+		As long as `lang` is valid, this function always succeeds.
+	*/
 	void auto_add_precompiled_header(dep::Graph& graph, const Toolchain& toolchain,
 		const fs::path& header, int lang);
 }
@@ -5825,9 +6040,6 @@ namespace nabs
 
 			if(target->kind() == KIND_C_SOURCE || target->kind() == KIND_CPP_SOURCE)
 				return Ok();
-
-			if(hooks.pre_compile_hook && !hooks.pre_compile_hook(target, target->produced_by))
-				return Err<fs::path>(target->name());
 
 			if(target->kind() == KIND_OBJECT)
 			{
@@ -5893,12 +6105,10 @@ namespace nabs
 				impl::int_error("auto_build_targets(): unknown target kind '{}'", target->kind());
 			}
 
-			if(hooks.post_compile_hook && !hooks.post_compile_hook(target, target->produced_by))
-				return Err<fs::path>(target->name());
-
 			return Ok();
 		}
 	}
+
 
 	Result<void, fs::path> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, const std::vector<dep::Item*>& targets)
@@ -5923,7 +6133,6 @@ namespace nabs
 	{
 		return auto_build_targets(toolchain, hooks, graph, { target });
 	}
-
 
 	Result<dep::Item*, fs::path> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
 		const fs::path& exe_name, const std::vector<fs::path>& src_files)
