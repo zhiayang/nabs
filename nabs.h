@@ -1979,7 +1979,7 @@ namespace zpr
 	Updated from baseline with:
 	1. expect()
 */
-
+#include <cassert>
 namespace nabs
 {
 	// we need a forward-declaration of error_and_exit for expect().
@@ -2158,6 +2158,12 @@ namespace nabs
 			else            nabs::error_and_exit("{}: {}", msg, this->error());
 		}
 
+		const T& or_else(const T& default_value) const
+		{
+			if(this->ok())  return this->unwrap();
+			else            return default_value;
+		}
+
 	private:
 		// 0 = schrodinger -- no error, no value.
 		// 1 = valid
@@ -2326,6 +2332,7 @@ namespace zpr
 #include <string>
 #include <vector>
 #include <optional>
+#include <functional>
 #include <filesystem>
 #include <type_traits>
 
@@ -2354,6 +2361,8 @@ using ssize_t = long long;
 
 #else
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/wait.h>
 #endif // _WIN32
 
 
@@ -2482,6 +2491,14 @@ namespace nabs
 		{
 			impl::__logger(-1, static_cast<Args&&>(args)...);
 		}
+
+		struct GlobalState
+		{
+			bool pkg_config_exists;
+			bool pkg_config_checked;
+		};
+
+		GlobalState& global_state();
 	}
 
 	namespace os
@@ -2557,6 +2574,37 @@ namespace nabs
 	}
 
 	/*
+		A helper function that appends to the given vector, because std::vector::insert has an atrocious
+		interface that forces you to make a temporary variable.
+	*/
+	template <typename T>
+	std::vector<T>& append_vector(std::vector<T>& vec, const std::vector<T>& items)
+	{
+		vec.insert(vec.end(), items.begin(), items.end());
+		return vec;
+	}
+
+	/*
+		The same as append_vector, but it takes an rvalue and thus moves items.
+	*/
+	template <typename T>
+	std::vector<T>& append_vector(std::vector<T>& vec, std::vector<T>&& items)
+	{
+		vec.insert(vec.end(), std::make_move_iterator(items.begin()), std::make_move_iterator(items.end()));
+		return vec;
+	}
+
+	/*
+		The same as append_vector, but it takes one item instead of a vector of items.
+	*/
+	template <typename T, typename T1>
+	std::vector<T>& append_vector(std::vector<T>& vec, T1&& item)
+	{
+		vec.push_back(static_cast<T1&&>(item));
+		return vec;
+	}
+
+	/*
 		A helper method to check if the string `sv` ends with the given `suffix`, since this
 		only exists as a method of std::string(_view) in C++20.
 	*/
@@ -2592,6 +2640,8 @@ namespace nabs
 
 		static constexpr int LANG_C         = 1;
 		static constexpr int LANG_CPP       = 2;
+		static constexpr int LANG_OBJC      = 3;
+		static constexpr int LANG_OBJCPP    = 4;
 	};
 
 	/*
@@ -2604,12 +2654,20 @@ namespace nabs
 		// additional options to pass to the compiler; these are not checked, and are passed as-is.
 		std::vector<std::string> options;
 
+		// list of additional include paths (obviously, don't include the '-I', it's just a path)
+		std::vector<fs::path> include_paths;
+
 		// names of libraries to pass to the compiler; they are passed as
 		// -lfoo for `foo` (on gcc/clang), so don't include the `-l` yourself
 		std::vector<std::string> libraries;
 
-		// list of additional include paths
-		std::vector<fs::path> include_paths;
+		// additional search paths for libraries, these are passed via `-L` on gcc
+		// and /link /LIBPATH on msvc. Again, don't include the -L yourself (it's just the path)
+		std::vector<fs::path> library_paths;
+
+		// list of defines (passed via -D for gcc, /D for msvc). If the value is empty,
+		// it is equivalent to passing -DFOO without any '='.
+		std::map<std::string, std::string> defines;
 
 		// folder for the intermediate files (.o, .d, objs, pdbs, that stuff)
 		// if this is empty, they'll be generated next to the source file.
@@ -2632,13 +2690,11 @@ namespace nabs
 
 		// a header to use as a precompiled header (optional)
 		fs::path precompiled_header;
-	};
 
-	// a forward declaration, don't mind this.
-	namespace dep
-	{
-		struct Item;
-	}
+		// frameworks, passed via `-framework`. This is only applicable for Clang on macOS/apple targets,
+		// and nowhere else.
+		std::vector<std::string> frameworks;
+	};
 
 	/*
 		This structure simply encapsulates a set of compilers, so you can pass this around easily.
@@ -2653,10 +2709,15 @@ namespace nabs
 		Compiler cxx;
 		CompilerFlags cxxflags;
 
+		Compiler objcc;
+		CompilerFlags objcflags;
+
+		Compiler objcxx;
+		CompilerFlags objcxxflags;
+
 		Compiler ld;
 		CompilerFlags ldflags;
 	};
-
 
 	/*
 		a very strange function. its sole purpose is to be used as `log_hook` in the Compiler. because we
@@ -2674,7 +2735,7 @@ namespace nabs
 			(void) args;
 
 			auto relative_path = [](const auto& p) -> auto {
-				return p.lexically_relative(fs::path(__FILE__).parent_path());
+				return p.lexically_relative(fs::weakly_canonical(fs::path(__FILE__)).parent_path());
 			};
 
 			if(output)
@@ -2738,8 +2799,31 @@ namespace nabs
 		using Fd = int;
 		static constexpr Fd FD_NONE = -1;
 
-		using Proc = pid_t;
-		static constexpr Proc PROC_NONE = -1;
+		struct Proc
+		{
+			pid_t pid;
+
+			bool is_thread;
+			pthread_t tid;
+
+			bool operator== (const Proc& p) const
+			{
+				if(this->is_thread != p.is_thread)
+					return false;
+
+				return (this->is_thread
+					? this->tid == p.tid
+					: this->pid == p.pid
+				);
+			};
+
+			bool operator!= (const Proc& p) const { return !(*this == p); };
+
+			static inline Proc of_pid(pid_t pid) { return Proc { pid, false, 0 }; }
+			static inline Proc of_tid(pthread_t tid) { return Proc { -1, true, tid }; }
+		};
+
+		static constexpr Proc PROC_NONE = Proc { -1, false, 0 };
 
 		void dupe_fd(os::Fd src, os::Fd dst);
 	#endif
@@ -2788,13 +2872,16 @@ namespace nabs
 			int run();
 			std::vector<os::Proc> runAsync();
 
+			int run(std::string* stdout);
+			std::vector<os::Proc> runAsync(std::string* stdout);
+
 			std::vector<Part> parts;
 
 			friend struct Part;
 			friend void split_transfer(SplitProgArgs args);
 
 		private:
-			std::vector<os::Proc> runAsync(os::Fd in_fd, os::Fd close_in_children);
+			std::vector<os::Proc> runAsync(os::Fd in_fd, std::string* stdout_capture = nullptr);
 		};
 
 		struct Part
@@ -2805,15 +2892,13 @@ namespace nabs
 			Part& operator= (Part&&) = default;
 			Part& operator= (const Part&) = default;
 
-			static constexpr int TYPE_PROC  = 1;
-			static constexpr int TYPE_FILE  = 2;
-			static constexpr int TYPE_SPLIT = 3;
+			static constexpr int TYPE_PROC          = 1;
+			static constexpr int TYPE_FILE          = 2;
+			static constexpr int TYPE_SPLIT         = 3;
+			static constexpr int TYPE_STDOUT_READER = 4;
 
 			inline int type() const  { return this->_type; }
 			inline int flags() const { return this->_flags; }
-
-			// used to check... certain things.
-			inline bool is_passive() const { return this->type() == TYPE_FILE; }
 
 			static inline Part of_command(std::string name, std::vector<std::string> args = { })
 			{
@@ -2833,9 +2918,16 @@ namespace nabs
 				return ret;
 			}
 
+			static inline Part of_stdout_reader(std::string* str)
+			{
+				auto ret = Part(TYPE_STDOUT_READER, 0, "stdout_reader", { });
+				ret.stdout_reader_out = str;
+				return ret;
+			}
+
 		private:
 			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
-			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close = os::FD_NONE);
+			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
 
 			inline auto make_args() { return impl::make_argument_array(this->name, this->arguments); }
 
@@ -2849,6 +2941,8 @@ namespace nabs
 			int _type;
 			int _flags;
 			std::string name;
+			std::string* stdout_reader_out = 0;
+
 			std::vector<std::string> arguments;
 
 			std::vector<impl::Pipeline> split_vals;
@@ -2894,6 +2988,13 @@ namespace nabs
 	{
 		return impl::Pipeline({
 			impl::Part::of_file(path.string())
+		});
+	}
+
+	inline impl::Pipeline read_stdout(std::string* str)
+	{
+		return impl::Pipeline({
+			impl::Part::of_stdout_reader(str)
 		});
 	}
 
@@ -3041,7 +3142,7 @@ namespace nabs
 		#endif
 		}
 
-	#if !defined(_WIN32)
+		#if !defined(_WIN32)
 		void dupe_fd(os::Fd src, os::Fd dst)
 		{
 			// dup2 closes dst for us.
@@ -3050,7 +3151,7 @@ namespace nabs
 
 			os::close_file(src);
 		}
-	#endif
+		#endif
 
 		os::Fd dupe_fd(os::Fd src)
 		{
@@ -3069,12 +3170,15 @@ namespace nabs
 			return dst;
 
 		#else
-			// dup2 closes dst for us.
-			if(auto ret = dup(src); ret < 0)
+			auto ret = os::FD_NONE;
+			if(ret = dup(src); ret < 0)
 				impl::int_error("dup({}): {}", src, strerror(errno));
 
-			else
-				return ret;
+			// on unix, it is important to make this new pipe also cloexec.
+			if(fcntl(ret, F_SETFD, FD_CLOEXEC) < 0)
+				impl::int_error("fcntl(): {}", os::strerror_wrapper());
+
+			return ret;
 		#endif
 		}
 
@@ -3140,11 +3244,18 @@ namespace nabs
 			CloseHandle(proc);
 			return static_cast<int>(status);
 		#else
-			int status = 0;
-			if(waitpid(proc, &status, 0) < 0)
-				impl::int_error("waitpid({}): {}", proc, strerror(errno));
+			if(proc.is_thread)
+			{
+				return pthread_join(proc.tid, nullptr);
+			}
+			else
+			{
+				int status = 0;
+				if(waitpid(proc.pid, &status, 0) < 0)
+					impl::int_error("waitpid({}): {}", proc.pid, strerror(errno));
 
-			return status;
+				return status;
+			}
 		#endif
 		}
 
@@ -3162,74 +3273,73 @@ namespace nabs
 
 	namespace impl
 	{
-	#if defined(_WIN32)
-		// https://docs.microsoft.com/en-gb/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
-		std::string quote_argument(std::string_view s)
-		{
-			if(s.find_first_of(" \t\n\v\f") == std::string::npos)
-				return std::string(s);
-
-			std::string ret = "\"";
-			int backs = 0;
-
-			for(auto it = s.begin(); ; ++it)
+		#if defined(_WIN32)
+			// https://docs.microsoft.com/en-gb/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+			std::string quote_argument(std::string_view s)
 			{
+				if(s.find_first_of(" \t\n\v\f") == std::string::npos)
+					return std::string(s);
+
+				std::string ret = "\"";
 				int backs = 0;
-				while(it != s.end() && *it == '\\')
-					++it, ++backs;
 
-				if(it == s.end())
+				for(auto it = s.begin(); ; ++it)
 				{
-					ret.append(backs * 2, '\\');
-					break;
+					int backs = 0;
+					while(it != s.end() && *it == '\\')
+						++it, ++backs;
+
+					if(it == s.end())
+					{
+						ret.append(backs * 2, '\\');
+						break;
+					}
+					else if(*it == '"')
+					{
+						ret.append(backs * 2 + 1, '\\');
+						ret.push_back(*it);
+					}
+					else
+					{
+						ret.append(backs, '\\');
+						ret.push_back(*it);
+					}
 				}
-				else if(*it == '"')
-				{
-					ret.append(backs * 2 + 1, '\\');
-					ret.push_back(*it);
-				}
-				else
-				{
-					ret.append(backs, '\\');
-					ret.push_back(*it);
-				}
+
+				ret.push_back('"');
+				return ret;
 			}
 
-			ret.push_back('"');
-			return ret;
-		}
-
-		std::string make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
-		{
-			std::string ret = quote_argument(exec_name);
-			for(auto& arg : args)
+			std::string make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
 			{
-				ret += " ";
-				ret += quote_argument(arg);
+				std::string ret = quote_argument(exec_name);
+				for(auto& arg : args)
+				{
+					ret += " ";
+					ret += quote_argument(arg);
+				}
+
+				return ret;
+			}
+		#else
+			// on unix, char** argv is passed directly, so unless the program is really stupid, there's
+			// actually no need to quote space-containing paths.
+			std::string quote_argument(std::string_view s)
+			{
+				return std::string(s);
 			}
 
-			return ret;
-		}
+			char** make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
+			{
+				char** args_array = new char*[args.size() + 2];
+				for(size_t i = 0; i < args.size(); i++)
+					args_array[1 + i] = const_cast<char*>(args[i].c_str());
 
-	#else
-		// on unix, char** argv is passed directly, so unless the program is really stupid, there's
-		// actually no need to quote space-containing paths.
-		std::string quote_argument(std::string_view s)
-		{
-			return std::string(s);
-		}
-
-		char** make_argument_array(const std::string& exec_name, const std::vector<std::string>& args)
-		{
-			char** args_array = new char*[args.size() + 2];
-			for(size_t i = 0; i < args.size(); i++)
-				args_array[1 + i] = const_cast<char*>(args[i].c_str());
-
-			args_array[0] = const_cast<char*>(exec_name.c_str());
-			args_array[args.size() + 1] = nullptr;
-			return args_array;
-		}
-	#endif // _WIN32
+				args_array[0] = const_cast<char*>(exec_name.c_str());
+				args_array[args.size() + 1] = nullptr;
+				return args_array;
+			}
+		#endif // _WIN32
 
 		// ADL should let us find this operator.
 		Pipeline operator| (Pipeline head, const Pipeline& tail)
@@ -3250,7 +3360,16 @@ namespace nabs
 			return head;
 		}
 
-		std::pair<os::Proc, bool> Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd, os::Fd child_close)
+		int Part::run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
+		{
+			auto [ child_pid, _ ] = this->runAsync(in_fd, out_fd, err_fd);
+			if(child_pid == os::PROC_NONE)
+				return 0;
+
+			return os::wait_for_pid(child_pid);
+		}
+
+		std::pair<os::Proc, bool> Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
 		{
 			/*
 				small explanation of `child_close`: on unix, we set the CLOEXEC flag on the
@@ -3266,7 +3385,6 @@ namespace nabs
 				on windows, this is irrelevant, because we always specify exactly the 3 handles (In, Out, Err)
 				that we want the child to inherit, so we can safely ignore `child_close` on windows.
 			*/
-
 			if(this->type() == TYPE_PROC)
 			{
 			#if defined(_WIN32)
@@ -3335,7 +3453,6 @@ namespace nabs
 
 				CloseHandle(procinfo.hThread);
 				return { procinfo.hProcess, false };
-
 			#else
 				if(auto child = fork(); child < 0)
 				{
@@ -3343,9 +3460,6 @@ namespace nabs
 				}
 				else if(child == 0)
 				{
-					if(child_close != os::FD_NONE)
-						os::close_file(child_close);
-
 					if(in_fd != os::FD_NONE)
 					{
 						os::dupe_fd(in_fd, STDIN_FILENO);
@@ -3370,15 +3484,12 @@ namespace nabs
 				}
 				else
 				{
-					return { child, false };
+					return { os::Proc::of_pid(child), false };
 				}
 			#endif // _WIN32
 			}
 			else if(this->type() == TYPE_FILE)
 			{
-				// wrap it in a lambda so we can call it in the child only. it's the same
-				// code for both windows and unix anyway.
-
 				auto make_the_file = [this, &in_fd]() -> os::Fd {
 					// if the in_fd is not -1, then we need to write to the file.
 					return os::open_file(this->name.c_str(), os::FileOpenFlags()
@@ -3396,7 +3507,11 @@ namespace nabs
 				if(in_fd != os::FD_NONE && out_fd != os::FD_NONE)
 					impl::int_error("file() cannot appear in the middle of a pipeline");
 
-			#if defined(_WIN32)
+				#if defined(_WIN32)
+					using FuncRetty = DWORD;
+				#else
+					using FuncRetty = void*;
+				#endif
 
 				struct Args
 				{
@@ -3404,7 +3519,7 @@ namespace nabs
 					os::Fd out_fd;
 				};
 
-				auto func = [](void* arg) -> DWORD {
+				auto worker = [](void* arg) -> FuncRetty {
 					auto fds = reinterpret_cast<Args*>(arg);
 					fd_transfer(fds->in_fd, fds->out_fd);
 					os::close_file(fds->in_fd);
@@ -3413,73 +3528,42 @@ namespace nabs
 					return 0;
 				};
 
-				auto args = new Args;
+				auto thread_arg = new Args;
 				auto file_fd = make_the_file();
 				if(in_fd != os::FD_NONE)
 				{
-					args->in_fd = os::dupe_fd(in_fd);
-					args->out_fd = file_fd;
+					thread_arg->in_fd = os::dupe_fd(in_fd);
+					thread_arg->out_fd = file_fd;
 				}
 				else if(out_fd != os::FD_NONE)
 				{
-					args->in_fd = file_fd;
-					args->out_fd = os::dupe_fd(out_fd);
+					thread_arg->in_fd = file_fd;
+					thread_arg->out_fd = os::dupe_fd(out_fd);
 				}
 				else
 				{
-					impl::int_error("unreachable");
+					int_error("unreachable");
 				}
-
-				auto proc = CreateThread(
+			#if defined(_WIN32)
+				auto thr = CreateThread(
 					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
 					0,          // DWORD                    dwStackSize
-					func,       // LPTHREAD_START_ROUTINE   lpStartAddress
-					args,       // LPVOID                   lpParameter
+					worker,     // LPTHREAD_START_ROUTINE   lpStartAddress
+					thread_arg, // LPVOID                   lpParameter
 					0,          // DWORD                    dwCreationFlags
 					nullptr     // LPDWORD                  lpThreadId
 				);
 
-				if(proc == os::PROC_NONE)
+				if(thr == os::PROC_NONE)
 					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
-				return { proc, false };
-
+				return { thr, false };
 			#else
+				pthread_t tid = 0;
+				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
+					int_error("pthread_create(): {}", os::strerror_wrapper());
 
-				if(auto child = fork(); child < 0)
-				{
-					impl::int_error("fork(): {}", os::strerror_wrapper());
-				}
-				else if(child == 0)
-				{
-					if(child_close != os::FD_NONE)
-						os::close_file(child_close);
-
-					auto file_fd = make_the_file();
-
-					if(in_fd != os::FD_NONE)
-					{
-						impl::fd_transfer(in_fd, file_fd);
-						os::close_file(in_fd);
-					}
-					else if(out_fd != os::FD_NONE)
-					{
-						impl::fd_transfer(file_fd, out_fd);
-						os::close_file(out_fd);
-					}
-					else
-					{
-						impl::int_error("unreachable");
-					}
-
-					os::close_file(file_fd);
-					exit(0);
-				}
-				else
-				{
-					return { child, false };
-				}
-
+				return { os::Proc::of_tid(tid), false };
 			#endif
 			}
 			else if(this->type() == TYPE_SPLIT)
@@ -3487,25 +3571,13 @@ namespace nabs
 				if(in_fd == os::FD_NONE)
 					int_error("split() cannot be the first item in a pipeline");
 
-			#if defined(_WIN32)
-				if(out_fd == os::FD_NONE)
-					out_fd = GetStdHandle(STD_OUTPUT_HANDLE);
+				#if defined(_WIN32)
+					using FuncRetty = DWORD;
+				#else
+					using FuncRetty = void*;
+				#endif
 
-				// since we cannot fork(), we just use a thread. this is necessary
-				// so we can return and let the rest of the pipeline proceed. since
-				// CreateThread also returns a HANDLE, we can also use WaitForObject
-				// to wait for it, which is actually super convenient. thanks, bill gates.
-
-				// for windows, this needs to be heap-allocated, and we make the split_transfer
-				// responsible for freeing it. this is because it executes in a separate thread,
-				// so we cannot allocate it on this stack.
-				auto args = new SplitProgArgs;
-				args->read_fd = in_fd;
-				args->write_fd = out_fd;
-				args->split_vals = this->split_vals;
-				args->split_ptrs = this->split_ptrs;
-
-				auto func = [](void* arg) -> DWORD {
+				auto worker = [](void* arg) -> FuncRetty {
 					auto args = reinterpret_cast<SplitProgArgs*>(arg);
 					split_transfer(*args);
 					os::close_file(args->read_fd);
@@ -3515,48 +3587,86 @@ namespace nabs
 					return 0;
 				};
 
+				if(out_fd == os::FD_NONE)
+				{
+				#if defined(_WIN32)
+					out_fd = GetStdHandle(STD_OUTPUT_HANDLE);
+				#else
+					out_fd = STDOUT_FILENO;
+				#endif
+				}
+
+				auto thread_arg = new SplitProgArgs;
+				thread_arg->read_fd = os::dupe_fd(in_fd);
+				thread_arg->write_fd = os::dupe_fd(out_fd);
+				thread_arg->split_vals = this->split_vals;
+				thread_arg->split_ptrs = this->split_ptrs;
+
+			#if defined(_WIN32)
 				auto thr = CreateThread(
-					nullptr,            // LPSECURITY_ATTRIBUTES    lpThreadAttributes
-					0,                  // DWORD                    dwStackSize
-					func,               // LPTHREAD_START_ROUTINE   lpStartAddress
-					args,               // LPVOID                   lpParameter
-					CREATE_SUSPENDED,   // DWORD                    dwCreationFlags
-					nullptr             // LPDWORD                  lpThreadId
+					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					0,          // DWORD                    dwStackSize
+					worker,     // LPTHREAD_START_ROUTINE   lpStartAddress
+					thread_arg, // LPVOID                   lpParameter
+					0,          // DWORD                    dwCreationFlags
+					nullptr     // LPDWORD                  lpThreadId
 				);
 
 				if(thr == os::PROC_NONE)
 					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
-				// since we are not in a separate process, we cannot close in_fd nor out_fd.
-				if(!ResumeThread(thr))
-					int_error("ResumeThread(): {}", os::GetLastErrorAsString());
-
 				return { thr, /* dont_close_pipes: */ true };
-
 			#else
-				// basically we have to emulate what the `tee` program does.
-				if(auto child = fork(); child < 0)
-				{
-					int_error("fork(): {}", os::strerror_wrapper());
-				}
-				else if(child == 0)
-				{
-					if(child_close != os::FD_NONE)
-						os::close_file(child_close);
+				pthread_t tid = 0;
+				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
+					int_error("pthread_create(): {}", os::strerror_wrapper());
 
-					SplitProgArgs args { };
-					args.read_fd = in_fd;
-					args.write_fd = out_fd;
-					args.split_vals = this->split_vals;
-					args.split_ptrs = this->split_ptrs;
+				return { os::Proc::of_tid(tid), /* dont_close_pipes: */ false };
+			#endif
+			}
+			else if(this->type() == TYPE_STDOUT_READER)
+			{
+				if(in_fd == os::FD_NONE)
+					int_error("split() cannot be the first item in a pipeline");
 
-					impl::split_transfer(std::move(args));
-					exit(0);
-				}
-				else
+				struct Arg
 				{
-					return { child, false };
-				}
+					os::Fd read_fd;
+					std::string* write_str = 0;
+				};
+
+				auto thread_arg = new Arg;
+				thread_arg->read_fd = os::dupe_fd(in_fd);
+				thread_arg->write_str = this->stdout_reader_out;
+
+				// because we need to read back to a string in the current (base) process,
+				// we cannot use fork; this *must* be a thread.
+				auto worker = [](void* _arg) -> void* {
+					auto arg = reinterpret_cast<Arg*>(_arg);
+
+					char buf[4096] { };
+					while(true)
+					{
+						auto did = os::read_file(arg->read_fd, buf, 4096);
+						if(did <= 0) break;
+
+						arg->write_str->append(buf, did);
+					}
+
+					os::close_file(arg->read_fd);
+					delete arg;
+
+					return nullptr;
+				};
+
+			#if defined(_WIN32)
+				int_error("windows LULW");
+			#else
+				pthread_t tid = 0;
+				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
+					int_error("pthread_create(): {}", os::strerror_wrapper());
+
+				return { os::Proc::of_tid(tid), false };
 			#endif
 			}
 			else
@@ -3565,16 +3675,7 @@ namespace nabs
 			}
 		}
 
-		int Part::run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
-		{
-			auto [ child_pid, _ ] = this->runAsync(in_fd, out_fd, err_fd);
-			if(child_pid == os::PROC_NONE)
-				return 0;
-
-			return os::wait_for_pid(child_pid);
-		}
-
-		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd, os::Fd close_in_children)
+		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd, std::string* stdout_capture)
 		{
 			std::vector<os::Proc> children;
 			os::Fd predecessor_pipe = in_fd;
@@ -3584,8 +3685,7 @@ namespace nabs
 
 			for(size_t i = 0; i < this->parts.size(); i++)
 			{
-				bool is_last = (i == this->parts.size() - 1);
-
+				bool is_last = (i == this->parts.size() - 1) && (stdout_capture == nullptr);
 				auto [ pipe_read, pipe_write ] = os::make_pipe();
 
 				if(is_last)
@@ -3596,8 +3696,7 @@ namespace nabs
 
 				// TODO: stderr is not handled here
 				// we don't really know how to link them together from proc to proc.
-				auto [ child, dont_close_pipes ] = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE,
-					/* child_close: */ close_in_children);
+				auto [ child, dont_close_pipes ] = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE);
 
 				if(child != os::PROC_NONE)
 					children.push_back(child);
@@ -3611,13 +3710,21 @@ namespace nabs
 					os::close_file(pipe_write);
 			}
 
+			if(stdout_capture != nullptr)
+			{
+				auto [ child, _ ] = Part::of_stdout_reader(stdout_capture)
+					.runAsync(predecessor_pipe, os::FD_NONE, os::FD_NONE);
+
+				children.push_back(child);
+			}
+
 			os::close_file(predecessor_pipe);
 			return children;
 		}
 
 		std::vector<os::Proc> Pipeline::runAsync()
 		{
-			return this->runAsync(os::FD_NONE, os::FD_NONE);
+			return this->runAsync(os::FD_NONE);
 		}
 
 		int Pipeline::run()
@@ -3631,6 +3738,24 @@ namespace nabs
 			// just use the last one.
 			return status;
 		}
+
+		int Pipeline::run(std::string* stdout_capture)
+		{
+			auto children = this->runAsync(stdout_capture);
+
+			int status = 0;
+			for(auto c : children)
+				status = os::wait_for_pid(c);
+
+			// just use the last one.
+			return status;
+		}
+
+		std::vector<os::Proc> Pipeline::runAsync(std::string* stdout_capture)
+		{
+			return this->runAsync(os::FD_NONE, stdout_capture);
+		}
+
 
 		void fd_transfer(os::Fd in_fd, os::Fd out_fd)
 		{
@@ -3650,15 +3775,12 @@ namespace nabs
 			std::vector<os::Fd> fds;
 			std::vector<os::Proc> children;
 
-			// because this is launched as a thread on windows,
-			// we also need to be responsible for actually firing off the
-			// pipelines here.
 			auto iterate_splits = [&fds, &children](Pipeline* pl) {
 
 				assert(pl != nullptr);
 				auto [ p_read, p_write ] = os::make_pipe();
 
-				auto cs = pl->runAsync(p_read, /* close_in_children: */ p_write);
+				auto cs = pl->runAsync(p_read);
 				children.insert(children.end(), cs.begin(), cs.end());
 				fds.push_back(p_write);
 			};
@@ -3770,6 +3892,8 @@ namespace nabs::dep
 	inline constexpr int KIND_EXE           = 4;
 	inline constexpr int KIND_PHONY         = 5;
 	inline constexpr int KIND_PCH           = 6;
+	inline constexpr int KIND_OBJC_SOURCE   = 7;
+	inline constexpr int KIND_OBJCPP_SOURCE = 8;
 
 	/*
 		A dependency graph, containing zero or more items. The graph is the owner of items created by it, and
@@ -3854,7 +3978,9 @@ namespace nabs::dep
 		3. If the extension is '.c', return KIND_C_SOURCE
 		4. If the extension is one of '.cpp', '.cc', '.cxx', 'c++', return KIND_CPP_SOURCE
 		5. If the extension is '.pch' or '.gch', return KIND_PCH
-		6. otherwise, return KIND_NONE
+		6. If the extension is '.m', return KIND_OBJC_SOURCE
+		7. If the extension is '.mm', return KIND_OBJCPP_SOURCE
+		8. otherwise, return KIND_NONE
 	*/
 	int infer_kind_from_filename(const fs::path& filename);
 
@@ -3870,19 +3996,18 @@ namespace nabs::dep
 		auto ext = filename.extension().string();
 		if(ext == "" || ext == ".exe")
 			return KIND_EXE;
-
 		else if(ext == ".o" || ext == ".obj")
 			return KIND_OBJECT;
-
 		else if(ext == ".c")
 			return KIND_C_SOURCE;
-
 		else if(ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".c++")
 			return KIND_CPP_SOURCE;
-
 		else if(ext == ".pch" || ext == ".gch")
 			return KIND_PCH;
-
+		else if(ext == ".m")
+			return KIND_OBJC_SOURCE;
+		else if(ext == ".mm")
+			return KIND_OBJCPP_SOURCE;
 		else
 			return KIND_NONE;
 	}
@@ -4376,6 +4501,14 @@ namespace nabs
 		ret.cxx.log_hook = default_compiler_logger(false, "cxx");
 		ret.ld.log_hook  = default_compiler_logger(true, "ld");
 
+	#if defined(__APPLE__)
+		ret.objcc = ret.cc;
+		ret.objcflags = get_default_cflags();
+
+		ret.objcxx = ret.cxx;
+		ret.objcxxflags = get_default_cxxflags();
+	#endif
+
 		return Ok(std::move(ret));
 	}
 
@@ -4718,8 +4851,14 @@ namespace nabs
 		// (just like object files)
 		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
-			if(cmp.lang == Compiler::LANG_CPP)      args.push_back("-x"), args.push_back("c++-header");
-			else if(cmp.lang == Compiler::LANG_C)   args.push_back("-x"), args.push_back("c-header");
+			if(cmp.lang == Compiler::LANG_CPP)
+				args.push_back("-x"), args.push_back("c++-header");
+			else if(cmp.lang == Compiler::LANG_C)
+				args.push_back("-x"), args.push_back("c-header");
+			else if(cmp.lang == Compiler::LANG_OBJC)
+				args.push_back("-x"), args.push_back("objective-c-header");
+			else if(cmp.lang == Compiler::LANG_OBJCPP)
+				args.push_back("-x"), args.push_back("objective-c++-header");
 
 			auto pch = get_default_pch_filename(cmp, opts, header);
 			args.push_back("-o");
@@ -4786,7 +4925,14 @@ namespace nabs
 
 		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
-
+			// TODO: this should be a runtime check, based on the target!
+		#if defined(__APPLE__)
+			if(cmp.kind == Compiler::KIND_CLANG)
+			{
+				for(auto& f : opts.frameworks)
+					args.push_back("-framework"), args.push_back(f);
+			}
+		#endif
 		}
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
@@ -5111,7 +5257,7 @@ namespace nabs
 				flags.language_standard = "c++17";
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
-				// flags.options.push_back("-O2");
+				flags.options.push_back("-O2");
 
 				// TODO: checking for stdc++fs and/or c++fs needs to be more robust
 				// eg. we should check if we were linked with libstdc++ or libc++, first of all
@@ -5125,6 +5271,9 @@ namespace nabs
 			#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 9)
 				flags.libraries.push_back("stdc++fs");
 			#endif
+
+				// also, pthreads is needed.
+				flags.options.push_back("-pthread");
 			}
 			else if(cpp.kind == Compiler::KIND_MSVC_CL)
 			{
@@ -5850,6 +5999,16 @@ namespace nabs
 			return std::string(buf);
 	#endif
 	}
+
+	namespace impl
+	{
+		GlobalState state { };
+		GlobalState& global_state()
+		{
+			// TODO: NOT THREAD SAFE AT ALL
+			return state;
+		}
+	}
 }
 #endif // !NABS_DECLARATION_ONLY
 
@@ -6038,8 +6197,11 @@ namespace nabs
 			if(!rebuild || target->kind() == KIND_PHONY || target->produced_by.empty())
 				return Ok();
 
-			if(target->kind() == KIND_C_SOURCE || target->kind() == KIND_CPP_SOURCE)
+			if(auto k = target->kind(); k == KIND_C_SOURCE || k == KIND_CPP_SOURCE
+				|| k == KIND_OBJC_SOURCE || k == KIND_OBJCPP_SOURCE)
+			{
 				return Ok();
+			}
 
 			if(target->kind() == KIND_OBJECT)
 			{
@@ -6053,10 +6215,12 @@ namespace nabs
 				auto src = prod[0];
 				if(src->kind() == KIND_C_SOURCE)
 					cmp = tc.cc, flags = tc.cflags;
-
 				else if(src->kind() == KIND_CPP_SOURCE)
 					cmp = tc.cxx, flags = tc.cxxflags;
-
+				else if(src->kind() == KIND_OBJC_SOURCE)
+					cmp = tc.objcc, flags = tc.objcflags;
+				else if(src->kind() == KIND_OBJCPP_SOURCE)
+					cmp = tc.objcxx, flags = tc.objcxxflags;
 				else
 					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
 
@@ -6078,9 +6242,14 @@ namespace nabs
 				auto src = prod[0];
 				if(src->kind() == KIND_C_SOURCE)
 					cmp = tc.cc, flags = tc.cflags;
-
 				else if(src->kind() == KIND_CPP_SOURCE)
 					cmp = tc.cxx, flags = tc.cxxflags;
+				else if(src->kind() == KIND_OBJC_SOURCE)
+					cmp = tc.objcc, flags = tc.objcflags;
+				else if(src->kind() == KIND_OBJCPP_SOURCE)
+					cmp = tc.objcxx, flags = tc.objcxxflags;
+				else
+					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
 
 				if(hooks.modify_flags)
 					hooks.modify_flags(cmp, flags, target, target->produced_by);
@@ -6180,10 +6349,12 @@ namespace nabs
 
 		if(kind == KIND_C_SOURCE)
 			return std::make_pair(toolchain.cc, toolchain.cflags);
-
 		else if(kind == KIND_CPP_SOURCE)
 			return std::make_pair(toolchain.cxx, toolchain.cxxflags);
-
+		else if(kind == KIND_OBJC_SOURCE)
+			return std::make_pair(toolchain.objcc, toolchain.objcflags);
+		else if(kind == KIND_OBJCPP_SOURCE)
+			return std::make_pair(toolchain.objcxx, toolchain.objcxxflags);
 		else
 			return { };
 	}
@@ -6197,9 +6368,11 @@ namespace nabs
 		const Compiler* cmp = nullptr;
 		const CompilerFlags* opts = nullptr;
 
-		if(lang == Compiler::LANG_CPP)      hdr_kind = KIND_CPP_SOURCE, cmp = &tc.cxx, opts = &tc.cxxflags;
-		else if(lang == Compiler::LANG_C)   hdr_kind = KIND_C_SOURCE, cmp = &tc.cc, opts = &tc.cflags;
-		else                                impl::int_error("unsupported language '{}'", lang);
+		if(lang == Compiler::LANG_CPP)          hdr_kind = KIND_CPP_SOURCE, cmp = &tc.cxx, opts = &tc.cxxflags;
+		else if(lang == Compiler::LANG_C)       hdr_kind = KIND_C_SOURCE, cmp = &tc.cc, opts = &tc.cflags;
+		else if(lang == Compiler::LANG_OBJC)    hdr_kind = KIND_OBJC_SOURCE, cmp = &tc.objcc, opts = &tc.objcflags;
+		else if(lang == Compiler::LANG_OBJCPP)  hdr_kind = KIND_OBJCPP_SOURCE, cmp = &tc.objcxx, opts = &tc.objcxxflags;
+		else                                    impl::int_error("unsupported language '{}'", lang);
 
 		assert(cmp != nullptr && opts != nullptr);
 		auto pch_name = get_default_pch_filename(*cmp, *opts, header);
@@ -6211,6 +6384,102 @@ namespace nabs
 
 		// also read the dependencies
 		read_dependencies_from_file(graph, get_dependency_filename(*cmp, *opts, header));
+	}
+}
+#endif
+
+
+
+/*
+	Library finding
+	---------------
+
+	These functions are responsible for finding both system libraries, and local (project-specific)
+	libraries. Right now, 'pkg-config' is the only supported mechanism to automatically search for
+	system libraries. Failing that, you can always provide a prefix to search for locally-installed
+	libraries in a specific location.
+*/
+namespace nabs
+{
+	struct LibraryFinderOptions
+	{
+		bool use_pkg_config;
+
+		bool static_library;
+		std::vector<fs::path> additional_search_folders;
+	};
+
+	struct LibraryResult
+	{
+		std::string name;
+		std::string version;
+
+		std::vector<fs::path> include_paths;
+		std::vector<std::string> compiler_flags;
+
+		std::vector<fs::path> library_paths;
+		std::vector<std::string> libraries;
+		std::vector<std::string> linker_flags;
+	};
+
+	#if 0
+		Result<void, std::string> find_libraries(CompilerFlags& cmpflags, CompilerFlags& ldflags,
+			const LibraryFinderOptions& opts, const std::vector<std::string>& libs);
+
+		Result<LibraryResult, std::string> find_libraries(const LibraryFinderOptions& opts,
+			const std::vector<std::string>& libs);
+	#endif
+
+	Result<LibraryResult, std::string> find_library(const LibraryFinderOptions& opts,
+		const std::string& lib);
+
+	Result<void, std::string> find_library(CompilerFlags& cmpflags, CompilerFlags& ldflags,
+		const LibraryFinderOptions& opts, const std::string& lib);
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	namespace impl
+	{
+		static bool check_pkg_config()
+		{
+			auto& gs = impl::global_state();
+			if(gs.pkg_config_checked)
+			{
+				return gs.pkg_config_exists;
+			}
+			else
+			{
+				gs.pkg_config_checked = true;
+				return gs.pkg_config_exists = (cmd("pkg-config", "--version").run() == 0);
+			}
+		}
+
+		static Result<LibraryResult, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
+			const std::string& lib)
+		{
+			if(!impl::check_pkg_config())
+				return Err<std::string>("pkg-config could not be found");
+
+			(void) opts;
+			(void) lib;
+			// LibraryResult library;
+			return Err<std::string>("asdf");
+		}
+	}
+
+	Result<LibraryResult, std::string> find_library(const LibraryFinderOptions& opts,
+		const std::string& lib)
+	{
+		if(opts.use_pkg_config)
+		{
+			auto l = impl::find_with_pkg_config(opts, lib);
+			if(l.ok()) return l;
+		}
+
+		return Err<std::string>("bsdf");
 	}
 }
 #endif

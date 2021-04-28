@@ -13,6 +13,10 @@ int main(int argc, char** argv)
 		zpr::println("  {}", argv[i]);
 
 	using namespace nabs;
+	map(fs::find_files_with_extension(".", ".txt"), [](const auto& f) {
+		fs::remove(f);
+	});
+
 	auto x
 		= cmd("cat", "README.md")
 		| split(
@@ -20,11 +24,16 @@ int main(int argc, char** argv)
 			file("bsdf.txt"))
 		| cmd("hexdump", "-C")
 		| file("foozle.txt");
-
 	zpr::println("status = {}", x.run());
 
+	std::string foo;
+	auto y = cmd("clang", "--version");
+	y.run(&foo);
 
-#if 1
+	zpr::println("foo = {}", foo);
+
+
+#if 0
 	namespace nd = nabs::dep;
 	{
 		nd::Graph graph;
