@@ -2535,6 +2535,12 @@ namespace nabs
 	std::vector<std::string_view> split_string_lines(std::string& s);
 
 	/*
+		Split a string by the given delimiter. You cannot perfectly emulate split_string_lines
+		by using '\n' as the delimiter (thanks, windows...), so don't do it.
+	*/
+	std::vector<std::string_view> split_string(std::string& s, char delim);
+
+	/*
 		Functional map of an iterable container.
 	*/
 	template <typename... T, template<typename...> class Con, typename Func>
@@ -2615,6 +2621,15 @@ namespace nabs
 	}
 
 	/*
+		A list of languages supported by nabs. This is not an enumeration because we want
+		to make this user-extendable... probably.
+	*/
+	inline constexpr int LANGUAGE_C         = 1;
+	inline constexpr int LANGUAGE_CPP       = 2;
+	inline constexpr int LANGUAGE_OBJC      = 3;
+	inline constexpr int LANGUAGE_OBJCPP    = 4;
+
+	/*
 		Encapsulates a particular binary as a compiler. This can actually represent a compiler, a linker,
 		an assembler, objcopy, whatever you want.
 	*/
@@ -2638,11 +2653,6 @@ namespace nabs
 		static constexpr int KIND_CLANG     = 1;
 		static constexpr int KIND_GCC       = 2;
 		static constexpr int KIND_MSVC_CL   = 3;
-
-		static constexpr int LANG_C         = 1;
-		static constexpr int LANG_CPP       = 2;
-		static constexpr int LANG_OBJC      = 3;
-		static constexpr int LANG_OBJCPP    = 4;
 	};
 
 	/*
@@ -4456,7 +4466,7 @@ namespace nabs
 
 		auto path_env = impl::get_path_variable();
 		if(auto cc = os::get_environment_var("CC"); !cc.empty())
-			return impl::get_compiler_from_env_var(path_env, cc, Compiler::LANG_C);
+			return impl::get_compiler_from_env_var(path_env, cc, LANGUAGE_C);
 
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
@@ -4480,7 +4490,7 @@ namespace nabs
 			return Err<std::string>("'cl.exe' does not exist");
 
 		ret.kind = Compiler::KIND_MSVC_CL;
-		ret.lang = Compiler::LANG_C;
+		ret.lang = LANGUAGE_C;
 		return Ok(ret);
 
 	#else
@@ -4492,7 +4502,7 @@ namespace nabs
 				Compiler cc;
 				cc.path = exe;
 				cc.kind = impl::get_compiler_kind(exe);
-				cc.lang = Compiler::LANG_C;
+				cc.lang = LANGUAGE_C;
 				return Ok(std::move(cc));
 			}
 		}
@@ -4505,13 +4515,13 @@ namespace nabs
 	{
 		auto path_env = impl::get_path_variable();
 		if(auto cc = os::get_environment_var("CXX"); !cc.empty())
-			return impl::get_compiler_from_env_var(path_env, cc, Compiler::LANG_CPP);
+			return impl::get_compiler_from_env_var(path_env, cc, LANGUAGE_CPP);
 
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
 		// msvc uses cl.exe for both C and C++ -- the hard part is actually finding the damn thing.
 		if(auto ret = find_c_compiler(); ret.ok())
-			ret->lang = Compiler::LANG_CPP;
+			ret->lang = LANGUAGE_CPP;
 
 		return ret;
 
@@ -4524,7 +4534,7 @@ namespace nabs
 				Compiler cxx;
 				cxx.path = exe;
 				cxx.kind = impl::get_compiler_kind(exe);
-				cxx.lang = Compiler::LANG_C;
+				cxx.lang = LANGUAGE_CPP;
 				return Ok(std::move(cxx));
 			}
 		}
@@ -4552,7 +4562,7 @@ namespace nabs
 			// use link.exe, which is in the same folder as cl.exe
 			ret.ld.path = ret.cxx.path.parent_path() / "link.exe";
 			ret.ld.kind = Compiler::KIND_MSVC_CL;
-			ret.ld.lang = Compiler::LANG_CPP;
+			ret.ld.lang = LANGUAGE_CPP;
 		}
 		else
 		{
@@ -4656,6 +4666,12 @@ namespace nabs
 
 				for(auto& fi : opts.forced_includes)
 					args.push_back("-include"), args.push_back(fi.string());
+
+				for(auto& [ def, val ] : opts.defines)
+				{
+					if(val.empty()) args.push_back(zpr::sprint("-D{}", def));
+					else            args.push_back(zpr::sprint("-D{}={}", def, val));
+				}
 
 				if(!opts.language_standard.empty())
 					args.push_back(zpr::sprint("-std={}", opts.language_standard));
@@ -4917,13 +4933,13 @@ namespace nabs
 		// (just like object files)
 		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
-			if(cmp.lang == Compiler::LANG_CPP)
+			if(cmp.lang == LANGUAGE_CPP)
 				args.push_back("-x"), args.push_back("c++-header");
-			else if(cmp.lang == Compiler::LANG_C)
+			else if(cmp.lang == LANGUAGE_C)
 				args.push_back("-x"), args.push_back("c-header");
-			else if(cmp.lang == Compiler::LANG_OBJC)
+			else if(cmp.lang == LANGUAGE_OBJC)
 				args.push_back("-x"), args.push_back("objective-c-header");
-			else if(cmp.lang == Compiler::LANG_OBJCPP)
+			else if(cmp.lang == LANGUAGE_OBJCPP)
 				args.push_back("-x"), args.push_back("objective-c++-header");
 
 			auto pch = get_default_pch_filename(cmp, opts, header);
@@ -5018,6 +5034,9 @@ namespace nabs
 		// libraries go after.
 		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
+			for(auto& lib : opts.library_paths)
+				args.push_back(zpr::sprint("-L{}", lib.string()));
+
 			for(auto& lib : opts.libraries)
 				args.push_back(zpr::sprint("-l{}", lib));
 		}
@@ -6047,6 +6066,28 @@ namespace nabs
 		return ret;
 	}
 
+	std::vector<std::string_view> split_string(std::string& str, char delim)
+	{
+		std::string_view view = str;
+		std::vector<std::string_view> ret;
+		while(true)
+		{
+			size_t ln = view.find(delim);
+			if(ln != std::string::npos)
+			{
+				ret.emplace_back(view.data(), ln);
+				view.remove_prefix(ln + 1);
+			}
+			else
+			{
+				break;
+			}
+		}
+		if(!view.empty())
+			ret.emplace_back(view.data(), view.length());
+		return ret;
+	}
+
 	std::string os::get_environment_var(const std::string& name)
 	{
 	#if defined(_WIN32)
@@ -6221,7 +6262,7 @@ namespace nabs
 		`intermediate_output_folder` is set, then the header goes in there.
 
 		Note that you must specify the language of the header (via the `lang` parameter), this is either
-		LANG_C or LANG_CPP for now. We will not infer the type of the header from its extension since
+		LANGUAGE_C or LANGUAGE_CPP for now. We will not infer the type of the header from its extension since
 		people (me) use '.h' for C++ headers as well.
 
 		As long as `lang` is valid, this function always succeeds.
@@ -6434,10 +6475,10 @@ namespace nabs
 		const Compiler* cmp = nullptr;
 		const CompilerFlags* opts = nullptr;
 
-		if(lang == Compiler::LANG_CPP)          hdr_kind = KIND_CPP_SOURCE, cmp = &tc.cxx, opts = &tc.cxxflags;
-		else if(lang == Compiler::LANG_C)       hdr_kind = KIND_C_SOURCE, cmp = &tc.cc, opts = &tc.cflags;
-		else if(lang == Compiler::LANG_OBJC)    hdr_kind = KIND_OBJC_SOURCE, cmp = &tc.objcc, opts = &tc.objcflags;
-		else if(lang == Compiler::LANG_OBJCPP)  hdr_kind = KIND_OBJCPP_SOURCE, cmp = &tc.objcxx, opts = &tc.objcxxflags;
+		if(lang == LANGUAGE_C)            hdr_kind = KIND_C_SOURCE, cmp = &tc.cc, opts = &tc.cflags;
+		else if(lang == LANGUAGE_CPP)     hdr_kind = KIND_CPP_SOURCE, cmp = &tc.cxx, opts = &tc.cxxflags;
+		else if(lang == LANGUAGE_OBJC)    hdr_kind = KIND_OBJC_SOURCE, cmp = &tc.objcc, opts = &tc.objcflags;
+		else if(lang == LANGUAGE_OBJCPP)  hdr_kind = KIND_OBJCPP_SOURCE, cmp = &tc.objcxx, opts = &tc.objcxxflags;
 		else                                    impl::int_error("unsupported language '{}'", lang);
 
 		assert(cmp != nullptr && opts != nullptr);
@@ -6469,13 +6510,14 @@ namespace nabs
 {
 	struct LibraryFinderOptions
 	{
-		bool use_pkg_config;
-
 		bool static_library;
 		std::vector<fs::path> additional_search_folders;
+
+
+		bool use_pkg_config = true;
 	};
 
-	struct LibraryResult
+	struct Library
 	{
 		std::string name;
 		std::string version;
@@ -6488,19 +6530,10 @@ namespace nabs
 		std::vector<std::string> linker_flags;
 	};
 
-	#if 0
-		Result<void, std::string> find_libraries(CompilerFlags& cmpflags, CompilerFlags& ldflags,
-			const LibraryFinderOptions& opts, const std::vector<std::string>& libs);
-
-		Result<LibraryResult, std::string> find_libraries(const LibraryFinderOptions& opts,
-			const std::vector<std::string>& libs);
-	#endif
-
-	Result<LibraryResult, std::string> find_library(const LibraryFinderOptions& opts,
+	Result<Library, std::string> find_library(const LibraryFinderOptions& opts,
 		const std::string& lib);
 
-	Result<void, std::string> find_library(CompilerFlags& cmpflags, CompilerFlags& ldflags,
-		const LibraryFinderOptions& opts, const std::string& lib);
+	void use_library(const Library& lib, CompilerFlags& cflags, CompilerFlags& ldflags, bool separate_linking);
 }
 
 // implementation
@@ -6519,24 +6552,66 @@ namespace nabs
 			else
 			{
 				gs.pkg_config_checked = true;
-				return gs.pkg_config_exists = (cmd("pkg-config", "--version").run() == 0);
+				std::string foo;
+				return gs.pkg_config_exists = (cmd("pkg-config", "--version").run(&foo) == 0);
 			}
 		}
 
-		static Result<LibraryResult, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
-			const std::string& lib)
+		template <typename Mapper>
+		static auto invoke_pkg_config(const char* opt, const char* kind, const std::string& lib, Mapper&& mapper, bool is_static)
+			-> Result<std::vector<decltype(mapper(std::declval<std::string_view>()))>, std::string>
+		{
+			std::string tmp;
+			std::vector<std::string> args = { opt, lib };
+			if(is_static)
+				args.push_back("--static");
+
+			if(cmd("pkg-config", args).run(&tmp) != 0)
+				return Err<std::string>(zpr::sprint("failed to get {} ({}) for '{}'", kind, opt, lib));
+
+			tmp = trim_whitespace(tmp);
+			return Ok(map(split_string(tmp, ' '), static_cast<decltype(mapper)&&>(mapper)));
+		}
+
+		static Result<Library, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
+			const std::string& name)
 		{
 			if(!impl::check_pkg_config())
 				return Err<std::string>("pkg-config could not be found");
 
-			(void) opts;
-			(void) lib;
-			// LibraryResult library;
-			return Err<std::string>("asdf");
+			Library lib;
+			if(cmd("pkg-config", "--exists", name).run() != 0)
+				return Err<std::string>(zpr::sprint("library '{}' not found by pkg-config", name));
+
+			lib.name = name;
+			if(cmd("pkg-config", "--modversion", name).run(&lib.version) != 0)
+				return Err<std::string>(zpr::sprint("failed to get version for '{}'", name));
+
+			lib.include_paths = invoke_pkg_config("--cflags-only-I", "include paths", name, [](auto sv) {
+				return fs::path(sv.substr(2));
+			}, opts.static_library).or_else({ });
+
+			lib.compiler_flags = invoke_pkg_config("--cflags-only-other", "compiler flags", name, [](auto sv) {
+				return std::string(sv);
+			}, opts.static_library).or_else({ });
+
+			lib.libraries = invoke_pkg_config("--libs-only-l", "libraries", name, [](auto sv) {
+				return std::string(sv.substr(2));
+			}, opts.static_library).or_else({ });
+
+			lib.library_paths = invoke_pkg_config("--libs-only-L", "library search paths", name, [](auto sv) {
+				return fs::path(sv.substr(2));
+			}, opts.static_library).or_else({ });
+
+			lib.linker_flags = invoke_pkg_config("--libs-only-other", "linker flags", name, [](auto sv) {
+				return std::string(sv);
+			}, opts.static_library).or_else({ });
+
+			return Ok(std::move(lib));
 		}
 	}
 
-	Result<LibraryResult, std::string> find_library(const LibraryFinderOptions& opts,
+	Result<Library, std::string> find_library(const LibraryFinderOptions& opts,
 		const std::string& lib)
 	{
 		if(opts.use_pkg_config)
@@ -6546,6 +6621,25 @@ namespace nabs
 		}
 
 		return Err<std::string>("bsdf");
+	}
+
+
+	void use_library(const Library& lib, CompilerFlags& cf, CompilerFlags& lf, bool separate_linking)
+	{
+		append_vector(cf.options, lib.compiler_flags);
+		append_vector(cf.include_paths, lib.include_paths);
+
+		append_vector(lf.library_paths, lib.library_paths);
+		append_vector(lf.options, lib.linker_flags);
+		append_vector(lf.libraries, lib.libraries);
+
+		// if we are not linking as a separate step, then the compiler must also be invoked with the libraries.
+		if(!separate_linking)
+		{
+			append_vector(cf.library_paths, lib.library_paths);
+			append_vector(cf.options, lib.linker_flags);
+			append_vector(cf.libraries, lib.libraries);
+		}
 	}
 }
 #endif
