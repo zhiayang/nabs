@@ -2927,7 +2927,7 @@ namespace nabs
 
 		private:
 			int run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
-			std::pair<os::Proc, bool> runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
+			os::Proc runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd);
 
 			inline auto make_args() { return impl::make_argument_array(this->name, this->arguments); }
 
@@ -3362,14 +3362,14 @@ namespace nabs
 
 		int Part::run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
 		{
-			auto [ child_pid, _ ] = this->runAsync(in_fd, out_fd, err_fd);
+			auto child_pid = this->runAsync(in_fd, out_fd, err_fd);
 			if(child_pid == os::PROC_NONE)
 				return 0;
 
 			return os::wait_for_pid(child_pid);
 		}
 
-		std::pair<os::Proc, bool> Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
+		os::Proc Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
 		{
 			/*
 				small explanation of `child_close`: on unix, we set the CLOEXEC flag on the
@@ -3452,7 +3452,7 @@ namespace nabs
 				delete[] attrib_buffer;
 
 				CloseHandle(procinfo.hThread);
-				return { procinfo.hProcess, false };
+				return procinfo.hProcess;
 			#else
 				if(auto child = fork(); child < 0)
 				{
@@ -3484,7 +3484,7 @@ namespace nabs
 				}
 				else
 				{
-					return { os::Proc::of_pid(child), false };
+					return os::Proc::of_pid(child);
 				}
 			#endif // _WIN32
 			}
@@ -3557,13 +3557,13 @@ namespace nabs
 				if(thr == os::PROC_NONE)
 					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
-				return { thr, false };
+				return thr;
 			#else
 				pthread_t tid = 0;
 				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
 					int_error("pthread_create(): {}", os::strerror_wrapper());
 
-				return { os::Proc::of_tid(tid), false };
+				return os::Proc::of_tid(tid);
 			#endif
 			}
 			else if(this->type() == TYPE_SPLIT)
@@ -3615,13 +3615,13 @@ namespace nabs
 				if(thr == os::PROC_NONE)
 					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
-				return { thr, /* dont_close_pipes: */ true };
+				return thr;
 			#else
 				pthread_t tid = 0;
 				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
 					int_error("pthread_create(): {}", os::strerror_wrapper());
 
-				return { os::Proc::of_tid(tid), /* dont_close_pipes: */ false };
+				return os::Proc::of_tid(tid);
 			#endif
 			}
 			else if(this->type() == TYPE_STDOUT_READER)
@@ -3666,7 +3666,7 @@ namespace nabs
 				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
 					int_error("pthread_create(): {}", os::strerror_wrapper());
 
-				return { os::Proc::of_tid(tid), false };
+				return os::Proc::of_tid(tid);
 			#endif
 			}
 			else
@@ -3696,23 +3696,23 @@ namespace nabs
 
 				// TODO: stderr is not handled here
 				// we don't really know how to link them together from proc to proc.
-				auto [ child, dont_close_pipes ] = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE);
+				auto child = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE);
 
 				if(child != os::PROC_NONE)
 					children.push_back(child);
 
 				// setup the read end for the next process.
-				if(predecessor_pipe != os::FD_NONE && !dont_close_pipes)
+				if(predecessor_pipe != os::FD_NONE)
 					os::close_file(predecessor_pipe);
 
 				predecessor_pipe = pipe_read;
-				if(!is_last && !dont_close_pipes)
+				if(!is_last)
 					os::close_file(pipe_write);
 			}
 
 			if(stdout_capture != nullptr)
 			{
-				auto [ child, _ ] = Part::of_stdout_reader(stdout_capture)
+				auto child = Part::of_stdout_reader(stdout_capture)
 					.runAsync(predecessor_pipe, os::FD_NONE, os::FD_NONE);
 
 				children.push_back(child);
