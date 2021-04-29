@@ -3371,6 +3371,12 @@ namespace nabs
 
 		os::Proc Part::runAsync(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
 		{
+			#if defined(_WIN32)
+				using WorkerRetty = DWORD;
+			#else
+				using WorkerRetty = void*;
+			#endif
+
 			/*
 				small explanation of `child_close`: on unix, we set the CLOEXEC flag on the
 				pipe descriptors, so they automatically close when the child process execs, so it does
@@ -3507,19 +3513,13 @@ namespace nabs
 				if(in_fd != os::FD_NONE && out_fd != os::FD_NONE)
 					impl::int_error("file() cannot appear in the middle of a pipeline");
 
-				#if defined(_WIN32)
-					using FuncRetty = DWORD;
-				#else
-					using FuncRetty = void*;
-				#endif
-
 				struct Args
 				{
 					os::Fd in_fd;
 					os::Fd out_fd;
 				};
 
-				auto worker = [](void* arg) -> FuncRetty {
+				auto worker = [](void* arg) -> WorkerRetty {
 					auto fds = reinterpret_cast<Args*>(arg);
 					fd_transfer(fds->in_fd, fds->out_fd);
 					os::close_file(fds->in_fd);
@@ -3571,13 +3571,7 @@ namespace nabs
 				if(in_fd == os::FD_NONE)
 					int_error("split() cannot be the first item in a pipeline");
 
-				#if defined(_WIN32)
-					using FuncRetty = DWORD;
-				#else
-					using FuncRetty = void*;
-				#endif
-
-				auto worker = [](void* arg) -> FuncRetty {
+				auto worker = [](void* arg) -> WorkerRetty {
 					auto args = reinterpret_cast<SplitProgArgs*>(arg);
 					split_transfer(*args);
 					os::close_file(args->read_fd);
@@ -3641,7 +3635,7 @@ namespace nabs
 
 				// because we need to read back to a string in the current (base) process,
 				// we cannot use fork; this *must* be a thread.
-				auto worker = [](void* _arg) -> void* {
+				auto worker = [](void* _arg) -> WorkerRetty {
 					auto arg = reinterpret_cast<Arg*>(_arg);
 
 					char buf[4096] { };
@@ -3655,8 +3649,7 @@ namespace nabs
 
 					os::close_file(arg->read_fd);
 					delete arg;
-
-					return nullptr;
+					return 0;
 				};
 
 			#if defined(_WIN32)
