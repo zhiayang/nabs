@@ -2396,7 +2396,7 @@ namespace nabs
 		static constexpr const char* COLOUR_WARN = "\x1b[1m\x1b[33m";
 		static constexpr const char* COLOUR_ERROR = "\x1b[1m\x1b[31m";
 		static constexpr const char* COLOUR_RESET = "\x1b[0m";
-		static constexpr const char* COLOUR_BOLD  = "\x1b[1m";
+		static constexpr const char* COLOUR_BOLD  = "\x1b[37m";
 	#else
 		static constexpr const char* COLOUR_LOG = "";
 		static constexpr const char* COLOUR_WARN = "";
@@ -2425,10 +2425,10 @@ namespace nabs
 			// "one of those" programs.
 		#if defined(_WIN32)
 			if(GetFileType(GetStdHandle(level > 0 ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE)) != FILE_TYPE_CHAR)
-				colour = "", reset = "";
+				colour = "", reset = "", bold = "";
 		#else
 			if(!isatty(level > 0 ? STDERR_FILENO : STDOUT_FILENO))
-				colour = "", reset = "";
+				colour = "", reset = "", bold = "";
 		#endif
 
 			auto output = (level > 0 ? stderr : stdout);
@@ -4398,8 +4398,6 @@ namespace nabs
 				}
 
 				lines = split_string_lines(out);
-				zpr::fprintln(stderr, "out = {}", lines[0]);
-
 				if(lines[0].find("clang") != std::string::npos)
 					return Compiler::KIND_CLANG;
 

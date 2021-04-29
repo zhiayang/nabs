@@ -8,7 +8,7 @@ int main(int argc, char** argv)
 {
 	nabs::self_update(argc, argv, __FILE__);
 
-	zpr::println("got {} argument{}:", argc, argc == 1 ? "" : "s");
+	nabs::log("got {} argument{}:", argc, argc == 1 ? "" : "s");
 	for(int i = 0; i < argc; i++)
 		zpr::println("  {}", argv[i]);
 
