@@ -12,6 +12,8 @@ int main(int argc, char** argv)
 	for(int i = 0; i < argc; i++)
 		zpr::println("  {}", argv[i]);
 
+	auto tc = nabs::find_toolchain();
+
 	using namespace nabs;
 	map(fs::find_files_with_extension(".", ".txt"), [](const auto& f) {
 		fs::remove(f);
@@ -25,12 +27,6 @@ int main(int argc, char** argv)
 		| cmd("hexdump", "-C")
 		| file("foozle.txt");
 	zpr::println("status = {}", x.run());
-
-	std::string foo;
-	auto y = cmd("clang", "--version");
-	y.run(&foo);
-
-	zpr::println("foo = {}", foo);
 
 
 #if 0

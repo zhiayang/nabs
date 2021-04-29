@@ -2634,6 +2634,7 @@ namespace nabs
 		// find_toolchain already have this setup appropriately.
 		std::function<void (const fs::path&, const std::vector<fs::path>&, const std::vector<std::string>&)> log_hook;
 
+		static constexpr int KIND_UNKNOWN   = 0;
 		static constexpr int KIND_CLANG     = 1;
 		static constexpr int KIND_GCC       = 2;
 		static constexpr int KIND_MSVC_CL   = 3;
@@ -2869,11 +2870,8 @@ namespace nabs
 			inline Pipeline(std::vector<Part> parts) : parts(std::move(parts)) { }
 			inline bool empty() const { return this->parts.empty(); }
 
-			int run();
-			std::vector<os::Proc> runAsync();
-
-			int run(std::string* stdout);
-			std::vector<os::Proc> runAsync(std::string* stdout);
+			int run(std::string* stdout_capture = nullptr, std::string* stderr_capture = nullptr);
+			std::vector<os::Proc> runAsync(std::string* stdout_capture = nullptr, std::string* stderr_capture = nullptr);
 
 			std::vector<Part> parts;
 
@@ -2881,7 +2879,8 @@ namespace nabs
 			friend void split_transfer(SplitProgArgs args);
 
 		private:
-			std::vector<os::Proc> runAsync(os::Fd in_fd, std::string* stdout_capture = nullptr);
+			std::vector<os::Proc> runAsync(os::Fd in_fd, std::string* stdout_capture = nullptr,
+				std::string* stderr_capture = nullptr);
 		};
 
 		struct Part
@@ -2895,7 +2894,7 @@ namespace nabs
 			static constexpr int TYPE_PROC          = 1;
 			static constexpr int TYPE_FILE          = 2;
 			static constexpr int TYPE_SPLIT         = 3;
-			static constexpr int TYPE_STDOUT_READER = 4;
+			static constexpr int TYPE_STRING_OUT    = 4;
 
 			inline int type() const  { return this->_type; }
 			inline int flags() const { return this->_flags; }
@@ -2918,10 +2917,10 @@ namespace nabs
 				return ret;
 			}
 
-			static inline Part of_stdout_reader(std::string* str)
+			static inline Part of_string(std::string* str)
 			{
-				auto ret = Part(TYPE_STDOUT_READER, 0, "stdout_reader", { });
-				ret.stdout_reader_out = str;
+				auto ret = Part(TYPE_STRING_OUT, 0, "string", { });
+				ret.string_out = str;
 				return ret;
 			}
 
@@ -2941,7 +2940,7 @@ namespace nabs
 			int _type;
 			int _flags;
 			std::string name;
-			std::string* stdout_reader_out = 0;
+			std::string* string_out = 0;
 
 			std::vector<std::string> arguments;
 
@@ -2991,10 +2990,10 @@ namespace nabs
 		});
 	}
 
-	inline impl::Pipeline read_stdout(std::string* str)
+	inline impl::Pipeline to_string(std::string* str)
 	{
 		return impl::Pipeline({
-			impl::Part::of_stdout_reader(str)
+			impl::Part::of_string(str)
 		});
 	}
 
@@ -3110,7 +3109,6 @@ namespace nabs
 				impl::int_error("CreatePipe(): {}", GetLastErrorAsString());
 
 			return PipeDes { p_read, p_write };
-
 		#else
 			if(int p[2]; pipe(p) < 0)
 			{
@@ -3595,7 +3593,6 @@ namespace nabs
 				thread_arg->write_fd = os::dupe_fd(out_fd);
 				thread_arg->split_vals = this->split_vals;
 				thread_arg->split_ptrs = this->split_ptrs;
-
 			#if defined(_WIN32)
 				auto thr = CreateThread(
 					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
@@ -3618,10 +3615,10 @@ namespace nabs
 				return os::Proc::of_tid(tid);
 			#endif
 			}
-			else if(this->type() == TYPE_STDOUT_READER)
+			else if(this->type() == TYPE_STRING_OUT)
 			{
 				if(in_fd == os::FD_NONE)
-					int_error("split() cannot be the first item in a pipeline");
+					int_error("to_string() cannot be the first item in a pipeline");
 
 				struct Arg
 				{
@@ -3631,7 +3628,7 @@ namespace nabs
 
 				auto thread_arg = new Arg;
 				thread_arg->read_fd = os::dupe_fd(in_fd);
-				thread_arg->write_str = this->stdout_reader_out;
+				thread_arg->write_str = this->string_out;
 
 				// because we need to read back to a string in the current (base) process,
 				// we cannot use fork; this *must* be a thread.
@@ -3644,7 +3641,8 @@ namespace nabs
 						auto did = os::read_file(arg->read_fd, buf, 4096);
 						if(did <= 0) break;
 
-						arg->write_str->append(buf, did);
+						if(arg->write_str != nullptr)
+							arg->write_str->append(buf, did);
 					}
 
 					os::close_file(arg->read_fd);
@@ -3668,7 +3666,7 @@ namespace nabs
 			}
 		}
 
-		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd, std::string* stdout_capture)
+		std::vector<os::Proc> Pipeline::runAsync(os::Fd in_fd, std::string* stdout_capture, std::string* stderr_capture)
 		{
 			std::vector<os::Proc> children;
 			os::Fd predecessor_pipe = in_fd;
@@ -3678,18 +3676,42 @@ namespace nabs
 
 			for(size_t i = 0; i < this->parts.size(); i++)
 			{
-				bool is_last = (i == this->parts.size() - 1) && (stdout_capture == nullptr);
+				bool is_last = (i == this->parts.size() - 1); // && (stdout_capture == nullptr);
 				auto [ pipe_read, pipe_write ] = os::make_pipe();
+
+				auto stderr_write = os::FD_NONE;
 
 				if(is_last)
 				{
-					os::close_file(pipe_write);
-					pipe_write = os::FD_NONE;
+					// if we need to capture stdout, don't close the write end of this pipe yet.
+					if(stdout_capture == nullptr)
+					{
+						os::close_file(pipe_write);
+						pipe_write = os::FD_NONE;
+					}
+
+					// if we need to capture stderr, make a new pipe for it, and run the of_string.
+					if(stderr_capture != nullptr)
+					{
+						auto [ r, w ] = os::make_pipe();
+						stderr_write = w;
+
+						auto child = Part::of_string(stderr_capture).runAsync(r, os::FD_NONE, os::FD_NONE);
+						children.push_back(child);
+					}
 				}
 
-				// TODO: stderr is not handled here
-				// we don't really know how to link them together from proc to proc.
-				auto child = this->parts[i].runAsync(predecessor_pipe, pipe_write, os::FD_NONE);
+				/*
+					TODO: stderr is (still) not handled in a very nice way.
+					right now, we can run an entire pipeline and capture the stderr, but that
+					stderr is only for the last process in the chain. everyone else's stderr
+					is printed to console, and that might not be very desirable.
+
+					The ideal implementation is to have a Part that can collect stderrs, and
+					also have a Part that can merge stdout/stderr and pass it to the next program
+					(something like 2&>1)
+				*/
+				auto child = this->parts[i].runAsync(predecessor_pipe, pipe_write, stderr_write);
 
 				if(child != os::PROC_NONE)
 					children.push_back(child);
@@ -3698,57 +3720,23 @@ namespace nabs
 				if(predecessor_pipe != os::FD_NONE)
 					os::close_file(predecessor_pipe);
 
+				if(stderr_write != os::FD_NONE)
+					os::close_file(stderr_write);
+
 				predecessor_pipe = pipe_read;
-				if(!is_last)
+				if(pipe_write != os::FD_NONE)
 					os::close_file(pipe_write);
 			}
 
 			if(stdout_capture != nullptr)
 			{
-				auto child = Part::of_stdout_reader(stdout_capture)
-					.runAsync(predecessor_pipe, os::FD_NONE, os::FD_NONE);
-
+				auto child = Part::of_string(stdout_capture).runAsync(predecessor_pipe, os::FD_NONE, os::FD_NONE);
 				children.push_back(child);
 			}
 
 			os::close_file(predecessor_pipe);
 			return children;
 		}
-
-		std::vector<os::Proc> Pipeline::runAsync()
-		{
-			return this->runAsync(os::FD_NONE);
-		}
-
-		int Pipeline::run()
-		{
-			auto children = this->runAsync();
-
-			int status = 0;
-			for(auto c : children)
-				status = os::wait_for_pid(c);
-
-			// just use the last one.
-			return status;
-		}
-
-		int Pipeline::run(std::string* stdout_capture)
-		{
-			auto children = this->runAsync(stdout_capture);
-
-			int status = 0;
-			for(auto c : children)
-				status = os::wait_for_pid(c);
-
-			// just use the last one.
-			return status;
-		}
-
-		std::vector<os::Proc> Pipeline::runAsync(std::string* stdout_capture)
-		{
-			return this->runAsync(os::FD_NONE, stdout_capture);
-		}
-
 
 		void fd_transfer(os::Fd in_fd, os::Fd out_fd)
 		{
@@ -3802,6 +3790,23 @@ namespace nabs
 			// wait for all the children...
 			for(auto c : children)
 				os::wait_for_pid(c);
+		}
+
+		std::vector<os::Proc> Pipeline::runAsync(std::string* stdout_capture, std::string* stderr_capture)
+		{
+			return this->runAsync(os::FD_NONE, stdout_capture, stderr_capture);
+		}
+
+		int Pipeline::run(std::string* stdout_capture, std::string* stderr_capture)
+		{
+			auto children = this->runAsync(stdout_capture, stderr_capture);
+
+			int status = 0;
+			for(auto c : children)
+				status = os::wait_for_pid(c);
+
+			// just use the last one.
+			return status;
 		}
 	}
 }
@@ -4360,21 +4365,78 @@ namespace nabs
 			return { };
 		}
 
+		static int get_compiler_kind(const fs::path& path)
+		{
+			// tbh the exit code doesn't matter, since we know it exists
+			std::string out, err;
+			cmd(path).run(&out, &err);
+
+			/*
+				gcc:
+				`gcc: fatal error: no input files`
+
+				clang:
+				`clang: error: no input files`
+
+				msvc:
+				`Microsoft (R) C/C++ Optimizing Compiler Version 19.23.28107 for x64`
+			*/
+
+			auto lines = split_string_lines(out);
+			if(!lines.empty() && lines[0].find("Microsoft (R)") != std::string::npos)
+			{
+				return Compiler::KIND_MSVC_CL;
+			}
+			else
+			{
+				// well we know it's not msvc, so it must be something sane that accepts '--version'
+				out.clear();
+				if(cmd(path, "--version").run(&out) != 0)
+				{
+					int_warn("compiler '{}' does not support '--version' flag, giving up", path);
+					return Compiler::KIND_UNKNOWN;
+				}
+
+				lines = split_string_lines(out);
+				zpr::fprintln(stderr, "out = {}", lines[0]);
+
+				if(lines[0].find("clang") != std::string::npos)
+					return Compiler::KIND_CLANG;
+
+				else if(lines[0].find("gcc") != std::string::npos)
+					return Compiler::KIND_GCC;
+			}
+
+			int_warn("could not determine the kind for compiler '{}'", path);
+			return Compiler::KIND_UNKNOWN;
+		}
+
 		static Result<Compiler, std::string> get_compiler_from_env_var(const std::vector<fs::path>& path_env,
 			const std::string& var, int lang)
 		{
-			// first, check if this file exists "just like that"
-			// TODO: we still need a way to capture stdout of a program
-			// so that we can figure out if this is cl.exe or gcc or clang.
-
 			if(fs::exists(var))
-				return Ok(Compiler { .path = var, .kind = Compiler::KIND_CLANG, .lang = lang });
-
-			// if not, look for it in the path
-			if(auto ccc = impl::find_file_in_path(var, path_env); !ccc.empty())
-				return Ok(Compiler { .path = ccc, .kind = Compiler::KIND_CLANG, .lang = lang });
-
-			return Err<std::string>(zpr::sprint("specified compiler '{}' does not exist", var));
+			{
+				// first, check if this file exists "just like that" (in case an absolute path,
+				// or something relative to the current dir, was provided)
+				Compiler cc;
+				cc.path = var;
+				cc.kind = get_compiler_kind(var);
+				cc.lang = lang;
+				return Ok(std::move(cc));
+			}
+			else if(auto path = impl::find_file_in_path(var, path_env); !path.empty())
+			{
+				// if not, look for it in the path
+				Compiler cc;
+				cc.path = path;
+				cc.kind = get_compiler_kind(path);
+				cc.lang = lang;
+				return Ok(std::move(cc));
+			}
+			else
+			{
+				return Err<std::string>(zpr::sprint("specified compiler '{}' does not exist", var));
+			}
 		}
 	}
 
@@ -4425,17 +4487,19 @@ namespace nabs
 
 	#else
 		// basically, find 'cc' in the path.
-		if(auto clang = impl::find_file_in_path("clang", path_env); !clang.empty())
-			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_CLANG, .lang = Compiler::LANG_C });
+		for(auto foo : { "clang", "gcc", "cc" })
+		{
+			if(auto exe = impl::find_file_in_path(foo, path_env); !exe.empty())
+			{
+				Compiler cc;
+				cc.path = exe;
+				cc.kind = impl::get_compiler_kind(exe);
+				cc.lang = Compiler::LANG_C;
+				return Ok(std::move(cc));
+			}
+		}
 
-		else if(auto gcc = impl::find_file_in_path("gcc", path_env); !gcc.empty())
-			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_C });
-
-		else if(auto cc = impl::find_file_in_path("cc", path_env); !cc.empty())
-			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_C });
-
-		else
-			return Err<std::string>("no compiler in $PATH");
+		return Err<std::string>("no compiler in $PATH");
 	#endif // _WIN32
 	}
 
@@ -4455,18 +4519,19 @@ namespace nabs
 
 	#else
 		// basically, find 'c++' in the path.
-		if(auto clang = impl::find_file_in_path("clang++", path_env); !clang.empty())
-			return Ok(Compiler { .path = clang, .kind = Compiler::KIND_CLANG, .lang = Compiler::LANG_CPP });
+		for(auto foo : { "clang++", "g++", "c++" })
+		{
+			if(auto exe = impl::find_file_in_path(foo, path_env); !exe.empty())
+			{
+				Compiler cxx;
+				cxx.path = exe;
+				cxx.kind = impl::get_compiler_kind(exe);
+				cxx.lang = Compiler::LANG_C;
+				return Ok(std::move(cxx));
+			}
+		}
 
-		else if(auto cc = impl::find_file_in_path("c++", path_env); !cc.empty())
-			return Ok(Compiler { .path = cc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_CPP });
-
-		else if(auto gcc = impl::find_file_in_path("g++", path_env); !gcc.empty())
-			return Ok(Compiler { .path = gcc, .kind = Compiler::KIND_GCC, .lang = Compiler::LANG_CPP });
-
-		else
-			return Err<std::string>("no compiler in $PATH");
-
+		return Err<std::string>("no compiler in $PATH");
 	#endif // _WIN32
 	}
 
@@ -4484,8 +4549,18 @@ namespace nabs
 		else
 			ret.cxx = cxx.unwrap();
 
-		// use the c++ compiler to link.
-		ret.ld = ret.cxx;
+		if(ret.cxx.kind == Compiler::KIND_MSVC_CL)
+		{
+			// use link.exe, which is in the same folder as cl.exe
+			ret.ld.path = ret.cxx.path.parent_path() / "link.exe";
+			ret.ld.kind = Compiler::KIND_MSVC_CL;
+			ret.ld.lang = Compiler::LANG_CPP;
+		}
+		else
+		{
+			// use the c++ compiler to link.
+			ret.ld = ret.cxx;
+		}
 
 		ret.cflags = get_default_cflags();
 		ret.cxxflags = get_default_cxxflags();
