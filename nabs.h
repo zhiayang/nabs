@@ -37,7 +37,6 @@
 
 
 
-
 	Version History
 	===============
 
@@ -2335,6 +2334,7 @@ namespace zpr
 #include <functional>
 #include <filesystem>
 #include <type_traits>
+#include <unordered_map>
 
 #include <cstdio>
 #include <cerrno>
@@ -2381,6 +2381,13 @@ using ssize_t = long long;
 #elif (NABS_EXPAND(NABS_NO_COLOURS) == 1)
 	#undef NABS_NO_COLOURS
 	#define NABS_NO_COLOURS 1
+#endif
+
+#if !defined(NABS_STRICT_COMPILER_CHECK)
+	#define NABS_STRICT_COMPILER_CHECK 0
+#elif (NABS_EXPAND(NABS_STRICT_COMPILER_CHECK) == 1)
+	#undef NABS_STRICT_COMPILER_CHECK
+	#define NABS_STRICT_COMPILER_CHECK 1
 #endif
 
 
@@ -2477,6 +2484,27 @@ namespace nabs
 		Result<std::string, std::string> read_file(const fs::path& file);
 	}
 
+	struct Library
+	{
+		std::string name;
+		std::string version;
+
+		std::vector<fs::path> include_paths;
+		std::vector<std::string> compiler_flags;
+
+		std::vector<fs::path> library_paths;
+		std::vector<std::string> libraries;
+		std::vector<std::string> linker_flags;
+	};
+
+	struct LibraryFinderOptions
+	{
+		bool static_library;
+		std::vector<fs::path> additional_search_folders;
+
+		bool use_pkg_config = true;
+	};
+
 	namespace impl
 	{
 		template <typename... Args>
@@ -2496,6 +2524,8 @@ namespace nabs
 		{
 			bool pkg_config_exists;
 			bool pkg_config_checked;
+
+			std::unordered_map<std::string, Library> cached_libraries;
 		};
 
 		GlobalState& global_state();
@@ -3259,8 +3289,13 @@ namespace nabs
 			else
 			{
 				int status = 0;
+			again:
 				if(waitpid(proc.pid, &status, 0) < 0)
+				{
+					if(errno == EINTR)
+						goto again;
 					impl::int_error("waitpid({}): {}", proc.pid, strerror(errno));
+				}
 
 				return status;
 			}
@@ -3855,6 +3890,10 @@ namespace nabs::dep
 
 		Importantly, the Graph does not differentiate two items with the same name but different kinds; the
 		name is the only identifying key.
+
+
+		TODO (dependency stuff):
+		1. need a way to specify optional dependencies
 	*/
 	struct Item
 	{
@@ -3870,6 +3909,9 @@ namespace nabs::dep
 
 		std::vector<Item*> deps;
 		std::vector<Item*> produced_by;
+
+		// this is only used if kind == KIND_SYSTEM_LIBRARY i guess
+		LibraryFinderOptions lib_finder_options;
 
 		// this is for your own use.
 		uint64_t user_flags = 0;
@@ -3893,15 +3935,16 @@ namespace nabs::dep
 		friend struct Graph;
 	};
 
-	inline constexpr int KIND_NONE          = 0;
-	inline constexpr int KIND_C_SOURCE      = 1;
-	inline constexpr int KIND_CPP_SOURCE    = 2;
-	inline constexpr int KIND_OBJECT        = 3;
-	inline constexpr int KIND_EXE           = 4;
-	inline constexpr int KIND_PHONY         = 5;
-	inline constexpr int KIND_PCH           = 6;
-	inline constexpr int KIND_OBJC_SOURCE   = 7;
-	inline constexpr int KIND_OBJCPP_SOURCE = 8;
+	inline constexpr int KIND_NONE           = 0;
+	inline constexpr int KIND_C_SOURCE       = 1;
+	inline constexpr int KIND_CPP_SOURCE     = 2;
+	inline constexpr int KIND_OBJECT         = 3;
+	inline constexpr int KIND_EXE            = 4;
+	inline constexpr int KIND_PHONY          = 5;
+	inline constexpr int KIND_PCH            = 6;
+	inline constexpr int KIND_OBJC_SOURCE    = 7;
+	inline constexpr int KIND_OBJCPP_SOURCE  = 8;
+	inline constexpr int KIND_SYSTEM_LIBRARY = 9;
 
 	/*
 		A dependency graph, containing zero or more items. The graph is the owner of items created by it, and
@@ -3973,7 +4016,7 @@ namespace nabs::dep
 		Result<std::vector<std::vector<Item*>>, std::vector<Item*>> topological_sort(std::vector<Item*> roots) const;
 
 	private:
-		std::map<std::string, Item*> items;
+		std::unordered_map<std::string, Item*> items;
 
 		// this is a helper method that tries as hard as possible to find the list of circular items
 		std::vector<Item*> get_circular_depends(Item* root) const;
@@ -4174,7 +4217,8 @@ namespace nabs::dep
 		if(auto item = this->get(canon); item != nullptr)
 			return item;
 
-		return this->add(kind, std::move(canon));
+		// return this->add(kind, std::move(canon));
+		return (this->items[canon] = new Item(kind, canon));
 	}
 
 	Item* Graph::get_or_add(int kind, std::string name)
@@ -4182,7 +4226,7 @@ namespace nabs::dep
 		if(auto item = this->get(name); item != nullptr)
 			return item;
 
-		return this->add(kind, std::move(name));
+		return (this->items[name] = new Item(kind, name));
 	}
 
 	Item* Graph::get(const std::string& name) const
@@ -4377,9 +4421,22 @@ namespace nabs
 
 		static int get_compiler_kind(const fs::path& path)
 		{
+			// do a simple check first. note that this isn't *really* correct, because people might
+			// do stupid things (eg. make `gcc` actually run `clang`... cough apple cough), so give
+			// users a macro to force the strict check. Otherwise, this saves us from having to run
+			// the compiler just to check its kind.
+			#if !NABS_STRICT_COMPILER_CHECK
+				if(auto name = path.filename(); name == "cl.exe" || name == "cl")
+					return Compiler::KIND_MSVC_CL;
+				else if(name == "clang" || name == "clang++")
+					return Compiler::KIND_CLANG;
+				else if(name == "gcc" || name == "g++")
+					return Compiler::KIND_GCC;
+			#endif
+
 			// tbh the exit code doesn't matter, since we know it exists
 			std::string out, err;
-			cmd(path).run(&out, &err);
+			cmd(path, "--version").run(&out, &err);
 
 			/*
 				gcc:
@@ -4399,15 +4456,6 @@ namespace nabs
 			}
 			else
 			{
-				// well we know it's not msvc, so it must be something sane that accepts '--version'
-				out.clear();
-				if(cmd(path, "--version").run(&out) != 0)
-				{
-					int_warn("compiler '{}' does not support '--version' flag, giving up", path);
-					return Compiler::KIND_UNKNOWN;
-				}
-
-				lines = split_string_lines(out);
 				if(lines[0].find("clang") != std::string::npos)
 					return Compiler::KIND_CLANG;
 
@@ -4494,7 +4542,6 @@ namespace nabs
 		return Ok(ret);
 
 	#else
-		// basically, find 'cc' in the path.
 		for(auto foo : { "clang", "gcc", "cc" })
 		{
 			if(auto exe = impl::find_file_in_path(foo, path_env); !exe.empty())
@@ -5340,6 +5387,7 @@ namespace nabs
 			if(cpp.kind == Compiler::KIND_CLANG || cpp.kind == Compiler::KIND_GCC)
 			{
 				flags.language_standard = "c++17";
+				flags.options.push_back("-fno-exceptions");
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
 				flags.options.push_back("-O2");
@@ -6121,6 +6169,142 @@ namespace nabs
 
 
 
+/*
+	Library finding
+	---------------
+
+	These functions are responsible for finding both system libraries, and local (project-specific)
+	libraries. Right now, 'pkg-config' is the only supported mechanism to automatically search for
+	system libraries. Failing that, you can always provide a prefix to search for locally-installed
+	libraries in a specific location.
+*/
+namespace nabs
+{
+	Result<Library, std::string> find_library(const std::string& lib, const LibraryFinderOptions& opts);
+
+	void use_library(const Library& lib, CompilerFlags& cflags, CompilerFlags& ldflags, bool separate_linking);
+}
+
+// implementation
+#if !NABS_DECLARATION_ONLY
+namespace nabs
+{
+	namespace impl
+	{
+		static bool check_pkg_config()
+		{
+			auto& gs = impl::global_state();
+			if(gs.pkg_config_checked)
+			{
+				return gs.pkg_config_exists;
+			}
+			else
+			{
+				gs.pkg_config_checked = true;
+				std::string foo;
+				return gs.pkg_config_exists = (cmd("pkg-config", "--version").run(&foo) == 0);
+			}
+		}
+
+		template <typename Mapper, typename = std::enable_if_t<!std::is_same_v<
+			decltype(std::declval<Mapper>()(std::declval<std::string_view>())),
+			void>>
+		>
+		static auto invoke_pkg_config(const char* opt, const char* kind, const std::string& lib, Mapper&& mapper, bool is_static)
+			-> Result<std::vector<decltype(mapper(std::declval<std::string_view>()))>, std::string>
+		{
+			std::string tmp;
+			std::vector<std::string> args = { opt, lib };
+			if(is_static)
+				args.push_back("--static");
+
+			if(cmd("pkg-config", args).run(&tmp) != 0)
+				return Err<std::string>(zpr::sprint("failed to get {} ({}) for '{}'", kind, opt, lib));
+
+			tmp = trim_whitespace(tmp);
+			return Ok(map(split_string(tmp, ' '), static_cast<Mapper&&>(mapper)));
+		}
+
+		template <typename Mapper, typename = std::enable_if_t<std::is_same_v<
+			decltype(std::declval<Mapper>()(std::declval<std::string_view>())),
+			void>>
+		>
+		static auto invoke_pkg_config(const char* opt, const char* kind, const std::string& lib, Mapper&& mapper, bool is_static)
+			-> Result<void, std::string>
+		{
+			std::string tmp;
+			std::vector<std::string> args = { opt, lib };
+			if(is_static)
+				args.push_back("--static");
+
+			if(cmd("pkg-config", args).run(&tmp) != 0)
+				return Err<std::string>(zpr::sprint("failed to get {} ({}) for '{}'", kind, opt, lib));
+
+			tmp = trim_whitespace(tmp);
+			map(split_string(tmp, ' '), static_cast<Mapper&&>(mapper));
+			return Ok();
+		}
+
+
+		static Result<Library, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
+			const std::string& name)
+		{
+			if(!impl::check_pkg_config())
+				return Err<std::string>("pkg-config could not be found");
+
+			Library lib;
+			lib.name = name;
+			if(cmd("pkg-config", "--modversion", name).run(&lib.version) != 0)
+				return Err<std::string>(zpr::sprint("library '{}' not found by pkg-config", name));
+
+			invoke_pkg_config("--cflags", "compiler flags", name, [&lib](auto sv) -> void {
+				if(sv.find("-I") == 0)  lib.include_paths.push_back(sv.substr(2));
+				else                    lib.compiler_flags.push_back(std::string(sv));
+			}, opts.static_library);
+
+			invoke_pkg_config("--libs", "linker flags", name, [&lib](auto sv) -> void {
+				if(sv.find("-l") == 0)      lib.libraries.push_back(std::string(sv.substr(2)));
+				else if(sv.find("-L") == 0) lib.library_paths.push_back(sv.substr(2));
+				else                        lib.compiler_flags.push_back(std::string(sv));
+			}, opts.static_library);
+
+			return Ok(std::move(lib));
+		}
+	}
+
+	Result<Library, std::string> find_library(const std::string& lib, const LibraryFinderOptions& opts)
+	{
+		if(opts.use_pkg_config)
+		{
+			auto l = impl::find_with_pkg_config(opts, lib);
+			if(l.ok()) return l;
+		}
+
+		return Err<std::string>("bsdf");
+	}
+
+
+	void use_library(const Library& lib, CompilerFlags& cf, CompilerFlags& lf, bool separate_linking)
+	{
+		append_vector(cf.options, lib.compiler_flags);
+		append_vector(cf.include_paths, lib.include_paths);
+
+		append_vector(lf.library_paths, lib.library_paths);
+		append_vector(lf.options, lib.linker_flags);
+		append_vector(lf.libraries, lib.libraries);
+
+		// if we are not linking as a separate step, then the compiler must also be invoked with the libraries.
+		if(!separate_linking)
+		{
+			append_vector(cf.library_paths, lib.library_paths);
+			append_vector(cf.options, lib.linker_flags);
+			append_vector(cf.libraries, lib.libraries);
+		}
+	}
+}
+#endif
+
+
 
 
 
@@ -6174,12 +6358,6 @@ namespace nabs
 		std::function<void (Compiler&, CompilerFlags&, dep::Item*, std::vector<dep::Item*>)> modify_flags;
 	};
 
-	namespace impl
-	{
-		Result<void, fs::path> auto_compile_one_thing(const dep::Graph& graph, const dep::Item* target,
-			const Toolchain& tc, const AutoCompileHooks& hooks);
-	}
-
 	/*
 		Infer the compiler to use (in terms of a pair of Compiler and its CompilerFlags) for a given
 		file, using its extension. Internally, this function uses `infer_kind_from_filename()` to
@@ -6195,6 +6373,12 @@ namespace nabs
 	/*
 		Automatically populate the dependency graph with the right vertices and edges to build an executable
 		from a set of source files, given just the output executable's path, and the list of source files.
+
+		This also accepts a list of <name, option> library pairs; when required, we will automatically call
+		find_library with the name and the provided finding-options to find the library. By providing any
+		library in that list, the following assumptions are made:
+		1. Every source file in the list will be compiled with the list of compiler flags for all libraries
+		2. The final executable will be linked with the linker flags (and/or `-l` `-L`) for all libraries
 
 		This function is not responsible for actually building the target (use auto_build_target for that),
 		but it only sets up the dependency chains correctly.
@@ -6212,11 +6396,12 @@ namespace nabs
 		information. Importantly, this means that changing a header file *WILL NOT* force a recompile of the
 		source files that include it.
 
-		On success, it returns the item that represents the executable file. On failure, it returns the
-		path of the offending source file.
+		On success, it returns the item that represents the executable file. On failure, it returns an error
+		message as a string -- typically this is the path of the target that failed to compile.
 	*/
-	Result<dep::Item*, fs::path> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
-		const fs::path& exe, const std::vector<fs::path>& files);
+	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& exe, const std::vector<fs::path>& files,
+		const std::vector<std::pair<std::string, LibraryFinderOptions>>& libraries = { });
 
 	/*
 		Automatically build all the targets provided in the list, by using the dependency graph and
@@ -6246,13 +6431,13 @@ namespace nabs
 		Lastly, you can provide a `AutoCompileHooks` structure which lets you:
 		1. modify the flags just before compilation starts  -- modify_flags
 	*/
-	Result<void, fs::path> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+	Result<void, std::string> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, const std::vector<dep::Item*>& targets);
 
 	/*
 		Identical to auto_build_targets, but it is just a wrapper that builds only one target.
 	*/
-	Result<void, fs::path> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, dep::Item* target);
 
 	/*
@@ -6277,31 +6462,110 @@ namespace nabs
 {
 	namespace impl
 	{
-		Result<void, fs::path> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
-			const Toolchain& tc, const AutoCompileHooks& hooks)
+		// TODO: something needs to be done about this to make it less stupid
+		// basically, we want the `kind` of Item to be user-extendible, so function should also
+		// be somehow user-extendible with their own kinds
+		static bool is_kind_phonylike(int kind)
+		{
+			return kind == dep::KIND_PHONY || kind == dep::KIND_SYSTEM_LIBRARY;
+		}
+
+		static bool is_kind_weak(int kind)
+		{
+			return kind == dep::KIND_SYSTEM_LIBRARY;
+		}
+
+
+		// NOTE: don't call this directly (with the last argument) -- always call the other one
+		// (without the last argument)
+		static Result<void, std::string> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
+			const Toolchain& tc, const AutoCompileHooks& hooks, std::vector<Library*>& depended_libs)
 		{
 			using namespace nabs::dep;
 
 			bool target_exists = fs::exists(target->name());
 
-			bool rebuild = false;
-			for(auto& dep : target->deps)
-			{
+			auto dependency_needs_rebuilding = [&target_exists](Item* target, Item* dep) -> Result<bool, std::string> {
+
 				bool dep_exists = fs::exists(dep->name());
-				bool dep_phony = dep->kind() == KIND_PHONY;
+				bool dep_phony = is_kind_phonylike(dep->kind());
 
 				if(!dep_phony && !dep_exists)
-					return Err(fs::path(dep->name()));
+				{
+					return Err<std::string>(zpr::sprint("required (non-phony) dependency '{}' does not exist",
+						dep->name()));
+				}
 
-				if(dep_phony || !dep_exists || !target_exists
-					|| fs::last_write_time(dep->name()) > fs::last_write_time(target->name()))
+				if(dep_phony || !dep_exists || !target_exists)
+					return Ok(true);
+
+				if(fs::last_write_time(dep->name()) > fs::last_write_time(target->name()))
+					return Ok(true);
+
+				return Ok(false);
+			};
+
+			auto use_libraries = [&depended_libs](CompilerFlags& flags, bool linking) {
+				for(auto lib : depended_libs)
+				{
+					CompilerFlags dummy;
+					if(linking) use_library(*lib, dummy, flags, /* separate_linking: */ true);
+					else        use_library(*lib, flags, dummy, /* separate_linking: */ true);
+				}
+			};
+
+			// TODO: is there a better way to do this than some 2-pass nonsense?
+
+			// this is a check that the target is phonyLIKE -- not that it is actually KIND_PHONY.
+			// only "pure" phony (ie. really phony) targets are never built, but some targets that
+			// are phonylike (eg. system libraries) still need some "build steps" (eg. running pkg-config)
+			// this is similar to how make phony targets still have commands that must be run. So, we must
+			// ensure that, even if the dependencies are up-to-date, a phonylike target is still 'built'.
+			bool rebuild = is_kind_phonylike(target->kind());
+
+			for(auto& dep : target->deps)
+			{
+				// NOTE: we don't check for KIND_SYSTEM_LIBRARY, since we know it's weak.
+				if(is_kind_weak(dep->kind()))
+					continue;
+
+				assert(dep->kind() != KIND_SYSTEM_LIBRARY);
+
+				if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
+				{
+					return Err(foo.error());
+				}
+				else if(foo.unwrap())
 				{
 					rebuild = true;
-					auto_compile_one_thing(graph, dep, tc, hooks);
+					auto_compile_one_thing(graph, dep, tc, hooks, depended_libs);
 				}
 			}
 
-			if(!rebuild || target->kind() == KIND_PHONY || target->produced_by.empty())
+			// pass number 2 -- check if we actually had to rebuild the target for real (because one of its
+			// 'non-weak' dependencies was rebuilt), and if so *then* rebuild the weak dependencies if needed.
+			if(rebuild)
+			{
+				for(auto& dep : target->deps)
+				{
+					// we already handled the non-weak dependencies, so skip them.
+					if(!is_kind_weak(dep->kind()))
+						continue;
+
+					// for system libraries, they are also considered phony -- so they will always be
+					// "rebuilt", which involves (a) pkg-config-ing them if not cached, and more importantly
+					// (b) adding to the depended_libs list, which our object file will then use.
+					if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
+						return Err(foo.error());
+
+					else if(foo.unwrap())
+						auto_compile_one_thing(graph, dep, tc, hooks, depended_libs);
+				}
+			}
+
+			// now, we check if the target is actually KIND_PHONY. in this case, it has no commands that it
+			// needs to run, so we quit now. note that phonyLIKE targets get past here and still get to "build".
+			if(!rebuild || target->kind() == KIND_PHONY)
 				return Ok();
 
 			if(auto k = target->kind(); k == KIND_C_SOURCE || k == KIND_CPP_SOURCE
@@ -6331,11 +6595,13 @@ namespace nabs
 				else
 					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
 
+				use_libraries(flags, /* linking: */ false);
+
 				if(hooks.modify_flags)
 					hooks.modify_flags(cmp, flags, target, target->produced_by);
 
 				if(compile_to_object_file(cmp, flags, target->name(), src->name()) != 0)
-					return Err<fs::path>(target->name());
+					return Err<std::string>(target->name());
 			}
 			else if(target->kind() == KIND_PCH)
 			{
@@ -6358,23 +6624,52 @@ namespace nabs
 				else
 					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
 
+				use_libraries(flags, /* linking: */ false);
+
 				if(hooks.modify_flags)
 					hooks.modify_flags(cmp, flags, target, target->produced_by);
 
 				if(!compile_header_to_pch(cmp, flags, src->name()).ok())
-					return Err<fs::path>(target->name());
+					return Err<std::string>(target->name());
 			}
 			else if(target->kind() == KIND_EXE)
 			{
 				auto ld = tc.ld;
 				auto ldflags = tc.ldflags;
 
+				use_libraries(ldflags, /* linking: */ true);
+
 				if(hooks.modify_flags)
 					hooks.modify_flags(ld, ldflags, target, target->produced_by);
 
 				auto prod = map(target->produced_by, [](auto x) { return fs::path(x->name()); });
 				if(link_object_files(ld, ldflags, target->name(), prod) != 0)
-					return Err<fs::path>(target->name());
+					return Err<std::string>(target->name());
+			}
+			else if(target->kind() == KIND_SYSTEM_LIBRARY)
+			{
+				Library* lib = nullptr;
+
+				auto& cache = impl::global_state().cached_libraries;
+				if(auto it = cache.find(target->name()); it != cache.end())
+				{
+					lib = &it->second;
+				}
+				else
+				{
+					auto library = find_library(target->name(), target->lib_finder_options);
+					if(!library.ok())
+						return Err<std::string>(zpr::sprint("could not find required library '{}'", target->name()));
+
+					cache[target->name()] = std::move(library.unwrap());
+					lib = &cache[target->name()];
+				}
+
+				assert(lib != nullptr);
+
+				// TODO: not sure if it's worthwhile to check for duplicates here
+				if(std::find(depended_libs.begin(), depended_libs.end(), lib) == depended_libs.end())
+					depended_libs.push_back(lib);
 			}
 			else
 			{
@@ -6383,10 +6678,27 @@ namespace nabs
 
 			return Ok();
 		}
+
+		static Result<void, std::string> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
+			const Toolchain& tc, const AutoCompileHooks& hooks)
+		{
+			// this function is only called by the top-level "build_target" function. we need to check
+			// if the target is 'weak' here -- weak targets should never be built directly, only as part
+			// of a dependency chain.
+
+			// right now the primary kind of weak target is KIND_SYSTEM_LIBRARY; we don't want to invoke
+			// pkg-config on it (which is what constitutes "building") unless one or more object files are
+			// actually going to be compiled/linked.
+			if(is_kind_weak(target->kind()))
+				return Ok();
+
+			std::vector<Library*> depended_libs;
+			return auto_compile_one_thing(graph, target, tc, hooks, depended_libs);
+		}
 	}
 
 
-	Result<void, fs::path> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+	Result<void, std::string> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, const std::vector<dep::Item*>& targets)
 	{
 		auto order = graph.topological_sort(targets)
@@ -6404,17 +6716,29 @@ namespace nabs
 		return Ok();
 	}
 
-	Result<void, fs::path> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
+	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, dep::Item* target)
 	{
 		return auto_build_targets(toolchain, hooks, graph, { target });
 	}
 
-	Result<dep::Item*, fs::path> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
-		const fs::path& exe_name, const std::vector<fs::path>& src_files)
+	// TODO: refactor this out into more constituent parts (eg. auto_objects_from_sources)
+	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& exe_name, const std::vector<fs::path>& src_files,
+		const std::vector<std::pair<std::string, LibraryFinderOptions>>& libraries)
 	{
 		using namespace dep;
 		auto exe_file = graph.get_or_add(KIND_EXE, exe_name);
+
+		auto libs = map(libraries, [&graph](const auto& thing) {
+			auto lib_item = graph.get_or_add(KIND_SYSTEM_LIBRARY, thing.first);
+			lib_item->lib_finder_options = thing.second;
+
+			return lib_item;
+		});
+
+		for(auto lib : libs)
+			exe_file->depend(lib);
 
 		for(auto& f : src_files)
 		{
@@ -6433,6 +6757,10 @@ namespace nabs
 			// setup the dependency from obj <- source
 			obj->add_produced_by(src);
 			exe_file->add_produced_by(obj);
+
+			// depend on the libraries
+			for(auto lib : libs)
+				obj->depend(lib);
 
 			// also setup the header depends for the source
 			read_dependencies_from_file(graph, get_dependency_filename(compiler, flags, f));
@@ -6496,150 +6824,3 @@ namespace nabs
 #endif
 
 
-
-/*
-	Library finding
-	---------------
-
-	These functions are responsible for finding both system libraries, and local (project-specific)
-	libraries. Right now, 'pkg-config' is the only supported mechanism to automatically search for
-	system libraries. Failing that, you can always provide a prefix to search for locally-installed
-	libraries in a specific location.
-*/
-namespace nabs
-{
-	struct LibraryFinderOptions
-	{
-		bool static_library;
-		std::vector<fs::path> additional_search_folders;
-
-
-		bool use_pkg_config = true;
-	};
-
-	struct Library
-	{
-		std::string name;
-		std::string version;
-
-		std::vector<fs::path> include_paths;
-		std::vector<std::string> compiler_flags;
-
-		std::vector<fs::path> library_paths;
-		std::vector<std::string> libraries;
-		std::vector<std::string> linker_flags;
-	};
-
-	Result<Library, std::string> find_library(const LibraryFinderOptions& opts,
-		const std::string& lib);
-
-	void use_library(const Library& lib, CompilerFlags& cflags, CompilerFlags& ldflags, bool separate_linking);
-}
-
-// implementation
-#if !NABS_DECLARATION_ONLY
-namespace nabs
-{
-	namespace impl
-	{
-		static bool check_pkg_config()
-		{
-			auto& gs = impl::global_state();
-			if(gs.pkg_config_checked)
-			{
-				return gs.pkg_config_exists;
-			}
-			else
-			{
-				gs.pkg_config_checked = true;
-				std::string foo;
-				return gs.pkg_config_exists = (cmd("pkg-config", "--version").run(&foo) == 0);
-			}
-		}
-
-		template <typename Mapper>
-		static auto invoke_pkg_config(const char* opt, const char* kind, const std::string& lib, Mapper&& mapper, bool is_static)
-			-> Result<std::vector<decltype(mapper(std::declval<std::string_view>()))>, std::string>
-		{
-			std::string tmp;
-			std::vector<std::string> args = { opt, lib };
-			if(is_static)
-				args.push_back("--static");
-
-			if(cmd("pkg-config", args).run(&tmp) != 0)
-				return Err<std::string>(zpr::sprint("failed to get {} ({}) for '{}'", kind, opt, lib));
-
-			tmp = trim_whitespace(tmp);
-			return Ok(map(split_string(tmp, ' '), static_cast<decltype(mapper)&&>(mapper)));
-		}
-
-		static Result<Library, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
-			const std::string& name)
-		{
-			if(!impl::check_pkg_config())
-				return Err<std::string>("pkg-config could not be found");
-
-			Library lib;
-			if(cmd("pkg-config", "--exists", name).run() != 0)
-				return Err<std::string>(zpr::sprint("library '{}' not found by pkg-config", name));
-
-			lib.name = name;
-			if(cmd("pkg-config", "--modversion", name).run(&lib.version) != 0)
-				return Err<std::string>(zpr::sprint("failed to get version for '{}'", name));
-
-			lib.include_paths = invoke_pkg_config("--cflags-only-I", "include paths", name, [](auto sv) {
-				return fs::path(sv.substr(2));
-			}, opts.static_library).or_else({ });
-
-			lib.compiler_flags = invoke_pkg_config("--cflags-only-other", "compiler flags", name, [](auto sv) {
-				return std::string(sv);
-			}, opts.static_library).or_else({ });
-
-			lib.libraries = invoke_pkg_config("--libs-only-l", "libraries", name, [](auto sv) {
-				return std::string(sv.substr(2));
-			}, opts.static_library).or_else({ });
-
-			lib.library_paths = invoke_pkg_config("--libs-only-L", "library search paths", name, [](auto sv) {
-				return fs::path(sv.substr(2));
-			}, opts.static_library).or_else({ });
-
-			lib.linker_flags = invoke_pkg_config("--libs-only-other", "linker flags", name, [](auto sv) {
-				return std::string(sv);
-			}, opts.static_library).or_else({ });
-
-			return Ok(std::move(lib));
-		}
-	}
-
-	Result<Library, std::string> find_library(const LibraryFinderOptions& opts,
-		const std::string& lib)
-	{
-		if(opts.use_pkg_config)
-		{
-			auto l = impl::find_with_pkg_config(opts, lib);
-			if(l.ok()) return l;
-		}
-
-		return Err<std::string>("bsdf");
-	}
-
-
-	void use_library(const Library& lib, CompilerFlags& cf, CompilerFlags& lf, bool separate_linking)
-	{
-		append_vector(cf.options, lib.compiler_flags);
-		append_vector(cf.include_paths, lib.include_paths);
-
-		append_vector(lf.library_paths, lib.library_paths);
-		append_vector(lf.options, lib.linker_flags);
-		append_vector(lf.libraries, lib.libraries);
-
-		// if we are not linking as a separate step, then the compiler must also be invoked with the libraries.
-		if(!separate_linking)
-		{
-			append_vector(cf.library_paths, lib.library_paths);
-			append_vector(cf.options, lib.linker_flags);
-			append_vector(cf.libraries, lib.libraries);
-		}
-	}
-}
-#endif
