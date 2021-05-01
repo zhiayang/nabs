@@ -105,7 +105,7 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 
-	Version 2.2.1
+	Version 2.3.1
 	=============
 */
 
@@ -1537,7 +1537,7 @@ namespace zpr
 	}
 
 	template <typename... Args>
-	size_t sprint(char* buf, size_t len, tt::str_view fmt, Args&&... args)
+	size_t sprint(size_t len, char* buf, tt::str_view fmt, Args&&... args)
 	{
 		auto appender = detail::buffer_appender(buf, len);
 		detail::print(appender, fmt,
@@ -1906,10 +1906,17 @@ namespace zpr
 				detail::print_one(static_cast<Cb&&>(cb), args, *it);
 				++it;
 
-				if(it != end(x) && !args.alternate())
-					cb(", ");
+				if(it != end(x))
+				{
+					if(!args.alternate())
+						cb(", ");
+					else
+						cb(" ");
+				}
 				else
+				{
 					break;
+				}
 			}
 
 			if(!args.alternate())
@@ -2382,7 +2389,7 @@ namespace zmt
 	{
 	private:
 		template <typename Fn, typename = void>
-		struct wrapper;
+		struct wrapper { };
 
 		// specialise for copyable types
 		template <typename Fn>
@@ -3170,6 +3177,7 @@ namespace nabs
 	{
 		using namespace std::filesystem;
 
+		Result<FILE*, std::string> fopen_wrapper(const fs::path& file, const char* mode);
 		Result<std::string, std::string> read_file(const fs::path& file);
 	}
 
@@ -3215,6 +3223,8 @@ namespace nabs
 			bool pkg_config_checked;
 
 			std::unordered_map<std::string, Library> cached_libraries;
+
+			fs::path cached_windows_sdk_root;
 		};
 
 		zmt::Synchronised<GlobalState>& global_state();
@@ -3380,6 +3390,7 @@ namespace nabs
 		static constexpr int KIND_CLANG     = 1;
 		static constexpr int KIND_GCC       = 2;
 		static constexpr int KIND_MSVC_CL   = 3;
+		static constexpr int KIND_MSVC_LINK = 4;
 	};
 
 	/*
@@ -3432,6 +3443,14 @@ namespace nabs
 		// frameworks, passed via `-framework`. This is only applicable for Clang on macOS/apple targets,
 		// and nowhere else.
 		std::vector<std::string> frameworks;
+
+		// whether exceptions are disabled. for compatibility with "normal" c++ projects, this is false by default.
+		bool exceptions_disabled = false;
+
+		// only applies if the compiler/linker is msvc 'cl.exe' or 'link.exe'. specify whether or not to append
+		// .exe to the output name if it did not end in '.exe'. Windows (apparently) has trouble executing files
+		// if they don't end in '.exe', so this is TRUE by default.
+		bool msvc_ensure_exe_extension = true;
 	};
 
 	/*
@@ -3523,8 +3542,27 @@ namespace nabs
 		using Fd = HANDLE;
 		static constexpr Fd FD_NONE = nullptr;
 
-		using Proc = HANDLE;
-		static constexpr Proc PROC_NONE = nullptr;
+		struct Proc
+		{
+			HANDLE handle;
+
+			bool is_thread;
+
+			bool operator== (const Proc& p) const
+			{
+				if(this->is_thread != p.is_thread)
+					return false;
+
+				return this->handle == p.handle;
+			};
+
+			bool operator!= (const Proc& p) const { return !(*this == p); };
+
+			static inline Proc of_pid(HANDLE pid) { return Proc { pid, false }; }
+			static inline Proc of_tid(HANDLE tid) { return Proc { tid, true }; }
+		};
+
+		static constexpr Proc PROC_NONE = Proc { nullptr, false };
 
 		static size_t PIPE_BUFFER_SIZE = 16384;
 
@@ -3965,18 +4003,18 @@ namespace nabs
 		int wait_for_pid(Proc proc)
 		{
 		#if defined(_WIN32)
-			if(WaitForSingleObject(proc, INFINITE) != WAIT_OBJECT_0)
+			if(WaitForSingleObject(proc.handle, INFINITE) != WAIT_OBJECT_0)
 				impl::int_error("WaitForSingleObject(): {}", GetLastErrorAsString());
 
 			// we are using this for threads as well; if it is not a process, return 0.
 			DWORD status = 0;
-			if(GetProcessId(proc) != 0)
+			if(!proc.is_thread)
 			{
-				if(!GetExitCodeProcess(proc, &status))
+				if(!GetExitCodeProcess(proc.handle, &status))
 					impl::int_error("GetExitCodeProcess(): {}", GetLastErrorAsString());
 			}
 
-			CloseHandle(proc);
+			CloseHandle(proc.handle);
 			return static_cast<int>(status);
 		#else
 			if(proc.is_thread)
@@ -4198,7 +4236,7 @@ namespace nabs
 				delete[] attrib_buffer;
 
 				CloseHandle(procinfo.hThread);
-				return procinfo.hProcess;
+				return os::Proc::of_pid(procinfo.hProcess);
 			#else
 				if(auto child = fork(); child < 0)
 				{
@@ -4294,10 +4332,10 @@ namespace nabs
 					nullptr     // LPDWORD                  lpThreadId
 				);
 
-				if(thr == os::PROC_NONE)
+				if(thr == nullptr)
 					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
-				return thr;
+				return os::Proc::of_tid(thr);
 			#else
 				pthread_t tid = 0;
 				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
@@ -4345,10 +4383,10 @@ namespace nabs
 					nullptr     // LPDWORD                  lpThreadId
 				);
 
-				if(thr == os::PROC_NONE)
+				if(thr == nullptr)
 					int_error("CreateThread(): {}", os::GetLastErrorAsString());
 
-				return thr;
+				return os::Proc::of_tid(thr);
 			#else
 				pthread_t tid = 0;
 				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
@@ -4393,7 +4431,19 @@ namespace nabs
 				};
 
 			#if defined(_WIN32)
-				int_error("windows LULW");
+				auto thr = CreateThread(
+					nullptr,    // LPSECURITY_ATTRIBUTES    lpThreadAttributes
+					0,          // DWORD                    dwStackSize
+					worker,     // LPTHREAD_START_ROUTINE   lpStartAddress
+					thread_arg, // LPVOID                   lpParameter
+					0,          // DWORD                    dwCreationFlags
+					nullptr     // LPDWORD                  lpThreadId
+				);
+
+				if(thr == nullptr)
+					int_error("CreateThread(): {}", os::GetLastErrorAsString());
+
+				return os::Proc::of_tid(thr);
 			#else
 				pthread_t tid = 0;
 				if(pthread_create(&tid, /* attribs: */ nullptr, worker, thread_arg) < 0)
@@ -4545,7 +4595,13 @@ namespace nabs
 
 			int status = 0;
 			for(auto c : children)
-				status = os::wait_for_pid(c);
+			{
+				int child_st = os::wait_for_pid(c);
+
+				// ignore status codes for threads.
+				if(!c.is_thread)
+					status = child_st;
+			}
 
 			// just use the last one.
 			return status;
@@ -4616,6 +4672,10 @@ namespace nabs::dep
 
 		std::vector<std::string> dependecies_as_array() const;
 
+		unsigned int flags = 0;
+
+		static constexpr unsigned int FLAG_MIGHT_NOT_EXIST = 0x1;
+
 	private:
 		Item() { }
 		Item(int kind, std::string name)
@@ -4627,6 +4687,7 @@ namespace nabs::dep
 		int _kind = 0;
 		std::string _name;
 		size_t dependents = 0;
+
 		mutable size_t level = 0;
 
 		friend struct Graph;
@@ -4998,7 +5059,10 @@ namespace nabs::dep
 			if(line.empty())
 				continue;
 
+			// what a shitshow. fuck you, bill gates
 			auto target = parse_till_space(line);
+			target = fs::path(target).make_preferred().string();
+
 			if(target.empty() || target.back() != ':')
 			{
 				impl::int_warn("depfile: expected ':' following target");
@@ -5018,7 +5082,10 @@ namespace nabs::dep
 				{
 					auto dep = parse_till_space(line);
 					if(!dep.empty())
+					{
+						dep = fs::path(dep).make_preferred().string();
 						deps.push_back(std::move(dep));
+					}
 				}
 
 				line = trim_whitespace(line);
@@ -5033,11 +5100,21 @@ namespace nabs::dep
 				}
 			}
 
-			for(auto& dep : deps)
+			int tk = infer_kind_from_filename(target);
+			if(deps.empty())
 			{
-				int tk = infer_kind_from_filename(target);
-				int dk = infer_kind_from_filename(dep);
-				graph.get_or_add(tk, target)->depend(graph.get_or_add(dk, dep));
+				// gcc/clang generate targets with no dependencies for headers, specifically so that if
+				// they get deleted, everything doesn't grind to a halt. we emulate that in our dependency
+				// system with FLAG_MIGHT_NOT_EXIST, so set that for the target iff it has no dependencies.
+				graph.get_or_add(tk, target)->flags |= Item::FLAG_MIGHT_NOT_EXIST;
+			}
+			else
+			{
+				for(auto& dep : deps)
+				{
+					int dk = infer_kind_from_filename(dep);
+					graph.get_or_add(tk, target)->depend(graph.get_or_add(dk, dep));
+				}
 			}
 		}
 
@@ -5133,7 +5210,7 @@ namespace nabs
 
 			// tbh the exit code doesn't matter, since we know it exists
 			std::string out, err;
-			cmd(path, "--version").run(&out, &err);
+			cmd(path.string(), "--version").run(&out, &err);
 
 			/*
 				gcc:
@@ -5265,10 +5342,14 @@ namespace nabs
 
 		// msvc uses cl.exe for both C and C++ -- the hard part is actually finding the damn thing.
 		if(auto ret = find_c_compiler(); ret.ok())
+		{
 			ret->lang = LANGUAGE_CPP;
-
-		return ret;
-
+			return ret;
+		}
+		else
+		{
+			return Err<std::string>("could not find MSVC");
+		}
 	#else
 		// basically, find 'c++' in the path.
 		for(auto foo : { "clang++", "g++", "c++" })
@@ -5305,7 +5386,7 @@ namespace nabs
 		{
 			// use link.exe, which is in the same folder as cl.exe
 			ret.ld.path = ret.cxx.path.parent_path() / "link.exe";
-			ret.ld.kind = Compiler::KIND_MSVC_CL;
+			ret.ld.kind = Compiler::KIND_MSVC_LINK;
 			ret.ld.lang = LANGUAGE_CPP;
 		}
 		else
@@ -5316,6 +5397,9 @@ namespace nabs
 
 		ret.cflags = get_default_cflags();
 		ret.cxxflags = get_default_cxxflags();
+
+		// by default, create it.
+		ret.ldflags.create_missing_folders = true;
 
 		ret.cc.log_hook  = default_compiler_logger(false, "cc");
 		ret.cxx.log_hook = default_compiler_logger(false, "cxx");
@@ -5397,8 +5481,38 @@ namespace nabs
 #if !NABS_DECLARATION_ONLY
 namespace nabs
 {
+	// this needs a forward declaration.
+	namespace os
+	{
+		fs::path msvc_windows_sdk();
+	}
+
+
 	namespace impl
 	{
+		static void setup_exception_args(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts)
+		{
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+			{
+				if(opts.exceptions_disabled)
+					args.push_back("-fno-exceptions");
+			}
+			else if(cmp.kind == Compiler::KIND_MSVC_CL)
+			{
+				args.push_back("/EHsc");
+				if(opts.exceptions_disabled)
+					args.push_back("-D_HAS_EXCEPTIONS=0");
+			}
+			else if(cmp.kind == Compiler::KIND_MSVC_LINK)
+			{
+				// nothing is required
+			}
+			else
+			{
+				impl::int_error("setup_exception_args(): unsupported compiler");
+			}
+		}
+
 		static std::vector<std::string> setup_basic_args(const Compiler& cmp, const CompilerFlags& opts)
 		{
 			auto args = opts.options;
@@ -5433,10 +5547,21 @@ namespace nabs
 
 				if(!opts.language_standard.empty())
 					args.push_back(zpr::sprint("/std:{}", opts.language_standard));
+
+				for(auto& [ def, val ] : opts.defines)
+				{
+					if(val.empty()) args.push_back(zpr::sprint("/D{}", def));
+					else            args.push_back(zpr::sprint("/D{}={}", def, val));
+				}
+			}
+			else if(cmp.kind == Compiler::KIND_MSVC_LINK)
+			{
+				// this is very important.
+				args.push_back("/NOLOGO");
 			}
 			else
 			{
-				impl::int_error("unsupported compiler");
+				impl::int_error("setup_basic_args(): unsupported compiler");
 			}
 
 			return args;
@@ -5469,6 +5594,15 @@ namespace nabs
 				fs::create_directories(p);
 		}
 
+		static fs::path ensure_exe_extension_if_necessary(const Compiler& cmp, const CompilerFlags& opts, fs::path f)
+		{
+			bool is_msvc = (cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK);
+			if(is_msvc && opts.msvc_ensure_exe_extension)
+				return f.replace_extension(".exe");
+			else
+				return f;
+		}
+
 		static fs::path set_output_name(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts,
 			bool obj, const std::optional<fs::path>& output_name, const std::vector<fs::path>& files)
 		{
@@ -5479,11 +5613,14 @@ namespace nabs
 			if(output_name.has_value())
 			{
 				f = *output_name;
+
+				if(!obj)
+					f = ensure_exe_extension_if_necessary(cmp, opts, f);
 			}
 			else
 			{
 				f = files[0];
-				if(cmp.kind == Compiler::KIND_MSVC_CL)
+				if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
 					f = f.replace_extension(obj ? ".obj" : ".exe");
 				else
 					f = f.replace_extension(obj ? (f.extension().string() + ".o") : "");
@@ -5515,6 +5652,11 @@ namespace nabs
 					if(!obj)
 						args.push_back(zpr::sprint("/Fe:{}", quote_argument(f.string())));
 				}
+				else if(cmp.kind == Compiler::KIND_MSVC_LINK)
+				{
+					// i think we should be ok to just go to normal here as well.
+					goto normal;
+				}
 				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 				{
 					// there's no special behaviour for this, because gcc/clang don't throw stupid obj
@@ -5523,7 +5665,7 @@ namespace nabs
 				}
 				else
 				{
-					impl::int_error("unsupported compiler");
+					impl::int_error("set_output_name(): unsupported compiler");
 				}
 			}
 			else
@@ -5536,6 +5678,12 @@ namespace nabs
 					if(obj) args.push_back(zpr::sprint("/Fo{}", quote_argument(f.string())));
 					else    args.push_back(zpr::sprint("/Fe:{}", quote_argument(f.string())));
 				}
+				else if(cmp.kind == Compiler::KIND_MSVC_LINK)
+				{
+					if(obj) impl::int_error("set_output_name(): cannot use 'link.exe' to produce object files");
+
+					args.push_back(zpr::sprint("/OUT:{}", quote_argument(f.string())));
+				}
 				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 				{
 					args.push_back("-o");
@@ -5543,7 +5691,7 @@ namespace nabs
 				}
 				else
 				{
-					impl::int_error("unsupported compiler");
+					impl::int_error("set_output_name(): unsupported compiler");
 				}
 			}
 
@@ -5567,7 +5715,7 @@ namespace nabs
 			}
 			else
 			{
-				impl::int_error("unsupported compiler");
+				impl::int_error("setup_args_for_compiling_to_obj(): unsupported compiler");
 			}
 		}
 
@@ -5586,9 +5734,13 @@ namespace nabs
 					args.push_back("-include");
 					args.push_back(pch.string());
 				}
+				else if(cmp.kind == Compiler::KIND_MSVC_CL)
+				{
+					impl::int_error("add_flags_for_precompiled_header(): msvc TODO");
+				}
 				else
 				{
-					impl::int_error("unsupported compiler");
+					impl::int_error("add_flags_for_precompiled_header(): unsupported compiler");
 				}
 			}
 		}
@@ -5604,18 +5756,111 @@ namespace nabs
 					args.push_back("-MMD");
 
 					args.push_back("-MF");
-					args.push_back(get_dependency_filename(cmp, opts, file));
+					args.push_back(get_dependency_filename(cmp, opts, file).string());
 				}
 				else if(cmp.kind == Compiler::KIND_MSVC_CL)
 				{
 					args.push_back("/showIncludes");
-					impl::int_error("msvc /showIncludes unsupported");
 				}
 				else
 				{
-					impl::int_error("unsupported compiler");
+					impl::int_error("set_flags_for_dependency_file(): unsupported compiler");
 				}
 			}
+		}
+
+		static void parse_msvc_show_includes_and_write_to_file(std::string& std_out, const fs::path& out_path,
+			const fs::path& dep_path, bool write_file)
+		{
+			/*
+				key assumptions:
+				1. your system language is english (or whatever visual studio's language is)
+					if it's not, this literally will not work.
+
+				2. the first line of output from cl.exe is always the name of the source file,
+					which we can safely skip
+
+				3. if the line is (a) not the first line, and (b) does not start with "Note: including file",
+					we print it out to stderr verbatim.
+			*/
+
+			auto escape_spaces = [](const fs::path& path) -> std::string {
+				// obviously the path separator cannot be '\'
+				std::string sv = path.string();
+				std::replace(sv.begin(), sv.end(), '\\', '/');
+
+				std::string ret;
+
+				for(char c : sv)
+				{
+					if(c == ' ')
+						ret += '\\';
+
+					ret += c;
+				}
+
+				return ret;
+			};
+
+			auto write_wrapper = [write_file](auto&&... args) {
+				if(write_file)
+					zpr::fprint(static_cast<decltype(args)&&>(args)...);
+			};
+
+
+			constexpr const char MAGIC_WORDS[] = "Note: including file:";
+
+			auto lines = split_string_lines(std_out);
+			lines.erase(lines.begin());
+
+			auto windows_sdk = os::msvc_windows_sdk();
+
+			FILE* dep_file = nullptr;
+			if(write_file)
+			{
+				auto _dep_file = fs::fopen_wrapper(dep_path, "wb");
+				if(!_dep_file.ok())
+				{
+					impl::int_warn("couldn't open dependency file '{}' for writing: {}", dep_path, _dep_file.error());
+					return;
+				}
+
+				dep_file = _dep_file.unwrap();
+			}
+
+			write_wrapper(dep_file, "{}: ", escape_spaces(out_path.string()));
+
+			// we are forced to accumulate these here, for reasons.
+			std::vector<std::string> headers;
+
+			for(auto& line : lines)
+			{
+				if(line.find(MAGIC_WORDS) == 0)
+				{
+					auto file = fs::path(trim_whitespace(line.substr(sizeof(MAGIC_WORDS) - 1)));
+
+					// there's no -MMD equivalent of -MD for /showInclude, so we must manually
+					// exclude files that appear in the windows SDK (treat them as system includes)
+					if(write_file && (windows_sdk.empty() || file.lexically_relative(windows_sdk).empty()))
+						headers.push_back(escape_spaces(file.string()));
+				}
+				else
+				{
+					fprintf(stderr, "%.*s\n", static_cast<int>(line.size()), line.data());
+				}
+			}
+
+			// print the list of headers (using alt syntax, so we don't get the '[' and the ',')
+			write_wrapper(dep_file, "{#}\n\n", headers);
+
+			// for each header, now we want to generate a target with no dependencies, just like gcc/clang.
+			// this allows compilation to keep going even if the header gets deleted. Note that we handle this
+			// case specifically in read_dependencies_from_file as well.
+			for(auto& h : headers)
+				write_wrapper(dep_file, "{}: \n\n", h);
+
+			write_wrapper(dep_file, "\n");
+			fclose(dep_file);
 		}
 	}
 
@@ -5627,24 +5872,14 @@ namespace nabs
 
 	fs::path get_dependency_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path file)
 	{
-		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+		// i guess we emit the same file for every compiler.
+		if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
 		{
-			if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
-			{
-				return *inter / (file.concat(".d"));
-			}
-			else
-			{
-				return file.concat(".d");
-			}
-		}
-		else if(cmp.kind == Compiler::KIND_MSVC_CL)
-		{
-			impl::int_error("unsupported compiler");
+			return *inter / (file.concat(".d"));
 		}
 		else
 		{
-			impl::int_error("unsupported compiler");
+			return file.concat(".d");
 		}
 	}
 
@@ -5658,7 +5893,7 @@ namespace nabs
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 			filename = header.concat(".pch");
 		else
-			impl::int_error("unsupported compiler");
+			impl::int_error("get_default_pch_filename(): unsupported compiler");
 
 		if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
 			return *inter / filename;
@@ -5671,6 +5906,7 @@ namespace nabs
 		const fs::path& header)
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
+		impl::setup_exception_args(args, cmp, opts);
 		impl::set_flags_for_dependency_file(args, cmp, opts, header);
 
 		// the pch either goes next to the header file, or in the intermediate directory
@@ -5702,11 +5938,11 @@ namespace nabs
 		}
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
-			impl::int_error("unsupported compiler");
+			impl::int_error("compile_header_to_pch(): msvc TODO");
 		}
 		else
 		{
-			impl::int_error("unsupported compiler");
+			impl::int_error("compile_header_to_pch(): unsupported compiler");
 		}
 	}
 
@@ -5718,6 +5954,7 @@ namespace nabs
 		auto args = impl::setup_basic_args(cmp, opts);
 		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
 		impl::add_flags_for_precompiled_header(args, cmp, opts);
+		impl::setup_exception_args(args, cmp, opts);
 
 		auto out_name = impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 		impl::set_flags_for_dependency_file(args, cmp, opts, file);
@@ -5727,14 +5964,31 @@ namespace nabs
 		if(cmp.log_hook)
 			cmp.log_hook(out_name, { file }, args);
 
-		if(cmp.kind == Compiler::KIND_MSVC_CL)
-		{
-			impl::int_error("unsupported compiler");
-		}
-		else
+		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
 			// this is easy, since the compiler writes it for us.
 			return cmd(cmp.path.string(), std::move(args)).run();
+		}
+		else if(cmp.kind == Compiler::KIND_MSVC_CL)
+		{
+			// capture stdout and stderr
+			std::string out;
+			std::string err;
+
+			int status = cmd(cmp.path.string(), std::move(args)).run(&out, &err);
+			auto depfile = get_dependency_filename(cmp, opts, file);
+
+			// stderr is irrelevant, because the people at microsoft don't know what's up
+			impl::parse_msvc_show_includes_and_write_to_file(out, out_name, depfile,
+				/* write_file: */ (status == 0));
+
+			// just in case, print the stderr as well.
+			fprintf(stderr, "%s", err.c_str());
+			return status;
+		}
+		else
+		{
+			impl::int_error("compile_to_object_file(): unsupported compiler");
 		}
 	}
 
@@ -5745,12 +5999,24 @@ namespace nabs
 		const std::vector<fs::path>& files)
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
+		impl::setup_exception_args(args, cmp, opts);
 		impl::add_flags_for_precompiled_header(args, cmp, opts);
 
 		auto out = impl::set_output_name(args, cmp, opts, /* obj: */ false, output, files);
 
+		// assume all compilers let you just throw the input files at the end with no regard.
+		for(auto& f : files)
+			args.push_back(f.string());
+
+		// libraries go after.
 		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 		{
+			for(auto& lib : opts.library_paths)
+				args.push_back(zpr::sprint("-L{}", lib.string()));
+
+			for(auto& lib : opts.libraries)
+				args.push_back(zpr::sprint("-l{}", lib));
+
 			// TODO: this should be a runtime check, based on the target!
 		#if defined(__APPLE__)
 			if(cmp.kind == Compiler::KIND_CLANG)
@@ -5771,20 +6037,6 @@ namespace nabs
 			impl::int_error("unsupported compiler");
 		}
 
-		// assume all compilers let you just throw the input files at the end with no regard.
-		for(auto& f : files)
-			args.push_back(f.string());
-
-		// libraries go after.
-		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
-		{
-			for(auto& lib : opts.library_paths)
-				args.push_back(zpr::sprint("-L{}", lib.string()));
-
-			for(auto& lib : opts.libraries)
-				args.push_back(zpr::sprint("-l{}", lib));
-		}
-
 		if(cmp.log_hook)
 			cmp.log_hook(out, files, args);
 
@@ -5792,11 +6044,49 @@ namespace nabs
 		return cmd(cmp.path.string(), std::move(args)).run();
 	}
 
-	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+	int link_object_files(const Compiler& linker, const CompilerFlags& opts, const std::optional<fs::path>& output,
 		const std::vector<fs::path>& files)
 	{
-		// we can just 'compile' them together.
-		return compile_files(compiler, opts, output, files);
+		auto args = impl::setup_basic_args(linker, opts);
+		impl::setup_exception_args(args, linker, opts);
+
+		auto out = impl::set_output_name(args, linker, opts, /* obj: */ false, output, files);
+
+		for(auto& f : files)
+			args.push_back(f.string());
+
+		if(linker.kind == Compiler::KIND_CLANG || linker.kind == Compiler::KIND_GCC)
+		{
+			for(auto& lib : opts.library_paths)
+				args.push_back(zpr::sprint("-L{}", lib.string()));
+
+			for(auto& lib : opts.libraries)
+				args.push_back(zpr::sprint("-l{}", lib));
+
+			// TODO: this should be a runtime check, based on the target!
+		#if defined(__APPLE__)
+			if(linker.kind == Compiler::KIND_CLANG)
+			{
+				for(auto& f : opts.frameworks)
+					args.push_back("-framework"), args.push_back(f);
+			}
+		#endif
+		}
+		else if(linker.kind == Compiler::KIND_MSVC_LINK)
+		{
+			if(!opts.libraries.empty())
+				impl::int_error("libraries unsupported");
+		}
+		else
+		{
+			impl::int_error("link_object_files(): unsupported linker");
+		}
+
+		if(linker.log_hook)
+			linker.log_hook(out, files, args);
+
+		// construct the command, and run it.
+		return cmd(linker.path.string(), std::move(args)).run();
 	}
 
 
@@ -5898,11 +6188,29 @@ namespace nabs::fs
 		});
 	}
 
+	// thanks to xXSuperCuberXx for teaching me about good naming conventions
+	Result<FILE*, std::string> fopen_wrapper(const fs::path& path, const char* mode)
+	{
+		#if defined(_WIN32)
+			// bill gates has a problem
+			FILE* f = nullptr;
+			if(fopen_s(&f, path.string().c_str(), mode) != 0)
+				return Err<std::string>(os::strerror_wrapper());
+		#else
+			FILE* f = fopen(path.string().c_str(), mode);
+			if(f == nullptr)
+				return Err<std::string>(os::strerror_wrapper());
+		#endif
+		return Ok(f);
+	}
+
 	Result<std::string, std::string> read_file(const fs::path& file)
 	{
-		FILE* f = fopen(file.string().c_str(), "rb");
-		if(f == nullptr)
-			return Err<std::string>(os::strerror_wrapper());
+		auto _f = fopen_wrapper(file, "rb");
+		if(!_f.ok())
+			return Err(_f.error());
+
+		auto f = _f.unwrap();
 
 		std::string input;
 		fseek(f, 0, SEEK_END);
@@ -5968,16 +6276,27 @@ namespace nabs
 	#if defined(_WIN32)
 		static constexpr const char* TMP_FILE_NAME = "__please_delete_me.exe";
 
+		static HANDLE duplicate_handle_as_inheritable(HANDLE handle)
+		{
+			auto proc = GetCurrentProcess();
+
+			HANDLE dst = nullptr;
+			if(!DuplicateHandle(proc, handle, proc, &dst, 0, true, DUPLICATE_SAME_ACCESS))
+				impl::int_error("DuplicateHandle(): {}", os::GetLastErrorAsString());
+
+			return dst;
+		}
+
 		static HANDLE create_process(fs::path proc, const char* first, const std::vector<std::string>& args)
 		{
 			STARTUPINFO info;
 			memset(&info, 0, sizeof(info));
 
 			info.cb = sizeof(STARTUPINFO);
-			info.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
-			info.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-			info.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
-			info.dwFlags |= STARTF_USESTDHANDLES;
+			// info.hStdInput  = duplicate_handle_as_inheritable(GetStdHandle(STD_INPUT_HANDLE));
+			// info.hStdOutput = duplicate_handle_as_inheritable(GetStdHandle(STD_OUTPUT_HANDLE));
+			// info.hStdError  = duplicate_handle_as_inheritable(GetStdHandle(STD_ERROR_HANDLE));
+			// info.dwFlags |= STARTF_USESTDHANDLES;
 
 			PROCESS_INFORMATION procinfo;
 			memset(&procinfo, 0, sizeof(procinfo));
@@ -6032,6 +6351,12 @@ namespace nabs
 			// wait for the child to finish
 			if(WaitForSingleObject(child, INFINITE) != WAIT_OBJECT_0)
 				impl::int_error("WaitForSingleObject(): {}", os::GetLastErrorAsString());
+
+			DWORD status = 0;
+			if(!GetExitCodeProcess(child, &status))
+				impl::int_error("GetExitCodeProcess(): {}", os::GetLastErrorAsString());
+
+			ExitProcess(status);
 		}
 	#endif
 
@@ -6110,6 +6435,7 @@ namespace nabs
 				flags.language_standard = "c++17";
 				flags.options.push_back("/O2");
 				flags.options.push_back("/W3");
+				flags.options.push_back("/DASDF");
 			}
 			else
 			{
@@ -6149,8 +6475,16 @@ namespace nabs
 		}
 
 	#if defined(_WIN32)
-		if(fs::exists(impl::TMP_FILE_NAME))
-			fs::remove(impl::TMP_FILE_NAME);
+		if(fs::exists(impl::TMP_FILE_NAME) && fs::is_regular_file(impl::TMP_FILE_NAME))
+		{
+			// note: we don't care if this fails, we just don't want it to throw an exception.
+			// for windows, we cannot remove the file from under a running exe, even though we
+			// can rename it. so, in the "second" execution (ie. after a self-rebuild), the
+			// __please_delete_me.exe file is still running (our parent), so we can't delete it.
+			// in such a case, just leave it, and try to delete it next time.
+			std::error_code ec;
+			fs::remove(impl::TMP_FILE_NAME, ec);
+		}
 	#endif
 
 		// first, get the modification time of this file:
@@ -6218,14 +6552,18 @@ namespace nabs
 
 	that was in-turn adapted from jon blow's "microsoft_craziness.h", which is licensed under MIT:
 	https://gist.github.com/machinamentum/a2b587a68a49094257da0c39a6c4405f
+
+	note that we still implement these functions even on not-windows, but they always return
+	an empty path.
 */
-#if defined(_WIN32)
 namespace nabs
 {
 	fs::path msvc_windows_sdk();
 	fs::path msvc_toolchain_binaries();
 	fs::path msvc_toolchain_libraries();
 }
+
+#if defined(_WIN32)
 
 // implementation
 #if !NABS_DECLARATION_ONLY
@@ -6671,29 +7009,47 @@ namespace nabs::impl
 		return &cachedResult;
 	}
 }
-namespace nabs::os
-{
-	fs::path msvc_windows_sdk()
-	{
-		auto ret = impl::performMSVCSearch()->windowsSDKRoot;
-		return fs::weakly_canonical(ret);
-	}
-
-	fs::path msvc_toolchain_binaries()
-	{
-		auto ret = impl::performMSVCSearch()->vsBinDirectory;
-		return fs::weakly_canonical(ret);
-	}
-
-	fs::path msvc_toolchain_libraries()
-	{
-		auto ret = impl::performMSVCSearch()->vsLibDirectory;
-		return fs::weakly_canonical(ret);
-	}
-}
 #endif // !NABS_DECLARATION_ONLY
 #endif // _WIN32
 
+#if !NABS_DECLARATION_ONLY
+namespace nabs::os
+{
+	#if defined(_WIN32)
+		// note: only the sdk directory is cached, for now. it's the only one that is kinda used
+		// more than onace (ie. after
+		fs::path msvc_windows_sdk()
+		{
+			if(auto cache = impl::global_state().rlock()->cached_windows_sdk_root; !cache.empty())
+				return cache;
+
+			auto ret = impl::performMSVCSearch()->windowsSDKRoot;
+			auto canon = fs::weakly_canonical(ret);
+
+			return impl::global_state().map_write([&canon](auto& gs) -> auto {
+				gs.cached_windows_sdk_root = canon;
+				return canon;
+			});
+		}
+
+		fs::path msvc_toolchain_binaries()
+		{
+			auto ret = impl::performMSVCSearch()->vsBinDirectory;
+			return fs::weakly_canonical(ret);
+		}
+
+		fs::path msvc_toolchain_libraries()
+		{
+			auto ret = impl::performMSVCSearch()->vsLibDirectory;
+			return fs::weakly_canonical(ret);
+		}
+	#else
+		fs::path msvc_windows_sdk() { return { }; }
+		fs::path msvc_toolchain_binaries() { return { }; }
+		fs::path msvc_toolchain_libraries() { return { }; }
+	#endif
+}
+#endif // !NABS_DECLARATION_ONLY
 
 
 
@@ -6857,7 +7213,7 @@ namespace nabs
 		std::string var;
 		var.resize(4096, ' ');
 		size_t len = 0;
-		getenv_s(&len, buf, 4096, name.c_str());
+		getenv_s(&len, var.data(), 4096, name.c_str());
 		var.resize(len);
 
 		return var;
@@ -6964,9 +7320,6 @@ namespace nabs
 			map(split_string(tmp, ' '), static_cast<Mapper&&>(mapper));
 			return Ok();
 		}
-
-
-		// HandsUp gachiHYPER
 
 
 		static Result<Library, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
@@ -7195,6 +7548,12 @@ namespace nabs
 	*/
 	void auto_add_precompiled_header(dep::Graph& graph, const Toolchain& toolchain,
 		const fs::path& header, int lang);
+
+
+	/*
+		A very simple function that sets a filename's extension to '.exe' if the platform is windows.
+	*/
+	fs::path auto_set_extension_exe(fs::path path);
 }
 
 // implementation
@@ -7211,18 +7570,83 @@ namespace nabs
 			return kind == dep::KIND_PHONY || kind == dep::KIND_SYSTEM_LIBRARY;
 		}
 
-		static bool is_kind_weak(int kind)
+
+		/*
+			this function takes a target that is known to be KIND_SYSTEM_LIBRARY, and walks its
+			dependencies, resolving them with pkg-config if necessary, accumulating all the resolved
+			libraries into the output parameter `depended_libs`.
+		*/
+		static Result<void, std::string> recursively_traverse_system_libraries(dep::Item* target,
+			std::vector<const Library*>& depended_libs)
 		{
-			return kind == dep::KIND_SYSTEM_LIBRARY;
+			using namespace nabs::dep;
+
+			assert(target->kind() == KIND_SYSTEM_LIBRARY);
+
+			for(auto& dep : target->deps)
+			{
+				if(dep->kind() == KIND_SYSTEM_LIBRARY)
+					recursively_traverse_system_libraries(dep, depended_libs);
+			}
+
+			auto lib = impl::global_state().map_read([&target](auto& gs) -> const Library* {
+				if(auto it = gs.cached_libraries.find(target->name()); it != gs.cached_libraries.end())
+					return &it->second;
+
+				return nullptr;
+			});
+
+			if(lib == nullptr)
+			{
+				auto library = find_library(target->name(), target->lib_finder_options);
+				if(!library.ok())
+					return Err<std::string>(zpr::sprint("could not find required library '{}'", target->name()));
+
+				lib = impl::global_state().map_write([&target, &library](auto& gs) -> auto {
+					gs.cached_libraries[target->name()] = std::move(library.unwrap());
+					return &gs.cached_libraries[target->name()];
+				});
+			}
+
+			assert(lib != nullptr);
+
+			// TODO: not sure if it's worthwhile to check for duplicates here
+			if(std::find(depended_libs.begin(), depended_libs.end(), lib) == depended_libs.end())
+				depended_libs.push_back(lib);
+
+			return Ok();
 		}
 
 
-		// NOTE: don't call this directly (with the last argument) -- always call the other one
-		// (without the last argument)
+
+		/*
+			NOTE: don't call this directly, call the other overload.
+
+			principle of operation:
+			the topological sort already sorts things in dependency order. so, under normal circumstances
+			this does not need to recursively traverse the dependencies of a target.
+
+			however, because of performance reasons, we want to avoid calling pkg-config unless one or
+			more object files are actually going to be compiled, so we have to put system library "uses"
+			into the dependency graph.
+
+			however, the "output" of pkg-config is just a bunch of flags, not a file on disk. so, it is
+			hard (read: impossible) to "normally" carry that information from the dependency to the target
+			by doing the topological traversal.
+
+			So when we are compiling something that has KIND_SYSTEM_LIBRARY as a dependency, we do the
+			recursively_traverse_system_libraries thing above.
+		*/
 		static Result<void, std::string> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
-			const Toolchain& tc, const AutoCompileHooks& hooks, std::vector<const Library*>& depended_libs)
+			const Toolchain& tc, const AutoCompileHooks& hooks)
 		{
 			using namespace nabs::dep;
+
+			// system libraries should not be built directly, you should only "reach" them through the
+			// recursively_traverse_system_libraries function.
+			if(target->kind() == KIND_SYSTEM_LIBRARY)
+				return Ok();
+
 
 			bool target_exists = fs::exists(target->name());
 
@@ -7231,7 +7655,7 @@ namespace nabs
 				bool dep_exists = fs::exists(dep->name());
 				bool dep_phony = is_kind_phonylike(dep->kind());
 
-				if(!dep_phony && !dep_exists)
+				if(!dep_phony && !dep_exists && !(dep->flags & Item::FLAG_MIGHT_NOT_EXIST))
 				{
 					return Err<std::string>(zpr::sprint("target '{}': required (non-phony) dependency '{}' does not exist",
 						target->name(), dep->name()));
@@ -7246,6 +7670,7 @@ namespace nabs
 				return Ok(false);
 			};
 
+			std::vector<const Library*> depended_libs;
 			auto use_libraries = [&depended_libs](CompilerFlags& flags, bool linking) {
 				for(auto lib : depended_libs)
 				{
@@ -7267,20 +7692,15 @@ namespace nabs
 			for(auto& dep : target->deps)
 			{
 				// NOTE: we don't check for KIND_SYSTEM_LIBRARY, since we know it's weak.
-				if(is_kind_weak(dep->kind()))
+				if(dep->kind() == KIND_SYSTEM_LIBRARY)
 					continue;
 
-				assert(dep->kind() != KIND_SYSTEM_LIBRARY);
-
 				if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
-				{
 					return Err(foo.error());
-				}
+
 				else if(foo.unwrap())
-				{
 					rebuild = true;
-					auto_compile_one_thing(graph, dep, tc, hooks, depended_libs);
-				}
+
 			}
 
 			// pass number 2 -- check if we actually had to rebuild the target for real (because one of its
@@ -7290,7 +7710,7 @@ namespace nabs
 				for(auto& dep : target->deps)
 				{
 					// we already handled the non-weak dependencies, so skip them.
-					if(!is_kind_weak(dep->kind()))
+					if(dep->kind() != KIND_SYSTEM_LIBRARY)
 						continue;
 
 					// for system libraries, they are also considered phony -- so they will always be
@@ -7300,7 +7720,10 @@ namespace nabs
 						return Err(foo.error());
 
 					else if(foo.unwrap())
-						auto_compile_one_thing(graph, dep, tc, hooks, depended_libs);
+					{
+						if(auto r = recursively_traverse_system_libraries(dep, depended_libs); !r.ok())
+							return Err(r.error());
+					}
 				}
 			}
 
@@ -7387,56 +7810,12 @@ namespace nabs
 				if(link_object_files(ld, ldflags, target->name(), prod) != 0)
 					return Err<std::string>(target->name());
 			}
-			else if(target->kind() == KIND_SYSTEM_LIBRARY)
-			{
-				auto lib = impl::global_state().map_read([&target](auto& gs) -> const Library* {
-					if(auto it = gs.cached_libraries.find(target->name()); it != gs.cached_libraries.end())
-						return &it->second;
-
-					return nullptr;
-				});
-
-				if(lib == nullptr)
-				{
-					auto library = find_library(target->name(), target->lib_finder_options);
-					if(!library.ok())
-						return Err<std::string>(zpr::sprint("could not find required library '{}'", target->name()));
-
-					lib = impl::global_state().map_write([&target, &library](auto& gs) -> auto {
-						gs.cached_libraries[target->name()] = std::move(library.unwrap());
-						return &gs.cached_libraries[target->name()];
-					});
-				}
-
-				assert(lib != nullptr);
-
-				// TODO: not sure if it's worthwhile to check for duplicates here
-				if(std::find(depended_libs.begin(), depended_libs.end(), lib) == depended_libs.end())
-					depended_libs.push_back(lib);
-			}
 			else
 			{
 				impl::int_error("auto_build_targets(): unknown target kind '{}'", target->kind());
 			}
 
 			return Ok();
-		}
-
-		static Result<void, std::string> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
-			const Toolchain& tc, const AutoCompileHooks& hooks)
-		{
-			// this function is only called by the top-level "build_target" function. we need to check
-			// if the target is 'weak' here -- weak targets should never be built directly, only as part
-			// of a dependency chain.
-
-			// right now the primary kind of weak target is KIND_SYSTEM_LIBRARY; we don't want to invoke
-			// pkg-config on it (which is what constitutes "building") unless one or more object files are
-			// actually going to be compiled/linked.
-			if(is_kind_weak(target->kind()))
-				return Ok();
-
-			std::vector<const Library*> depended_libs;
-			return auto_compile_one_thing(graph, target, tc, hooks, depended_libs);
 		}
 	}
 
@@ -7523,10 +7902,12 @@ namespace nabs
 
 	// TODO: refactor this out into more constituent parts (eg. auto_objects_from_sources)
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
-		const fs::path& exe_name, const std::vector<fs::path>& src_files,
+		const fs::path& _exe_name, const std::vector<fs::path>& src_files,
 		const std::vector<std::pair<std::string, LibraryFinderOptions>>& libraries)
 	{
 		using namespace dep;
+
+		auto exe_name = impl::ensure_exe_extension_if_necessary(toolchain.ld, toolchain.ldflags, _exe_name);
 		auto exe_file = graph.get_or_add(KIND_EXE, exe_name);
 
 		auto libs = map(libraries, [&graph](const auto& thing) {
@@ -7545,7 +7926,7 @@ namespace nabs
 			if(!_opt.has_value())
 			{
 				impl::int_warn("auto_executable_from_sources(): could not infer compiler for source file '{}'", f);
-				return Err(f);
+				return Err<std::string>(f.string());
 			}
 
 			auto [ compiler, flags ] = *_opt;
@@ -7628,6 +8009,15 @@ namespace nabs
 
 		// also read the dependencies
 		read_dependencies_from_file(graph, get_dependency_filename(*cmp, *opts, header));
+	}
+
+	fs::path auto_set_extension_exe(fs::path path)
+	{
+		#if defined(_WIN32)
+			path.replace_extension(".exe");
+		#endif
+
+		return path;
 	}
 }
 #endif
