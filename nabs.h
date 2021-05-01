@@ -105,7 +105,7 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 
-	Version 2.2.0
+	Version 2.2.1
 	=============
 */
 
@@ -1396,20 +1396,34 @@ namespace zpr
 			inline void flush(bool last = false)
 			{
 				if(!last && static_cast<size_t>(ptr - buf) < Limit)
+				{
+					if constexpr (Newline)
+						this->buf[ptr - buf] = '\n';
+
 					return;
+				}
 
-				fwrite(buf, sizeof(char), ptr - buf, fd);
-				written += ptr - buf;
+				if(!last || !Newline)
+				{
+					fwrite(buf, sizeof(char), ptr - buf, fd);
+					written += ptr - buf;
 
-				if(last && Newline)
-					written++, fputc('\n', fd);
+					ptr = buf;
+				}
+				else if(last && Newline)
+				{
+					// here's a special trick -- write one extra, because we always ensure that
+					// "one-past" the last character in our buffer is a newline.
+					fwrite(buf, sizeof(char), ptr - buf + 1, fd);
+					written += (ptr - buf) + 1;
 
-				ptr = buf;
+					ptr = buf;
+				}
 			}
 
 			FILE* fd = 0;
 
-			char buf[Limit];
+			char buf[Limit + 1];
 			char* ptr = &buf[0];
 			size_t& written;
 		};
@@ -2320,6 +2334,681 @@ namespace zpr
 }
 
 
+/*
+	zmt is included here to maintain a single-header strategy.
+	it is available from https://github.com/zhiayang/ztl
+
+	the code is included verbatim, but documentation has been removed.
+
+	zmt.h
+	Copyright 2021, zhiayang
+
+	Licensed under the Apache License, Version 2.0 (the "License");
+	you may not use this file except in compliance with the License.
+	You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+	Unless required by applicable law or agreed to in writing, software
+	distributed under the License is distributed on an "AS IS" BASIS,
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	See the License for the specific language governing permissions and
+	limitations under the License.
+
+	Version 0.1.0
+	=============
+*/
+
+#pragma once
+
+#include <cstdlib>
+
+#include <mutex>
+#include <deque>
+#include <thread>
+#include <atomic>
+#include <memory>
+#include <functional>
+#include <type_traits>
+#include <shared_mutex>
+
+// primitives
+namespace zmt
+{
+	// taken from "Move-only version of std::function"
+	// https://stackoverflow.com/a/52358928/
+	template <typename T>
+	struct unique_function : private std::function<T>
+	{
+	private:
+		template <typename Fn, typename = void>
+		struct wrapper;
+
+		// specialise for copyable types
+		template <typename Fn>
+		struct wrapper<Fn, std::enable_if_t<std::is_copy_constructible_v<Fn>>>
+		{
+			Fn fn;
+
+			template <typename... Args>
+			auto operator() (Args&&... args) { return this->fn(static_cast<Args&&>(args)...); }
+		};
+
+		// specialise for move-only types
+		template <typename Fn>
+		struct wrapper<Fn, std::enable_if_t<!std::is_copy_constructible_v<Fn> && std::is_move_constructible_v<Fn>>>
+		{
+			Fn fn;
+
+			wrapper(Fn&& fn) : fn(static_cast<Fn&&>(fn)) { }
+
+			wrapper(wrapper&&) = default;
+			wrapper& operator= (wrapper&&) = default;
+
+			// in theory, these two functions are never called.
+			wrapper(const wrapper& other) : fn(const_cast<Fn&&>(other.fn)) { abort(); }
+			wrapper& operator= (const wrapper&) { abort(); }
+
+			template <typename... Args>
+			auto operator() (Args&&... args) { return this->fn(static_cast<Args&&>(args)...); }
+		};
+
+		using base_type = std::function<T>;
+
+	public:
+		unique_function() = default;
+		unique_function(std::nullptr_t) : base_type(nullptr) { }
+
+		unique_function(unique_function&&) = default;
+		unique_function& operator= (unique_function&&) = default;
+
+		template <typename Fn>
+		unique_function(Fn&& fn) : base_type(wrapper<Fn>(static_cast<Fn&&>(fn))) { }
+
+		template <typename Fn>
+		unique_function& operator= (Fn&& fn) { base_type::operator=(wrapper<Fn>(static_cast<Fn&&>(fn))); return *this; }
+
+		unique_function& operator= (std::nullptr_t) { base_type::operator=(nullptr); return *this; }
+
+		using base_type::operator();
+	};
+
+	template <typename T>
+	struct condvar
+	{
+		condvar() : value() { }
+		condvar(const T& x) : value(x) { }
+		condvar(T&& x) : value(static_cast<T&&>(x)) { }
+
+		condvar(const condvar&) = delete;
+		condvar& operator= (const condvar&) = delete;
+
+		condvar(condvar&&) = default;
+		condvar& operator= (condvar&&) = default;
+
+		void set(const T& x)
+		{
+			this->set_quiet(x);
+			this->notify_all();
+		}
+
+		void set_quiet(const T& x)
+		{
+			auto lk = std::lock_guard<std::mutex>(this->mtx);
+			this->value = x;
+		}
+
+		T get()
+		{
+			return this->value;
+		}
+
+		bool wait(const T& x)
+		{
+			auto lk = std::unique_lock<std::mutex>(this->mtx);
+			this->cv.wait(lk, [&]{ return this->value == x; });
+			return true;
+		}
+
+		// returns true only if the value was set; if we timed out, it returns false.
+		bool wait(const T& x, std::chrono::nanoseconds timeout)
+		{
+			auto lk = std::unique_lock<std::mutex>(this->mtx);
+			return this->cv.wait_for(lk, timeout, [&]{ return this->value == x; });
+		}
+
+		template <typename Predicate>
+		bool wait_pred(Predicate p)
+		{
+			auto lk = std::unique_lock<std::mutex>(this->mtx);
+			this->cv.wait(lk, p);
+			return true;
+		}
+
+		// returns true only if the value was set; if we timed out, it returns false.
+		template <typename Predicate>
+		bool wait_pred(std::chrono::nanoseconds timeout, Predicate p)
+		{
+			auto lk = std::unique_lock<std::mutex>(this->mtx);
+			return this->cv.wait_for(lk, timeout, p);
+		}
+
+		void notify_one() { this->cv.notify_one(); }
+		void notify_all() { this->cv.notify_all(); }
+
+	private:
+		T value;
+		std::mutex mtx;
+		std::condition_variable cv;
+
+		friend struct semaphore;
+	};
+
+	struct semaphore
+	{
+		semaphore(uint64_t x) : value(x) { }
+
+		void post(uint64_t num = 1)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->value += num;
+			}
+
+			if(num > 1) this->cv.notify_all();
+			else        this->cv.notify_one();
+		}
+
+		void wait()
+		{
+			auto lk = std::unique_lock<std::mutex>(this->mtx);
+			while(this->value == 0)
+				this->cv.wait(lk);
+
+			this->value -= 1;
+		}
+
+	private:
+		uint64_t value = 0;
+		std::condition_variable cv;
+		std::mutex mtx;
+	};
+
+
+
+
+	template <typename T>
+	struct wait_queue
+	{
+		void push(const T& x)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->queue.push_back(x);
+			}
+			this->sem.post();
+		}
+
+		void push(T&& x)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->queue.push_back(static_cast<T&&>(x));
+			}
+			this->sem.post();
+		}
+
+		void push_quiet(const T& x)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->queue.push_back(x);
+			}
+			this->pending_notifies++;
+		}
+
+		void push_quiet(T&& x)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->queue.push_back(static_cast<T&&>(x));
+			}
+			this->pending_notifies++;
+		}
+
+
+		template <typename... Args>
+		void emplace(Args&&... xs)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->queue.emplace_back(static_cast<Args&&>(xs)...);
+			}
+			this->sem.post();
+		}
+
+		template <typename... Args>
+		void emplace_quiet(Args&&... xs)
+		{
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				this->queue.emplace_back(static_cast<Args&&>(xs)...);
+			}
+			this->pending_notifies++;
+		}
+
+		void notify_pending()
+		{
+			auto tmp = this->pending_notifies.exchange(0);
+			this->sem.post(tmp);
+		}
+
+		T pop()
+		{
+			this->sem.wait();
+
+			{
+				auto lk = std::unique_lock<std::mutex>(this->mtx);
+				auto ret = static_cast<T&&>(this->queue.front());
+				this->queue.pop_front();
+
+				return ret;
+			}
+		}
+
+		size_t size() const
+		{
+			return this->queue.size();
+		}
+
+		wait_queue() : sem(0) { }
+
+		wait_queue(const wait_queue&) = delete;
+		wait_queue& operator= (const wait_queue&) = delete;
+
+		wait_queue(wait_queue&&) = default;
+		wait_queue& operator= (wait_queue&&) = default;
+
+	private:
+		std::atomic<int64_t> pending_notifies = 0;
+		std::deque<T> queue;
+		std::mutex mtx;     // mtx is for protecting the queue during push/pop
+		semaphore sem;      // sem is for signalling when the queue has stuff (or not)
+	};
+}
+
+// Synchronised<T>
+namespace zmt
+{
+	template <typename T>
+	struct Synchronised
+	{
+	private:
+		struct ReadLockedInstance;
+		struct WriteLockedInstance;
+
+		using Lk = std::shared_mutex;
+
+		T value;
+		mutable Lk lk;
+		std::function<void ()> write_lock_callback = { };
+
+	public:
+		Synchronised() { }
+		~Synchronised() { }
+
+		Synchronised(const T& x) : value(x) { }
+		Synchronised(T&& x) : value(std::move(x)) { }
+
+		template <typename... Args>
+		Synchronised(Args&&... xs) : value(std::forward<Args>(xs)...) { }
+
+		Synchronised(Synchronised&&) = delete;
+		Synchronised(const Synchronised&) = delete;
+		Synchronised& operator= (Synchronised&&) = delete;
+		Synchronised& operator= (const Synchronised&) = delete;
+
+		void on_write_lock(std::function<void ()> fn)
+		{
+			this->write_lock_callback = std::move(fn);
+		}
+
+		template <typename Functor>
+		void perform_read(Functor&& fn) const
+		{
+			std::shared_lock lk(this->lk);
+			fn(this->value);
+		}
+
+		template <typename Functor>
+		void perform_write(Functor&& fn)
+		{
+			if(this->write_lock_callback)
+				this->write_lock_callback();
+
+			std::unique_lock lk(this->lk);
+			fn(this->value);
+		}
+
+		template <typename Functor>
+		auto map_read(Functor&& fn) const -> decltype(fn(this->value))
+		{
+			std::shared_lock lk(this->lk);
+			return fn(this->value);
+		}
+
+		template <typename Functor>
+		auto map_write(Functor&& fn) -> decltype(fn(this->value))
+		{
+			if(this->write_lock_callback)
+				this->write_lock_callback();
+
+			std::unique_lock lk(this->lk);
+			return fn(this->value);
+		}
+
+		Lk& getLock()
+		{
+			return this->lk;
+		}
+
+		ReadLockedInstance rlock() const
+		{
+			return ReadLockedInstance(*this);
+		}
+
+		WriteLockedInstance wlock()
+		{
+			if(this->write_lock_callback)
+				this->write_lock_callback();
+
+			return WriteLockedInstance(*this);
+		}
+
+	private:
+
+		// static Lk& assert_not_held(Lk& lk) { if(lk.held()) assert(!"cannot move held Synchronised"); return lk; }
+
+		struct ReadLockedInstance
+		{
+			const T* operator -> () { return &this->sync.value; }
+			const T* get() { return &this->sync.value; }
+			~ReadLockedInstance() { this->sync.lk.unlock_shared(); }
+
+		private:
+			ReadLockedInstance(const Synchronised& sync) : sync(sync) { this->sync.lk.lock_shared(); }
+
+			ReadLockedInstance(ReadLockedInstance&&) = delete;
+			ReadLockedInstance(const ReadLockedInstance&) = delete;
+
+			ReadLockedInstance& operator = (ReadLockedInstance&&) = delete;
+			ReadLockedInstance& operator = (const ReadLockedInstance&) = delete;
+
+			const Synchronised& sync;
+
+			friend struct Synchronised;
+		};
+
+		struct WriteLockedInstance
+		{
+			T* operator -> () { return &this->sync.value; }
+			T* get() { return &this->sync.value; }
+			~WriteLockedInstance() { this->sync.lk.unlock(); }
+
+		private:
+			WriteLockedInstance(Synchronised& sync) : sync(sync) { this->sync.lk.lock(); }
+
+			WriteLockedInstance(WriteLockedInstance&&) = delete;
+			WriteLockedInstance(const WriteLockedInstance&) = delete;
+
+			WriteLockedInstance& operator = (WriteLockedInstance&&) = delete;
+			WriteLockedInstance& operator = (const WriteLockedInstance&) = delete;
+
+			Synchronised& sync;
+
+			friend struct Synchronised;
+		};
+	};
+}
+
+// async operations (threadpool, futures)
+namespace zmt
+{
+	template <typename T>
+	struct future
+	{
+		template <typename F = T>
+		std::enable_if_t<!std::is_same_v<void, F>, T>& get()
+		{
+			this->wait();
+			return this->state->value;
+		}
+
+		template <typename F = T>
+		void set(std::enable_if_t<!std::is_same_v<void, F>, T>&& x)
+		{
+			this->state->value = x;
+			this->state->cv.set(true);
+		}
+
+		template <typename F = T>
+		std::enable_if_t<std::is_same_v<void, F>, void> get()
+		{
+			this->wait();
+		}
+
+		template <typename F = T>
+		std::enable_if_t<std::is_same_v<void, F>, void> set()
+		{
+			this->state->cv.set(true);
+		}
+
+		void wait() const
+		{
+			this->state->cv.wait(true);
+		}
+
+		void discard()
+		{
+			this->state->discard = true;
+		}
+
+		~future() { if(this->state && !this->state->discard) { this->state->cv.wait(true); } }
+
+		future() { this->state = std::make_shared<internal_state<T>>(); this->state->cv.set(false); }
+
+		template <typename F = T>
+		future(std::enable_if_t<!std::is_same_v<void, F>, T>&& val)
+		{
+			this->state = std::make_shared<internal_state<T>>();
+			this->state->value = val;
+			this->state->cv.set(true);
+		}
+
+		future(future&& f)
+		{
+			this->state = f.state;
+			f.state = nullptr;
+		}
+
+		future& operator = (future&& f)
+		{
+			if(this != &f)
+			{
+				this->state = f.state;
+				f.state = nullptr;
+			}
+
+			return *this;
+		}
+
+		future(const future&) = delete;
+		future& operator = (const future&) = delete;
+
+	private:
+		friend struct ThreadPool;
+
+		template <typename E>
+		struct internal_state
+		{
+			internal_state() { cv.set(false); }
+
+			E value;
+			condvar<bool> cv;
+			bool discard = false;
+
+			internal_state(internal_state&& f) = delete;
+			internal_state& operator = (internal_state&& f) = delete;
+		};
+
+		template <>
+		struct internal_state<void>
+		{
+			internal_state() { discard = false; cv.set(false); }
+
+			condvar<bool> cv;
+			bool discard;
+
+			internal_state(internal_state&& f) = delete;
+			internal_state& operator = (internal_state&& f) = delete;
+		};
+
+
+		future(std::shared_ptr<internal_state<T>> st) : state(st) { }
+		future clone() { return future(this->state); }
+
+		std::shared_ptr<internal_state<T>> state;
+	};
+
+	struct ThreadPool
+	{
+		template <typename Fn, typename... Args>
+		auto run(Fn&& fn, Args&&... args) -> future<decltype(fn(static_cast<Args&&>(args)...))>
+		{
+			using T = decltype(fn(static_cast<Args&&>(args)...));
+
+			auto fut = future<T>();
+			this->jobs.emplace([fn = std::move(fn), args..., f1 = fut.clone()]() mutable {
+				if constexpr (!std::is_same_v<T, void>)
+				{
+					f1.set(fn(static_cast<decltype(args)&&>(args)...));
+				}
+				else
+				{
+					fn(static_cast<decltype(args)&&>(args)...);
+					f1.set();
+				}
+			});
+
+			return fut;
+		}
+
+		ThreadPool(size_t num = std::thread::hardware_concurrency())
+		{
+			if(num == 0)
+				num = 1;
+
+			this->num_workers = num;
+			this->workers = new std::thread[this->num_workers];
+			this->start_workers();
+		}
+
+		~ThreadPool()
+		{
+			this->stop_all();
+			delete[] this->workers;
+		}
+
+		void stop_all()
+		{
+			this->jobs.push(Job::stop());
+			for(size_t i = 0; i < this->num_workers; i++)
+				this->workers[i].join();
+		}
+
+		void set_max_workers(size_t num)
+		{
+			this->stop_all();
+			delete[] this->workers;
+
+			if(num == 0)
+				num = 1;
+
+			this->num_workers = num;
+			this->workers = new std::thread[this->num_workers];
+			this->start_workers();
+		}
+
+		ThreadPool(ThreadPool&&) = delete;
+		ThreadPool(const ThreadPool&) = delete;
+		ThreadPool& operator = (ThreadPool&&) = delete;
+		ThreadPool& operator = (const ThreadPool&) = delete;
+
+	private:
+		void start_workers()
+		{
+			for(size_t i = 0; i < num_workers; i++)
+			{
+				this->workers[i] = std::thread([this]() {
+					worker(this);
+				});
+			}
+		}
+
+
+		static void worker(ThreadPool* tp)
+		{
+			while(true)
+			{
+				auto job = tp->jobs.pop();
+				if(job.should_stop)
+				{
+					tp->jobs.push(Job::stop());
+					break;
+				}
+
+				job.func();
+			}
+		}
+
+		struct Job
+		{
+			bool should_stop = false;
+			unique_function<void (void)> func;
+
+			Job() { }
+			explicit Job(unique_function<void (void)>&& f) : func(std::move(f)) { }
+
+			static inline Job stop() { Job j; j.should_stop = true; return j; }
+		};
+
+		size_t num_workers = 0;
+		std::thread* workers = nullptr;
+
+		wait_queue<Job> jobs;
+	};
+
+	namespace futures
+	{
+		template <typename... Args>
+		inline void wait(future<Args>&... futures)
+		{
+			// i love c++17
+			(futures.wait(), ...);
+		}
+
+		template <typename L>
+		inline void wait(const L& futures)
+		{
+			for(const auto& f : futures)
+				f.wait();
+		}
+	}
+}
+
+
+
+
 
 
 
@@ -2528,7 +3217,7 @@ namespace nabs
 			std::unordered_map<std::string, Library> cached_libraries;
 		};
 
-		GlobalState& global_state();
+		zmt::Synchronised<GlobalState>& global_state();
 	}
 
 	namespace os
@@ -2569,6 +3258,14 @@ namespace nabs
 		by using '\n' as the delimiter (thanks, windows...), so don't do it.
 	*/
 	std::vector<std::string_view> split_string(std::string& s, char delim);
+
+	/*
+		similar to std::stoi, but instead of throwing an exception (seriously...) it returns
+		an optional.
+	*/
+	std::optional<int64_t> stoi(const std::string& s, int base = 10);
+	std::optional<int64_t> stoi(std::string_view s, int base = 10);
+
 
 	/*
 		Functional map of an iterable container.
@@ -6136,6 +6833,24 @@ namespace nabs
 		return ret;
 	}
 
+	std::optional<int64_t> stoi(const std::string& s, int base)
+	{
+		if(s.empty())
+			return { };
+
+		char* tmp = 0;
+		int64_t ret = strtoll(s.c_str(), &tmp, base);
+		if(tmp != s.data() + s.size())
+			return { };
+
+		return ret;
+	}
+
+	std::optional<int64_t> stoi(std::string_view s, int base)
+	{
+		return stoi(std::string(s), base);
+	}
+
 	std::string os::get_environment_var(const std::string& name)
 	{
 	#if defined(_WIN32)
@@ -6157,8 +6872,8 @@ namespace nabs
 
 	namespace impl
 	{
-		GlobalState state { };
-		GlobalState& global_state()
+		zmt::Synchronised<GlobalState> state { };
+		zmt::Synchronised<GlobalState>& global_state()
 		{
 			// TODO: NOT THREAD SAFE AT ALL
 			return state;
@@ -6194,15 +6909,20 @@ namespace nabs
 		static bool check_pkg_config()
 		{
 			auto& gs = impl::global_state();
-			if(gs.pkg_config_checked)
+			if(gs.rlock()->pkg_config_checked)
 			{
-				return gs.pkg_config_exists;
+				return gs.rlock()->pkg_config_exists;
 			}
 			else
 			{
-				gs.pkg_config_checked = true;
 				std::string foo;
-				return gs.pkg_config_exists = (cmd("pkg-config", "--version").run(&foo) == 0);
+				auto st = cmd("pkg-config", "--version").run(&foo);
+
+				return gs.map_write([&st](auto& gs) -> bool {
+					gs.pkg_config_checked = true;
+					gs.pkg_config_exists = (st == 0);
+					return gs.pkg_config_exists;
+				});
 			}
 		}
 
@@ -6244,6 +6964,9 @@ namespace nabs
 			map(split_string(tmp, ' '), static_cast<Mapper&&>(mapper));
 			return Ok();
 		}
+
+
+		// HandsUp gachiHYPER
 
 
 		static Result<Library, std::string> find_with_pkg_config(const LibraryFinderOptions& opts,
@@ -6303,10 +7026,6 @@ namespace nabs
 	}
 }
 #endif
-
-
-
-
 
 /*
 	"automatic" compilation
@@ -6403,6 +7122,16 @@ namespace nabs
 		const fs::path& exe, const std::vector<fs::path>& files,
 		const std::vector<std::pair<std::string, LibraryFinderOptions>>& libraries = { });
 
+
+	/*
+		This is just an overload of auto_executable_from_sources that takes a list of libraries as a list of names,
+		assuming that all of them use the *default* LibraryFinderOptions. this is purely a convenience because
+		it's easier to initialise.
+	*/
+	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& exe_name, const std::vector<fs::path>& src_files, const std::vector<std::string>& libraries);
+
+
 	/*
 		Automatically build all the targets provided in the list, by using the dependency graph and
 		sorting it in topological order. In case of success, an empty result is returned. In case of
@@ -6439,6 +7168,18 @@ namespace nabs
 	*/
 	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, dep::Item* target);
+
+	/*
+		Identical to the overloads above, but using the provided thread pool for parallel job execution.
+		This means that the overloads not taking a ThreadPool are single-threaded.
+	*/
+	Result<void, std::string> auto_build_targets(zmt::ThreadPool& pool, const Toolchain& toolchain,
+		const AutoCompileHooks& hooks, const dep::Graph& graph, const std::vector<dep::Item*>& targets);
+
+	Result<void, std::string> auto_build_target(zmt::ThreadPool& pool, const Toolchain& toolchain,
+		const AutoCompileHooks& hooks, const dep::Graph& graph, dep::Item* target);
+
+
 
 	/*
 		Automatically add dependency information to build the given header as a precompiled header.
@@ -6479,7 +7220,7 @@ namespace nabs
 		// NOTE: don't call this directly (with the last argument) -- always call the other one
 		// (without the last argument)
 		static Result<void, std::string> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
-			const Toolchain& tc, const AutoCompileHooks& hooks, std::vector<Library*>& depended_libs)
+			const Toolchain& tc, const AutoCompileHooks& hooks, std::vector<const Library*>& depended_libs)
 		{
 			using namespace nabs::dep;
 
@@ -6492,8 +7233,8 @@ namespace nabs
 
 				if(!dep_phony && !dep_exists)
 				{
-					return Err<std::string>(zpr::sprint("required (non-phony) dependency '{}' does not exist",
-						dep->name()));
+					return Err<std::string>(zpr::sprint("target '{}': required (non-phony) dependency '{}' does not exist",
+						target->name(), dep->name()));
 				}
 
 				if(dep_phony || !dep_exists || !target_exists)
@@ -6648,21 +7389,23 @@ namespace nabs
 			}
 			else if(target->kind() == KIND_SYSTEM_LIBRARY)
 			{
-				Library* lib = nullptr;
+				auto lib = impl::global_state().map_read([&target](auto& gs) -> const Library* {
+					if(auto it = gs.cached_libraries.find(target->name()); it != gs.cached_libraries.end())
+						return &it->second;
 
-				auto& cache = impl::global_state().cached_libraries;
-				if(auto it = cache.find(target->name()); it != cache.end())
-				{
-					lib = &it->second;
-				}
-				else
+					return nullptr;
+				});
+
+				if(lib == nullptr)
 				{
 					auto library = find_library(target->name(), target->lib_finder_options);
 					if(!library.ok())
 						return Err<std::string>(zpr::sprint("could not find required library '{}'", target->name()));
 
-					cache[target->name()] = std::move(library.unwrap());
-					lib = &cache[target->name()];
+					lib = impl::global_state().map_write([&target, &library](auto& gs) -> auto {
+						gs.cached_libraries[target->name()] = std::move(library.unwrap());
+						return &gs.cached_libraries[target->name()];
+					});
 				}
 
 				assert(lib != nullptr);
@@ -6692,7 +7435,7 @@ namespace nabs
 			if(is_kind_weak(target->kind()))
 				return Ok();
 
-			std::vector<Library*> depended_libs;
+			std::vector<const Library*> depended_libs;
 			return auto_compile_one_thing(graph, target, tc, hooks, depended_libs);
 		}
 	}
@@ -6716,11 +7459,67 @@ namespace nabs
 		return Ok();
 	}
 
+	Result<void, std::string> auto_build_targets(zmt::ThreadPool& pool, const Toolchain& toolchain,
+		const AutoCompileHooks& hooks, const dep::Graph& graph, const std::vector<dep::Item*>& targets)
+	{
+		auto order = graph.topological_sort(targets)
+			.expect("failed to find a valid dependency order");
+
+		using ResultTy = Result<void, std::string>;
+
+		for(auto& targets : order)
+		{
+			std::vector<zmt::future<void>> futures;
+			zmt::wait_queue<ResultTy> results;
+
+			for(auto& target : targets)
+			{
+				futures.push_back(pool.run([&toolchain, &hooks, &graph, &target, &results]() {
+					auto ret = impl::auto_compile_one_thing(graph, target, toolchain, hooks);
+					results.push(std::move(ret));
+				}));
+			}
+
+			// pop the results
+			ResultTy ret = Ok();
+			size_t processed = 0;
+			while(processed < futures.size())
+			{
+				auto result = results.pop();
+				processed += 1;
+
+				if(!result.ok())
+				{
+					ret = Err(result.error());
+					break;
+				}
+			}
+
+			// wait for the jobs to terminate
+			zmt::futures::wait(futures);
+			if(!ret.ok())
+				return ret;
+		}
+
+		return Ok();
+	}
+
+
+
+	Result<void, std::string> auto_build_target(zmt::ThreadPool& pool, const Toolchain& toolchain,
+		const AutoCompileHooks& hooks, const dep::Graph& graph, dep::Item* target)
+	{
+		return auto_build_targets(pool, toolchain, hooks, graph, { target });
+	}
+
 	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
 		const dep::Graph& graph, dep::Item* target)
 	{
 		return auto_build_targets(toolchain, hooks, graph, { target });
 	}
+
+
+
 
 	// TODO: refactor this out into more constituent parts (eg. auto_objects_from_sources)
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
@@ -6776,6 +7575,16 @@ namespace nabs
 		return Ok(exe_file);
 	}
 
+	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& exe_name, const std::vector<fs::path>& src_files, const std::vector<std::string>& libraries)
+	{
+		std::vector<std::pair<std::string, LibraryFinderOptions>> libs;
+		for(auto& lib : libraries)
+			libs.push_back({ lib, LibraryFinderOptions { } });
+
+		return auto_executable_from_sources(graph, toolchain, exe_name, src_files, libs);
+	}
+
 	std::optional<std::pair<Compiler, CompilerFlags>> auto_infer_compiler_from_file(const Toolchain& toolchain,
 		const fs::path& path)
 	{
@@ -6823,4 +7632,23 @@ namespace nabs
 }
 #endif
 
+
+
+/*
+	TODOs:
+	2.  A sane API for libraries. Right now, we can probably make auto_executable_from_sources accept
+		a LibraryFinderOptions + std::vector<std::string>, but that's not very flexible:
+		(a) every library would have to use the same options
+		(b) every object would depend on those libraries; this might not be the case
+			-- while this is not an obvious concern, some libraries' defines and include dirs might mess
+				with compilation for object files that don't depend on it.
+			-- for example, here we would not compile utf8proc with the -I for openssl (even though
+				it won't affect it)
+
+		(c) similar to (b), every object would depend on every library. again, this might not be good practice.
+
+	3.  auto_objects_from_sources, which does 90% of the work of auto_executable_from_sources. It just
+		returns a list of the object files, minus the executable stuff. This would also need some way of
+		specifying libraries, probably in the same way
+*/
 
