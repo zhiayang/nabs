@@ -5469,7 +5469,7 @@ namespace nabs
 	int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files);
 	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files);
 
-	fs::path get_default_object_filename(const Compiler& compiler, const CompilerFlags& opts, const fs::path& file);
+	fs::path get_default_object_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path file);
 	fs::path get_dependency_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path file);
 	fs::path get_default_pch_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path header);
 
@@ -5720,27 +5720,45 @@ namespace nabs
 		}
 
 		static void add_flags_for_precompiled_header(std::vector<std::string>& args, const Compiler& cmp,
-			const CompilerFlags& opts)
+			const CompilerFlags& opts, bool linking)
 		{
 			// if you use a precompiled header, it is *your* responsibility to make sure
 			// that it is updated if/when necessary. the sanest way to do this is to enable
 			// the `generate_header_dependencies` flag in the compiler options, and use the
 			// dependency graph functionality (either via auto_*, or manually on your own) to
 			// ensure that the pch is recompiled if anything it includes changes.
-			if(auto pch = opts.precompiled_header; !pch.empty())
+			if(auto hdr = opts.precompiled_header; !hdr.empty())
 			{
-				if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				if(linking)
 				{
-					args.push_back("-include");
-					args.push_back(pch.string());
-				}
-				else if(cmp.kind == Compiler::KIND_MSVC_CL)
-				{
-					impl::int_error("add_flags_for_precompiled_header(): msvc TODO");
+					if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
+					{
+						// msvc generates an obj for the pch; we generated it with the default name,
+						// so all we need to do is just link it in.
+						args.push_back(get_default_object_filename(cmp, opts, hdr).string());
+					}
 				}
 				else
 				{
-					impl::int_error("add_flags_for_precompiled_header(): unsupported compiler");
+					if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+					{
+						args.push_back("-include");
+						args.push_back(hdr.string());
+					}
+					else if(cmp.kind == Compiler::KIND_MSVC_CL)
+					{
+						auto pch = get_default_pch_filename(cmp, opts, hdr);
+						auto quoted_pch = quote_argument(fs::weakly_canonical(pch).string());
+						auto quoted_hdr = quote_argument(fs::weakly_canonical(hdr).string());
+
+						args.push_back(zpr::sprint("/FI{}", quoted_hdr));
+						args.push_back(zpr::sprint("/Yu{}", quoted_hdr));
+						args.push_back(zpr::sprint("/Fp{}", quoted_pch));
+					}
+					else
+					{
+						impl::int_error("add_flags_for_precompiled_header(): unsupported compiler");
+					}
 				}
 			}
 		}
@@ -5864,10 +5882,27 @@ namespace nabs
 		}
 	}
 
-	fs::path get_default_object_filename(const Compiler& cmp, const CompilerFlags& opts, const fs::path& file)
+	fs::path get_default_object_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path file)
 	{
-		std::vector<std::string> fake_args;
-		return impl::set_output_name(fake_args, cmp, opts, /* obj: */ true, { }, { file });
+		// i guess we emit the same file for every compiler.
+		if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
+		{
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				return *inter / (file.concat(".o"));
+			else if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
+				return *inter / (file.replace_extension(".obj"));
+			else
+				impl::int_error("get_default_object_filename(): unsupported compiler");
+		}
+		else
+		{
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				return file.concat(".o");
+			else if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
+				return file.replace_extension(".obj");
+			else
+				impl::int_error("get_default_object_filename(): unsupported compiler");
+		}
 	}
 
 	fs::path get_dependency_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path file)
@@ -5909,6 +5944,8 @@ namespace nabs
 		impl::setup_exception_args(args, cmp, opts);
 		impl::set_flags_for_dependency_file(args, cmp, opts, header);
 
+		auto pch = get_default_pch_filename(cmp, opts, header);
+
 		// the pch either goes next to the header file, or in the intermediate directory
 		// (just like object files)
 		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
@@ -5938,7 +5975,44 @@ namespace nabs
 		}
 		else if(cmp.kind == Compiler::KIND_MSVC_CL)
 		{
-			impl::int_error("compile_header_to_pch(): msvc TODO");
+			args.push_back("/c");
+			args.push_back("/Yc");
+
+			args.push_back(zpr::sprint("/Fp{}", impl::quote_argument(pch.string())));
+
+			if(cmp.lang == LANGUAGE_C)
+				args.push_back("/Tc");
+			else if(cmp.lang == LANGUAGE_CPP)
+				args.push_back("/Tp");
+			else
+				impl::int_error("unsupported language '{}'", cmp.lang);
+
+			args.push_back(header.string());
+
+			if(cmp.log_hook)
+				cmp.log_hook(pch, { header }, args);
+
+			// this also generates an object file that *MUST* be linked in. dumb asdf, but
+			// put it in a predictable location (ie. where the other intermediate files go)
+			auto pch_obj = get_default_object_filename(cmp, opts, header);
+			args.push_back(zpr::sprint("/Fo{}", impl::quote_argument(pch_obj.string())));
+
+			// i hate msvc
+			std::string out;
+			std::string err;
+
+			int status = cmd(cmp.path.string(), std::move(args)).run(&out, &err);
+			auto depfile = get_dependency_filename(cmp, opts, header);
+
+			// stderr is irrelevant, because the people at microsoft don't know what's up
+			impl::parse_msvc_show_includes_and_write_to_file(out, pch, depfile,
+				/* write_file: */ (status == 0));
+
+			// just in case, print the stderr as well.
+			fprintf(stderr, "%s", err.c_str());
+
+			if(status == 0) return Ok(pch);
+			else            return Err(status);
 		}
 		else
 		{
@@ -5953,7 +6027,7 @@ namespace nabs
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
 		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
-		impl::add_flags_for_precompiled_header(args, cmp, opts);
+		impl::add_flags_for_precompiled_header(args, cmp, opts, /* linking: */ false);
 		impl::setup_exception_args(args, cmp, opts);
 
 		auto out_name = impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
@@ -6000,7 +6074,7 @@ namespace nabs
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
 		impl::setup_exception_args(args, cmp, opts);
-		impl::add_flags_for_precompiled_header(args, cmp, opts);
+		impl::add_flags_for_precompiled_header(args, cmp, opts, /* linking: */ true);
 
 		auto out = impl::set_output_name(args, cmp, opts, /* obj: */ false, output, files);
 
@@ -6040,8 +6114,20 @@ namespace nabs
 		if(cmp.log_hook)
 			cmp.log_hook(out, files, args);
 
-		// construct the command, and run it.
-		return cmd(cmp.path.string(), std::move(args)).run();
+		// msvc's printing of the filename is seriously obnoxious
+		if(cmp.kind == Compiler::KIND_MSVC_CL)
+		{
+			std::string out;
+			auto status = cmd(cmp.path.string(), std::move(args)).run(&out);
+			out.erase(0, 1 + out.find('\n'));
+
+			fprintf(stdout, "%s", out.c_str());
+			return status;
+		}
+		else
+		{
+			return cmd(cmp.path.string(), std::move(args)).run();
+		}
 	}
 
 	int link_object_files(const Compiler& linker, const CompilerFlags& opts, const std::optional<fs::path>& output,
@@ -6049,6 +6135,7 @@ namespace nabs
 	{
 		auto args = impl::setup_basic_args(linker, opts);
 		impl::setup_exception_args(args, linker, opts);
+		impl::add_flags_for_precompiled_header(args, linker, opts, /* linking: */ true);
 
 		auto out = impl::set_output_name(args, linker, opts, /* obj: */ false, output, files);
 
@@ -8037,8 +8124,29 @@ namespace nabs
 
 		(c) similar to (b), every object would depend on every library. again, this might not be good practice.
 
+
 	3.  auto_objects_from_sources, which does 90% of the work of auto_executable_from_sources. It just
 		returns a list of the object files, minus the executable stuff. This would also need some way of
 		specifying libraries, probably in the same way
+
+
+	4.  right now to use precompiled headers on windows, we need to set the precompiled_header field in
+		the link flags as well. this is due to msvc (a) generating an obj file when compiling a pch,
+		and (b) requiring it to be passed to the linker.
+
+		this creates a few problems:
+		(a) since the precompiled_header field is *not* a list, it means each toolchain is limited to only
+			one pch on windows, which isn't very ideal (in theory you can have as many as you want)
+
+		(b) the recipe needs to manually set the pch name in ldflags as well, because link_objects only
+			has access to the linker and knows nothing about the compiler.
+			- we could have it also accept the compiler as a parameter, but that's very ugly
+
+		the obvious solution to (a) is to just have the precompiled headers be a list instead of a singleton,
+		but that requires checking that it is at most 1-large for the cflags/cxxflags, which is not very intuitive.
+
+		the solution to (b) is either
+		(i)  have a method on the Toolchain, something like `use_c_pch()` that adds to both the cflags and the ldflags
+		(ii) not actually do anything about it and force the recipe to set it manually
 */
 
