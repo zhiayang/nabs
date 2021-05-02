@@ -6302,12 +6302,15 @@ namespace nabs::fs
 		std::string input;
 		fseek(f, 0, SEEK_END);
 
-		long fsize = ftell(f);
+		auto fsize = static_cast<size_t>(ftell(f));
 		fseek(f, 0, SEEK_SET);  //same as rewind(f);
 
 		input.resize(fsize);
-		if(fread(input.data(), fsize, 1, f) < 0)
-			return Err<std::string>(os::strerror_wrapper());
+		if(auto read = fread(input.data(), 1, fsize, f); read < fsize)
+		{
+			if(ferror(f)) return Err<std::string>(os::strerror_wrapper());
+			else          nabs::impl::int_warn("unexpected end of file (expected {} bytes, got only {})", fsize, read);
+		}
 
 		fclose(f);
 		return Ok(std::move(input));
