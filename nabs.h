@@ -31,18 +31,12 @@
 	(a) are written in one language (the best one) -- C++
 	(b) work for all major platforms -- Linux, macOS, BSDs, Windows
 	(c) easily support, with very little boilerplate, standard makefile project patterns
+	(d) provide platform- and compiler-independent abstractions for common flags/options
 
 	More documentation will be coming soon.
 
 
-
-
-	Version History
-	===============
-
-	0.1.0 - 28/04/2021
-	------------------
-	Initial release.
+	Version history is available at the bottom of this file.
 */
 
 #pragma once
@@ -62,7 +56,10 @@
 	zpr is included here to maintain a single-header strategy.
 	it is available from https://github.com/zhiayang/ztl
 
-	the code is included verbatim, but documentation has been removed.
+	the code is included with the following modifications:
+	1. documentation has been removed
+	2. zpr::tt reimplementation of type_traits has been removed
+	3. defines have been removed and set to their defaults.
 
 	zpr.h
 	Copyright 2020 - 2021, zhiayang
@@ -78,7 +75,6 @@
 	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 	See the License for the specific language governing permissions and
 	limitations under the License.
-
 
 
 	detail::print_floating and detail::print_exponent are adapted from _ftoa and _etoa
@@ -110,287 +106,28 @@
 */
 
 #include <cfloat>
+#include <cstdio>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 
-#define ZPR_DO_EXPAND(VAL)  VAL ## 1
-#define ZPR_EXPAND(VAL)     ZPR_DO_EXPAND(VAL)
+#include <string>
+#include <string_view>
+#include <type_traits>
 
-// this weird macro soup is necessary to defend against the case where you just do
-// #define ZPR_FOO_BAR, but without a value -- we want to treat that as a TRUE.
-#if !defined(ZPR_HEX_0X_RESPECTS_UPPERCASE)
-	#define ZPR_HEX_0X_RESPECTS_UPPERCASE 0
-#elif (ZPR_EXPAND(ZPR_HEX_0X_RESPECTS_UPPERCASE) == 1)
-	#undef ZPR_HEX_0X_RESPECTS_UPPERCASE
-	#define ZPR_HEX_0X_RESPECTS_UPPERCASE 1
-#endif
-
-#if !defined(ZPR_FREESTANDING)
-	#define ZPR_FREESTANDING 0
-#elif (ZPR_EXPAND(ZPR_FREESTANDING) == 1)
-	#undef ZPR_FREESTANDING
-	#define ZPR_FREESTANDING 1
-#endif
-
-// it needs to be like this so we don't throw a redefinition warning.
-#if !defined(ZPR_DECIMAL_LOOKUP_TABLE)
-	#define ZPR_DECIMAL_LOOKUP_TABLE 1
-#elif (ZPR_EXPAND(ZPR_DECIMAL_LOOKUP_TABLE) == 1)
-	#undef ZPR_DECIMAL_LOOKUP_TABLE
-	#define ZPR_DECIMAL_LOOKUP_TABLE 1
-#endif
-
-#if !defined(ZPR_HEXADECIMAL_LOOKUP_TABLE)
-	#define ZPR_HEXADECIMAL_LOOKUP_TABLE 1
-#elif (ZPR_EXPAND(ZPR_HEXADECIMAL_LOOKUP_TABLE) == 1)
-	#undef ZPR_HEXADECIMAL_LOOKUP_TABLE
-	#define ZPR_HEXADECIMAL_LOOKUP_TABLE 1
-#endif
-
-#if !defined(ZPR_USE_STD)
-	#define ZPR_USE_STD 1
-#elif (ZPR_EXPAND(ZPR_USE_STD) == 1)
-	#undef ZPR_USE_STD
-	#define ZPR_USE_STD 1
-#endif
-
-
-#if !ZPR_FREESTANDING
-	#include <cstdio>
-	#include <cstring>
-#else
-	#if defined(ZPR_USE_STD)
-		#undef ZPR_USE_STD
-	#endif
-
-	#define ZPR_USE_STD 0
-
-	extern "C" void* memset(void* s, int c, size_t n);
-	extern "C" void* memcpy(void* dest, const void* src, size_t n);
-	extern "C" void* memmove(void* dest, const void* src, size_t n);
-
-	extern "C" size_t strlen(const char* s);
-	extern "C" int strncmp(const char* s1, const char* s2, size_t n);
-
-#endif
-
-#if !ZPR_FREESTANDING && ZPR_USE_STD
-	#include <string>
-	#include <string_view>
-	#include <type_traits>
-#endif
-
-
-#undef ZPR_DO_EXPAND
-#undef ZPR_EXPAND
-
-
+#define ZPR_HEX_0X_RESPECTS_UPPERCASE   0
+#define ZPR_FREESTANDING                0
+#define ZPR_DECIMAL_LOOKUP_TABLE        1
+#define ZPR_HEXADECIMAL_LOOKUP_TABLE    1
+#define ZPR_USE_STD                     1
 
 namespace zpr::tt
 {
-#if 0
-
 	using namespace std;
 
-#else
-	template <typename T> struct type_identity { using type = T; };
+	/* from here on, all the code should be exactly the same as the released version of zpr.h */
+	/* -------------------------------------------------------------------------------------- */
 
-	template <typename T> struct remove_reference      { using type = T; };
-	template <typename T> struct remove_reference<T&>  { using type = T; };
-	template <typename T> struct remove_reference<T&&> { using type = T; };
-
-	template <typename T, T v>
-	struct integral_constant
-	{
-		static constexpr T value = v;
-		typedef T value_type;
-		typedef integral_constant type;
-
-		constexpr operator value_type() const { return value; }
-		constexpr value_type operator()() const { return value; }
-	};
-
-	using true_type = integral_constant<bool, true>;
-	using false_type = integral_constant<bool, false>;
-
-	template <typename T> struct remove_cv                   { using type = T; };
-	template <typename T> struct remove_cv<const T>          { using type = T; };
-	template <typename T> struct remove_cv<volatile T>       { using type = T; };
-	template <typename T> struct remove_cv<const volatile T> { using type = T; };
-
-	template <typename T> using remove_cv_t = typename remove_cv<T>::type;
-
-	template <typename> struct is_integral_base : false_type { };
-
-	template <> struct is_integral_base<bool>               : true_type { };
-	template <> struct is_integral_base<char>               : true_type { };
-	template <> struct is_integral_base<signed char>        : true_type { };
-	template <> struct is_integral_base<signed short>       : true_type { };
-	template <> struct is_integral_base<signed int>         : true_type { };
-	template <> struct is_integral_base<signed long>        : true_type { };
-	template <> struct is_integral_base<signed long long>   : true_type { };
-	template <> struct is_integral_base<unsigned char>      : true_type { };
-	template <> struct is_integral_base<unsigned short>     : true_type { };
-	template <> struct is_integral_base<unsigned int>       : true_type { };
-	template <> struct is_integral_base<unsigned long>      : true_type { };
-	template <> struct is_integral_base<unsigned long long> : true_type { };
-
-	template <typename T> struct is_integral : is_integral_base<remove_cv_t<T>> { };
-	template <typename T> constexpr auto is_integral_v = is_integral<T>::value;
-
-
-	template <typename> struct is_signed_base : false_type { };
-
-	template <> struct is_signed_base<signed char>        : true_type { };
-	template <> struct is_signed_base<signed short>       : true_type { };
-	template <> struct is_signed_base<signed int>         : true_type { };
-	template <> struct is_signed_base<signed long>        : true_type { };
-	template <> struct is_signed_base<signed long long>   : true_type { };
-
-	template <typename T> struct is_signed : is_signed_base<remove_cv_t<T>> { };
-	template <typename T> constexpr auto is_signed_v = is_signed<T>::value;
-
-	template <typename T, typename U>   struct is_same : false_type { };
-	template <typename T>               struct is_same<T, T> : true_type { };
-
-	template <typename A, typename B>
-	constexpr auto is_same_v = is_same<A, B>::value;
-
-	// the 3 major compilers -- clang, gcc, and msvc -- support __is_enum. it's not
-	// tenable implement is_enum without compiler magic.
-	template <typename T> struct is_enum { static constexpr bool value = __is_enum(T); };
-	template <typename T> constexpr auto is_enum_v = is_enum<T>::value;
-
-	template <typename T> struct is_reference      : false_type { };
-	template <typename T> struct is_reference<T&>  : true_type { };
-	template <typename T> struct is_reference<T&&> : true_type { };
-
-	template <typename T> struct is_const          : false_type { };
-	template <typename T> struct is_const<const T> : true_type { };
-
-	template <typename T> constexpr auto is_const_v = is_const<T>::value;
-	template <typename T> constexpr auto is_reference_v = is_reference<T>::value;
-
-	// a similar story exists for __underlying_type.
-	template <typename T> struct underlying_type { using type = __underlying_type(T); };
-	template <typename T> using underlying_type_t = typename underlying_type<T>::type;
-
-	template <bool B, typename T = void> struct enable_if { };
-	template <typename T> struct enable_if<true, T> { using type = T; };
-	template <bool B, typename T = void> using enable_if_t = typename enable_if<B, T>::type;
-
-	template <typename T> struct is_array : false_type { };
-	template <typename T> struct is_array<T[]> : true_type { };
-	template <typename T, size_t N> struct is_array<T[N]> : true_type { };
-
-	template <typename T> struct remove_extent { using type = T; };
-	template <typename T> struct remove_extent<T[]> { using type = T; };
-	template <typename T, size_t N> struct remove_extent<T[N]> { using type = T; };
-
-	template <typename T> struct is_function : integral_constant<bool, !is_const_v<const T> && !is_reference_v<T>> { };
-	template <typename T> constexpr auto is_function_v = is_function<T>::value;
-
-	template <typename T> auto try_add_pointer(int) -> type_identity<typename remove_reference<T>::type*>;
-	template <typename T> auto try_add_pointer(...) -> type_identity<T>;
-
-	template <typename T>
-	struct add_pointer : decltype(try_add_pointer<T>(0)) { };
-
-	template <bool B, typename T, typename F> struct conditional { using type = T; };
-	template <typename T, typename F> struct conditional<false, T, F> { using type = F; };
-	template <bool B, typename T, typename F> using conditional_t = typename conditional<B,T,F>::type;
-
-	template <typename...> struct conjunction : true_type { };
-	template <typename B1> struct conjunction<B1> : B1 { };
-	template <typename B1, typename... Bn>
-	struct conjunction<B1, Bn...> : conditional_t<bool(B1::value), conjunction<Bn...>, B1> { };
-
-	template <typename...> struct disjunction : false_type { };
-	template <typename B1> struct disjunction<B1> : B1 { };
-	template <typename B1, typename... Bn>
-	struct disjunction<B1, Bn...> : conditional_t<bool(B1::value), B1, disjunction<Bn...>>  { };
-
-	template <typename B>
-	struct negation : integral_constant<bool, !bool(B::value)> { };
-
-	template <typename T>
-	struct decay
-	{
-	private:
-		using U = typename remove_reference<T>::type;
-	public:
-		using type = typename conditional<
-			is_array<U>::value,
-			typename remove_extent<U>::type*,
-			typename conditional<
-				is_function<U>::value,
-				typename add_pointer<U>::type,
-				typename remove_cv<U>::type
-			>::type
-		>::type;
-	};
-
-	template <typename T> using decay_t = typename decay<T>::type;
-
-	template <typename T, bool = is_integral<T>::value>
-	struct _is_unsigned : integral_constant<bool, (T(0) < T(-1))> { };
-
-	template <typename T>
-	struct _is_unsigned<T, false> : false_type { };
-
-	template <typename T>
-	struct is_unsigned : _is_unsigned<T>::type { };
-
-	template <typename T>
-	struct make_unsigned { };
-
-	template <> struct make_unsigned<signed char> { using type = unsigned char; };
-	template <> struct make_unsigned<unsigned char> { using type = unsigned char; };
-	template <> struct make_unsigned<signed short> { using type = unsigned short; };
-	template <> struct make_unsigned<unsigned short> { using type = unsigned short; };
-	template <> struct make_unsigned<signed int> { using type = unsigned int; };
-	template <> struct make_unsigned<unsigned int> { using type = unsigned int; };
-	template <> struct make_unsigned<signed long> { using type = unsigned long; };
-	template <> struct make_unsigned<unsigned long> { using type = unsigned long; };
-	template <> struct make_unsigned<signed long long> { using type = unsigned long long; };
-	template <> struct make_unsigned<unsigned long long> { using type = unsigned long long; };
-
-	template <typename T>
-	using make_unsigned_t = typename make_unsigned<T>::type;
-
-
-	template <typename... Xs>
-	using void_t = void;
-
-	template <typename T>
-	struct __stop_declval_eval { static constexpr bool __stop = false; };
-
-	template <typename T, typename U = T&&>
-	U __declval(int);
-
-	template <typename T>
-	T __declval(long);
-
-	template <typename T>
-	auto declval() -> decltype(__declval<T>(0))
-	{
-		static_assert(__stop_declval_eval<T>::__stop, "declval() must not be used!");
-		return __stop_declval_eval<T>::__unknown();
-	}
-
-	template <typename T> T min(const T& a, const T& b) { return a < b ? a : b; }
-	template <typename T> T max(const T& a, const T& b) { return a > b ? a : b; }
-	template <typename T> T abs(const T& x) { return x < 0 ? -x : x; }
-
-	template <typename T>
-	void swap(T& t1, T& t2)
-	{
-		T temp = static_cast<T&&>(t1);
-		t1 = static_cast<T&&>(t2);
-		t2 = static_cast<T&&>(temp);
-	}
-
-#endif
 
 	// is_any<X, A, B, ... Z> -> is_same<X, A> || is_same<X, B> || ...
 	template <typename T, typename... Ts>
@@ -3236,10 +2973,21 @@ namespace nabs
 
 	struct LibraryFinderOptions
 	{
-		bool static_library;
-		std::vector<fs::path> additional_search_folders;
+		// use this to define your own search algorithm. this is always used if it is set.
+		// this is the first field to allow initialising with `{ your_finder_fn }` without using
+		// designated initialisers.
+		std::function<Result<Library, std::string> (const std::string& lib, const LibraryFinderOptions& opts)> custom_searcher;
 
+		bool prefer_static_library = false;
+		bool require_static_library = false;
+		std::vector<fs::path> additional_search_folders = { };
+
+		// this is contingent on pkg-config being available (also works on windows)
 		bool use_pkg_config = true;
+
+		// this is only used on unix (ie. not windows)
+		bool use_usr = true;
+		bool use_usr_local = true;
 	};
 
 	/*
@@ -3418,6 +3166,12 @@ namespace nabs
 	std::vector<std::string_view> split_string(std::string& s, char delim);
 
 	/*
+		Split a string by any whitespace (including \r, \n, \t, ' '). This is useful to emulate
+		shell-isms (or make-isms) that split arguments like that.
+	*/
+	std::vector<std::string_view> split_string_whitespace(std::string& s);
+
+	/*
 		similar to std::stoi, but instead of throwing an exception (seriously...) it returns
 		an optional.
 	*/
@@ -3515,13 +3269,16 @@ namespace nabs
 		 output: whether the the printed should be the input or the output. For linking, you probably
 		         want to show "link foo.exe" instead of "link a.o b.o" etc, so use `true` in this case.
 	*/
-	inline auto default_compiler_logger(bool output, const char* name)
+	inline auto default_compiler_logger(bool output, const char* name, fs::path base = { })
 	{
-		return [=](const fs::path& out, const std::vector<fs::path>& in, const std::vector<std::string>& args) {
+		return [=](const fs::path& out, const std::vector<fs::path>& in, const std::vector<std::string>& args) mutable {
 			(void) args;
 
-			auto relative_path = [](const auto& p) -> auto {
-				return p.lexically_relative(fs::weakly_canonical(fs::path(__FILE__)).parent_path());
+			if(base.empty())
+				base = fs::weakly_canonical(__FILE__).parent_path();
+
+			auto relative_path = [&base](const auto& p) -> auto {
+				return p.lexically_relative(base);
 			};
 
 			if(output)
@@ -4778,6 +4535,9 @@ namespace nabs::dep
 		// add a file, but infer the kind from the filename
 		Item* add(const fs::path& path);
 
+		// add a library. assumes the kind is KIND_SYSTEM_LIBRARY
+		Item* add_system_library(std::string name, LibraryFinderOptions opts = { });
+
 		// Get the item with the given name. For items representing files, the name should be `path.string()`.
 		// if the item with this name/path does not exist, NULL is returned.
 		Item* get(const std::string& name) const;
@@ -5045,6 +4805,13 @@ namespace nabs::dep
 			return it->second;
 		else
 			return nullptr;
+	}
+
+	Item* Graph::add_system_library(std::string name, LibraryFinderOptions opts)
+	{
+		auto item = this->add(KIND_SYSTEM_LIBRARY, std::move(name));
+		item->lib_finder_options = std::move(opts);
+		return item;
 	}
 
 	Item* Graph::add(const fs::path& path) { return this->add(infer_kind_from_filename(path), path); }
@@ -6396,25 +6163,25 @@ namespace nabs::fs
 	/*
 		Same semantics as `find_files`, but it returns files matching the given extension.
 	*/
-	std::vector<fs::path> find_files_with_extension(const fs::path& dir, std::string_view ext);
+	std::vector<fs::path> find_files_ext(const fs::path& dir, std::string_view ext);
 
 	/*
 		Same semantics as `find_files_recursively`, but it returns files matching the given extension.
 	*/
-	std::vector<fs::path> find_files_with_extension_recursively(const fs::path& dir, std::string_view ext);
+	std::vector<fs::path> find_files_ext_recursively(const fs::path& dir, std::string_view ext);
 }
 
 #if !NABS_DECLARATION_ONLY
 namespace nabs::fs
 {
-	std::vector<fs::path> find_files_with_extension(const fs::path& dir, std::string_view ext)
+	std::vector<fs::path> find_files_ext(const fs::path& dir, std::string_view ext)
 	{
 		return find_files(dir, [&ext](auto ent) -> bool {
 			return ent.path().extension() == ext;
 		});
 	}
 
-	std::vector<fs::path> find_files_with_extension_recursively(const fs::path& dir, std::string_view ext)
+	std::vector<fs::path> find_files_ext_recursively(const fs::path& dir, std::string_view ext)
 	{
 		return find_files_recursively(dir, [&ext](auto ent) -> bool {
 			return ent.path().extension() == ext;
@@ -7403,26 +7170,50 @@ namespace nabs
 		return ret;
 	}
 
+	namespace impl
+	{
+		template <typename Predicate>
+		inline std::vector<std::string_view> split_string_pred(std::string& str, Predicate&& pred)
+		{
+			std::string_view view = str;
+			std::vector<std::string_view> ret;
+			while(true)
+			{
+				// chop the leading
+				while(!view.empty() && pred(view.front()))
+					view.remove_prefix(1);
+
+				if(view.empty())
+					break;
+
+				size_t count = 0;
+				while(count < view.size() && !pred(view[count]))
+					count += 1;
+
+				ret.emplace_back(view.data(), count);
+				view.remove_prefix(count);
+			}
+
+			if(!view.empty())
+				ret.emplace_back(view.data(), view.size());
+
+			return ret;
+		}
+	}
+
 	std::vector<std::string_view> split_string(std::string& str, char delim)
 	{
-		std::string_view view = str;
-		std::vector<std::string_view> ret;
-		while(true)
-		{
-			size_t ln = view.find(delim);
-			if(ln != std::string::npos)
-			{
-				ret.emplace_back(view.data(), ln);
-				view.remove_prefix(ln + 1);
-			}
-			else
-			{
-				break;
-			}
-		}
-		if(!view.empty())
-			ret.emplace_back(view.data(), view.length());
-		return ret;
+		return impl::split_string_pred(str, [delim](char c) -> bool {
+			return c == delim;
+		});
+	}
+
+	std::vector<std::string_view> split_string_whitespace(std::string& str)
+	{
+		return impl::split_string_pred(str, [](char c) -> bool {
+			return c == ' ' || c == '\t' || c == '\r' || c == '\n'
+				|| c == '\v' || c == '\f';
+		});
 	}
 
 	std::optional<int64_t> stoi(const std::string& s, int base)
@@ -7571,25 +7362,104 @@ namespace nabs
 			invoke_pkg_config("--cflags", "compiler flags", name, [&lib](auto sv) -> void {
 				if(sv.find("-I") == 0)  lib.include_paths.push_back(sv.substr(2));
 				else                    lib.compiler_flags.push_back(std::string(sv));
-			}, opts.static_library);
+			}, opts.require_static_library);
 
 			invoke_pkg_config("--libs", "linker flags", name, [&lib](auto sv) -> void {
 				if(sv.find("-l") == 0)      lib.libraries.push_back(std::string(sv.substr(2)));
 				else if(sv.find("-L") == 0) lib.library_paths.push_back(sv.substr(2));
 				else                        lib.compiler_flags.push_back(std::string(sv));
-			}, opts.static_library);
+			}, opts.require_static_library);
 
 			return Ok(std::move(lib));
 		}
+
+
+		static Result<Library, std::string> find_in_folder_assuming_unix_convention(const std::string& lib,
+			const fs::path& base, const LibraryFinderOptions& opts)
+		{
+			// TODO(platform): this should probably be a runtime check for host/target
+			#if defined(__APPLE__)
+				constexpr const char* name_prefix       = "lib";
+				constexpr const char* dylib_extension   = ".dylib";
+				constexpr const char* static_extension  = ".a";
+			#elif defined(_WIN32)
+				constexpr const char* name_prefix       = "";
+				constexpr const char* dylib_extension   = ".dll";
+				constexpr const char* static_extension  = ".lib";
+			#else
+				constexpr const char* name_prefix       = "lib";
+				constexpr const char* dylib_extension   = ".so";
+				constexpr const char* static_extension  = ".a";
+			#endif
+
+			// either way, the return value doesn't change.
+			Library ret { };
+
+			ret.name = lib;
+			ret.libraries.push_back(lib);
+			ret.library_paths.push_back(base / "lib");
+			ret.include_paths.push_back(base / "include");
+
+			auto static_lib = base / "lib" / fs::path(name_prefix + lib).replace_extension(static_extension);
+			auto dynamic_lib = base / "lib" / fs::path(name_prefix + lib).replace_extension(dylib_extension);
+
+			// i don't actually know if this makes a difference.
+			if(opts.prefer_static_library)
+			{
+				if(fs::exists(static_lib))
+					return Ok(ret);
+
+				else if(!opts.require_static_library && fs::exists(dynamic_lib))
+					return Ok(ret);
+			}
+			else
+			{
+				if(!opts.require_static_library && fs::exists(dynamic_lib))
+					return Ok(ret);
+
+				else if(fs::exists(static_lib))
+					return Ok(ret);
+			}
+
+			return Err<std::string>(zpr::sprint("library '{}' was not found in {}", lib, base));
+		}
 	}
 
+	// TODO(msvc): find_library() should probably take a Compiler so we know what kind of files to search for
 	Result<Library, std::string> find_library(const std::string& lib, const LibraryFinderOptions& opts)
 	{
+		// search in the additional directories first
+		if(opts.custom_searcher)
+		{
+			auto l = opts.custom_searcher(lib, opts);
+			if(l.ok()) return l;
+		}
+
+		for(auto& dir : opts.additional_search_folders)
+		{
+			auto l = impl::find_in_folder_assuming_unix_convention(lib, dir, opts);
+			if(l.ok()) return l;
+		}
+
 		if(opts.use_pkg_config)
 		{
 			auto l = impl::find_with_pkg_config(opts, lib);
 			if(l.ok()) return l;
 		}
+
+	#if !defined(_WIN32)
+		if(opts.use_usr)
+		{
+			auto l = impl::find_in_folder_assuming_unix_convention(lib, "/usr", opts);
+			if(l.ok()) return l;
+		}
+
+		if(opts.use_usr_local)
+		{
+			auto l = impl::find_in_folder_assuming_unix_convention(lib, "/usr/local", opts);
+			if(l.ok()) return l;
+		}
+	#endif
 
 		return Err<std::string>("bsdf");
 	}
@@ -7614,6 +7484,9 @@ namespace nabs
 	}
 }
 #endif
+
+
+
 
 /*
 	"automatic" compilation
@@ -7681,14 +7554,16 @@ namespace nabs
 		Automatically populate the dependency graph with the right vertices and edges to build an executable
 		from a set of source files, given just the output executable's path, and the list of source files.
 
-		This also accepts a list of <name, option> library pairs; when required, we will automatically call
-		find_library with the name and the provided finding-options to find the library. By providing any
-		library in that list, the following assumptions are made:
+		This also accepts a list of Items that are set as extra dependencies for *ALL* the sources and the
+		final executable. You would mainly fill that list with Items representing KIND_SYSTEM_LIBRARY,
+		although that is not enforced.
+
+		By providing a library in that list, the following assumptions are made:
 		1. Every source file in the list will be compiled with the list of compiler flags for all libraries
 		2. The final executable will be linked with the linker flags (and/or `-l` `-L`) for all libraries
 
-		This function is not responsible for actually building the target (use auto_build_target for that),
-		but it only sets up the dependency chains correctly.
+		This function is not responsible for actually building the target (use auto_build_target for that);
+		it only sets up the dependency chains correctly.
 
 		1. A dependency item is added for the output executable
 		2. Each source file is 'depended-on' by its corresponding object file, named using get_default_object_filename
@@ -7707,8 +7582,7 @@ namespace nabs
 		message as a string -- typically this is the path of the target that failed to compile.
 	*/
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
-		const fs::path& exe, const std::vector<fs::path>& files,
-		const std::vector<std::pair<std::string, LibraryFinderOptions>>& libraries = { });
+		const fs::path& exe, const std::vector<fs::path>& files, const std::vector<dep::Item*>& extra_dependencies = { });
 
 
 	/*
@@ -8139,23 +8013,15 @@ namespace nabs
 
 	// TODO: refactor this out into more constituent parts (eg. auto_objects_from_sources)
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
-		const fs::path& _exe_name, const std::vector<fs::path>& src_files,
-		const std::vector<std::pair<std::string, LibraryFinderOptions>>& libraries)
+		const fs::path& _exe_name, const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_dependencies)
 	{
 		using namespace dep;
 
 		auto exe_name = impl::ensure_exe_extension_if_necessary(toolchain.ld, toolchain.ldflags, _exe_name);
 		auto exe_file = graph.get_or_add(KIND_EXE, exe_name);
 
-		auto libs = map(libraries, [&graph](const auto& thing) {
-			auto lib_item = graph.get_or_add(KIND_SYSTEM_LIBRARY, thing.first);
-			lib_item->lib_finder_options = thing.second;
-
-			return lib_item;
-		});
-
-		for(auto lib : libs)
-			exe_file->depend(lib);
+		for(auto edep : extra_dependencies)
+			exe_file->depend(edep);
 
 		for(auto& f : src_files)
 		{
@@ -8176,8 +8042,8 @@ namespace nabs
 			exe_file->add_produced_by(obj);
 
 			// depend on the libraries
-			for(auto lib : libs)
-				obj->depend(lib);
+			for(auto edep : extra_dependencies)
+				obj->depend(edep);
 
 			// also setup the header depends for the source
 			read_dependencies_from_file(graph, get_dependency_filename(compiler, flags, f));
@@ -8196,9 +8062,9 @@ namespace nabs
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
 		const fs::path& exe_name, const std::vector<fs::path>& src_files, const std::vector<std::string>& libraries)
 	{
-		std::vector<std::pair<std::string, LibraryFinderOptions>> libs;
+		std::vector<dep::Item*> libs;
 		for(auto& lib : libraries)
-			libs.push_back({ lib, LibraryFinderOptions { } });
+			libs.push_back(graph.add_system_library(lib));
 
 		return auto_executable_from_sources(graph, toolchain, exe_name, src_files, libs);
 	}
@@ -8263,19 +8129,20 @@ namespace nabs
 
 /*
 	TODOs:
-	2.  A sane API for libraries. Right now, we can probably make auto_executable_from_sources accept
-		a LibraryFinderOptions + std::vector<std::string>, but that's not very flexible:
-		(a) every library would have to use the same options
-		(b) every object would depend on those libraries; this might not be the case
-			-- while this is not an obvious concern, some libraries' defines and include dirs might mess
-				with compilation for object files that don't depend on it.
-			-- for example, here we would not compile utf8proc with the -I for openssl (even though
-				it won't affect it)
-
-		(c) similar to (b), every object would depend on every library. again, this might not be good practice.
-
 	3.  auto_objects_from_sources, which does 90% of the work of auto_executable_from_sources. It just
 		returns a list of the object files, minus the executable stuff. This would also need some way of
 		specifying libraries, probably in the same way
 */
 
+
+
+
+
+/*
+	Version History
+	===============
+
+	0.1.0 - 03/05/2021
+	------------------
+	Initial release.
+*/
