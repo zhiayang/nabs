@@ -2781,6 +2781,36 @@ namespace zmt
 // async operations (threadpool, futures)
 namespace zmt
 {
+	// workaround a gcc bug: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=85282
+	namespace impl
+	{
+		template <typename E>
+		struct future_internals
+		{
+			future_internals() { cv.set(false); }
+
+			E value;
+			condvar<bool> cv;
+			bool discard = false;
+
+			future_internals(future_internals&& f) = delete;
+			future_internals& operator = (future_internals&& f) = delete;
+		};
+
+		template <>
+		struct future_internals<void>
+		{
+			future_internals() { discard = false; cv.set(false); }
+
+			condvar<bool> cv;
+			bool discard;
+
+			future_internals(future_internals&& f) = delete;
+			future_internals& operator = (future_internals&& f) = delete;
+		};
+	}
+
+
 	template <typename T>
 	struct future
 	{
@@ -2822,12 +2852,12 @@ namespace zmt
 
 		~future() { if(this->state && !this->state->discard) { this->state->cv.wait(true); } }
 
-		future() { this->state = std::make_shared<internal_state<T>>(); this->state->cv.set(false); }
+		future() { this->state = std::make_shared<impl::future_internals<T>>(); this->state->cv.set(false); }
 
 		template <typename F = T>
 		future(std::enable_if_t<!std::is_same_v<void, F>, T>&& val)
 		{
-			this->state = std::make_shared<internal_state<T>>();
+			this->state = std::make_shared<impl::future_internals<T>>();
 			this->state->value = val;
 			this->state->cv.set(true);
 		}
@@ -2855,36 +2885,10 @@ namespace zmt
 	private:
 		friend struct ThreadPool;
 
-		template <typename E>
-		struct internal_state
-		{
-			internal_state() { cv.set(false); }
-
-			E value;
-			condvar<bool> cv;
-			bool discard = false;
-
-			internal_state(internal_state&& f) = delete;
-			internal_state& operator = (internal_state&& f) = delete;
-		};
-
-		template <>
-		struct internal_state<void>
-		{
-			internal_state() { discard = false; cv.set(false); }
-
-			condvar<bool> cv;
-			bool discard;
-
-			internal_state(internal_state&& f) = delete;
-			internal_state& operator = (internal_state&& f) = delete;
-		};
-
-
-		future(std::shared_ptr<internal_state<T>> st) : state(st) { }
+		future(std::shared_ptr<impl::future_internals<T>> st) : state(st) { }
 		future clone() { return future(this->state); }
 
-		std::shared_ptr<internal_state<T>> state;
+		std::shared_ptr<impl::future_internals<T>> state;
 	};
 
 	struct ThreadPool
@@ -5019,10 +5023,6 @@ namespace nabs::dep
 		auto contents = fs::read_file(dependency_file).expect("failed to read file");
 		auto lines = split_string_lines(contents);
 
-		// TODO: good job, we need to handle unescaping spaces in this filename.
-		// spaces are prepended with a backslash. good thing we can't have backslashes in filenames, right?
-		// WRONG, linux lets you have \ in filenames.
-
 		auto parse_till_space = [](std::string_view& line) -> std::string {
 			std::string ret;
 			line = trim_whitespace(line);
@@ -5698,20 +5698,20 @@ namespace nabs
 			return f;
 		}
 
-		static void setup_args_for_compiling_to_obj(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts,
-			const std::optional<fs::path>& output, const fs::path& file)
+		static fs::path setup_args_for_compiling_to_obj(std::vector<std::string>& args, const Compiler& cmp,
+			const CompilerFlags& opts, const std::optional<fs::path>& output, const fs::path& file)
 		{
 			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 			{
 				args.push_back("-c");
-				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
+				return impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 			}
 			else if(cmp.kind == Compiler::KIND_MSVC_CL)
 			{
 				args.push_back("/nologo");
 
 				args.push_back("/c");
-				impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
+				return impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 			}
 			else
 			{
@@ -5907,6 +5907,8 @@ namespace nabs
 
 	fs::path get_dependency_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path file)
 	{
+		(void) cmp;
+
 		// i guess we emit the same file for every compiler.
 		if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
 		{
@@ -6026,11 +6028,9 @@ namespace nabs
 		const fs::path& file)
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
-		impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
+		auto out_name = impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
 		impl::add_flags_for_precompiled_header(args, cmp, opts, /* linking: */ false);
 		impl::setup_exception_args(args, cmp, opts);
-
-		auto out_name = impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 		impl::set_flags_for_dependency_file(args, cmp, opts, file);
 
 		args.push_back(file.string());
@@ -7318,7 +7318,6 @@ namespace nabs
 		zmt::Synchronised<GlobalState> state { };
 		zmt::Synchronised<GlobalState>& global_state()
 		{
-			// TODO: NOT THREAD SAFE AT ALL
 			return state;
 		}
 	}
@@ -7657,6 +7656,13 @@ namespace nabs
 			return kind == dep::KIND_PHONY || kind == dep::KIND_SYSTEM_LIBRARY;
 		}
 
+		// same thing here, make this user-extendable somehow
+		static bool is_kind_sourcefile(int kind)
+		{
+			return kind == dep::KIND_C_SOURCE || kind == dep::KIND_CPP_SOURCE
+				|| kind == dep::KIND_OBJC_SOURCE || kind == dep::KIND_OBJCPP_SOURCE;
+		}
+
 
 		/*
 			this function takes a target that is known to be KIND_SYSTEM_LIBRARY, and walks its
@@ -7724,8 +7730,8 @@ namespace nabs
 			So when we are compiling something that has KIND_SYSTEM_LIBRARY as a dependency, we do the
 			recursively_traverse_system_libraries thing above.
 		*/
-		static Result<void, std::string> auto_compile_one_thing(const dep::Graph& graph, dep::Item* target,
-			const Toolchain& tc, const AutoCompileHooks& hooks)
+		static Result<void, std::string> auto_compile_one_thing(dep::Item* target, const Toolchain& tc,
+			const AutoCompileHooks& hooks)
 		{
 			using namespace nabs::dep;
 
@@ -7784,9 +7790,8 @@ namespace nabs
 
 				if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
 					return Err(foo.error());
-
-				else if(foo.unwrap())
-					rebuild = true;
+				else
+					rebuild = foo.unwrap();
 
 			}
 
@@ -7804,8 +7809,9 @@ namespace nabs
 					// "rebuilt", which involves (a) pkg-config-ing them if not cached, and more importantly
 					// (b) adding to the depended_libs list, which our object file will then use.
 					if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
+					{
 						return Err(foo.error());
-
+					}
 					else if(foo.unwrap())
 					{
 						if(auto r = recursively_traverse_system_libraries(dep, depended_libs); !r.ok())
@@ -7816,14 +7822,9 @@ namespace nabs
 
 			// now, we check if the target is actually KIND_PHONY. in this case, it has no commands that it
 			// needs to run, so we quit now. note that phonyLIKE targets get past here and still get to "build".
-			if(!rebuild || target->kind() == KIND_PHONY)
+			if(!rebuild || target->kind() == KIND_PHONY || is_kind_sourcefile(target->kind()))
 				return Ok();
 
-			if(auto k = target->kind(); k == KIND_C_SOURCE || k == KIND_CPP_SOURCE
-				|| k == KIND_OBJC_SOURCE || k == KIND_OBJCPP_SOURCE)
-			{
-				return Ok();
-			}
 
 			if(target->kind() == KIND_OBJECT)
 			{
@@ -7917,7 +7918,7 @@ namespace nabs
 		{
 			for(auto& target : targets)
 			{
-				if(auto e = impl::auto_compile_one_thing(graph, target, toolchain, hooks); !e.ok())
+				if(auto e = impl::auto_compile_one_thing(target, toolchain, hooks); !e.ok())
 					return e;
 			}
 		}
@@ -7940,8 +7941,8 @@ namespace nabs
 
 			for(auto& target : targets)
 			{
-				futures.push_back(pool.run([&toolchain, &hooks, &graph, &target, &results]() {
-					auto ret = impl::auto_compile_one_thing(graph, target, toolchain, hooks);
+				futures.push_back(pool.run([&toolchain, &hooks, &target, &results]() {
+					auto ret = impl::auto_compile_one_thing(target, toolchain, hooks);
 					results.push(std::move(ret));
 				}));
 			}
@@ -8148,5 +8149,11 @@ namespace nabs
 		the solution to (b) is either
 		(i)  have a method on the Toolchain, something like `use_c_pch()` that adds to both the cflags and the ldflags
 		(ii) not actually do anything about it and force the recipe to set it manually
+
+
+	5.  a similar situation exists for the `-pthread` flag -- you must specify it for both the compiler and the linker
+		to be safe, and so it becomes very awkward to use.
+
+		a potential solution is to go with methods on Toolchain that setup the flags appropriately...
 */
 
