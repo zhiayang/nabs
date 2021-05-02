@@ -12,6 +12,8 @@ The primary objective of this (not a) build system is to allow writing build rec
 4. provide platform- and compiler-independent abstractions for common flags/options
 
 
+### example
+
 While the documentation is not quite there yet, we already have a lot of features. For example, to
 create a build recipe that *automatically*:
 
