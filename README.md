@@ -56,6 +56,23 @@ int main(int argc, char** argv)
 }
 ```
 
+### missing features
+
+Some things are still not implemented:
+
+1. Any form of cross compilation support
+    - looking for toolchains in another folder (ie. anywhere other than the default)
+    - specifying prefixes, sysroots, etc.
+
+2. Searching for libraries using something other than `pkg-config`
+    - eg. looking in `/usr/lib` and `/usr/local/lib`
+    - any form of library searching on windows
+
+3. Misc features
+    - creating shared/static libraries
+    - more "automatic" argument parsing (eg. automatically handle stuff like `-j`, `--help`)
+
+
 
 
 ### license
