@@ -3185,27 +3185,6 @@ namespace nabs
 		Result<std::string, std::string> read_file(const fs::path& file);
 	}
 
-	struct Library
-	{
-		std::string name;
-		std::string version;
-
-		std::vector<fs::path> include_paths;
-		std::vector<std::string> compiler_flags;
-
-		std::vector<fs::path> library_paths;
-		std::vector<std::string> libraries;
-		std::vector<std::string> linker_flags;
-	};
-
-	struct LibraryFinderOptions
-	{
-		bool static_library;
-		std::vector<fs::path> additional_search_folders;
-
-		bool use_pkg_config = true;
-	};
-
 	namespace impl
 	{
 		template <typename... Args>
@@ -3220,18 +3199,6 @@ namespace nabs
 		{
 			impl::__logger(-1, static_cast<Args&&>(args)...);
 		}
-
-		struct GlobalState
-		{
-			bool pkg_config_exists;
-			bool pkg_config_checked;
-
-			std::unordered_map<std::string, Library> cached_libraries;
-
-			fs::path cached_windows_sdk_root;
-		};
-
-		zmt::Synchronised<GlobalState>& global_state();
 	}
 
 	namespace os
@@ -3253,6 +3220,183 @@ namespace nabs
 
 		std::string get_environment_var(const std::string& name);
 	}
+
+	struct Library
+	{
+		std::string name;
+		std::string version;
+
+		std::vector<fs::path> include_paths;
+		std::vector<std::string> compiler_flags;
+
+		std::vector<fs::path> library_paths;
+		std::vector<std::string> libraries;
+		std::vector<std::string> linker_flags;
+	};
+
+	struct LibraryFinderOptions
+	{
+		bool static_library;
+		std::vector<fs::path> additional_search_folders;
+
+		bool use_pkg_config = true;
+	};
+
+	/*
+		A list of languages supported by nabs. This is not an enumeration because we want
+		to make this user-extendable... probably.
+	*/
+	inline constexpr int LANGUAGE_C         = 1;
+	inline constexpr int LANGUAGE_CPP       = 2;
+	inline constexpr int LANGUAGE_OBJC      = 3;
+	inline constexpr int LANGUAGE_OBJCPP    = 4;
+
+	/*
+		Encapsulates a particular binary as a compiler. This can actually represent a compiler, a linker,
+		an assembler, objcopy, whatever you want.
+	*/
+	struct Compiler
+	{
+		// the path to the compiler binary. if you used find_*_compiler or find_toolchain, then this should exist.
+		fs::path path;
+
+		// the 'kind' of the compiler, which (for now) is either clang, gcc, or msvc's cl.exe
+		int kind;
+
+		// the language of the compiler, which (for now) is either C or C++.
+		int lang;
+
+		// a log hook that you can set to perform things (mostly logging) before the compiler is invoked.
+		// you can use default_compiler_logger for a default logging style, although compilers returned by
+		// find_toolchain already have this setup appropriately.
+		std::function<void (const fs::path&, const std::vector<fs::path>&, const std::vector<std::string>&)> log_hook;
+
+		static constexpr int KIND_UNKNOWN   = 0;
+		static constexpr int KIND_CLANG     = 1;
+		static constexpr int KIND_GCC       = 2;
+		static constexpr int KIND_MSVC_CL   = 3;
+		static constexpr int KIND_MSVC_LINK = 4;
+	};
+
+	/*
+		Encapsulates a set of flags that you pass to a compiler-like binary. Some of the fields
+		only make sense for C/C++ compilers (eg. include flags, language standard), but you can
+		just use the `options` field to pass whatever flags you want.
+	*/
+	struct CompilerFlags
+	{
+		// additional options to pass to the compiler; these are not checked, and are passed as-is.
+		std::vector<std::string> options;
+
+		// list of additional include paths (obviously, don't include the '-I', it's just a path)
+		std::vector<fs::path> include_paths;
+
+		// names of libraries to pass to the compiler; they are passed as
+		// -lfoo for `foo` (on gcc/clang), so don't include the `-l` yourself
+		std::vector<std::string> libraries;
+
+		// additional search paths for libraries, these are passed via `-L` on gcc
+		// and /link /LIBPATH on msvc. Again, don't include the -L yourself (it's just the path)
+		std::vector<fs::path> library_paths;
+
+		// list of defines (passed via -D for gcc, /D for msvc). If the value is empty,
+		// it is equivalent to passing -DFOO without any '='.
+		std::map<std::string, std::string> defines;
+
+		// folder for the intermediate files (.o, .d, objs, pdbs, that stuff)
+		// if this is empty, they'll be generated next to the source file.
+		// intermediate files will never appear in the "current directory"
+		// (ie. wherever you're running `nabs` from)
+		fs::path intermediate_output_folder;
+
+		// list of forced-includes (as if via `-include <filename>` or `/FI`)
+		std::vector<fs::path> forced_includes;
+
+		// create any missing folders in any output file paths, as if by `mkdir -p`
+		bool create_missing_folders = false;
+
+		// the language standard. this is a string because i can't be bothered right now
+		// (also because there's like c++latest on msvc, 0x/1y/1z/2a on gcc/clang)
+		std::string language_standard;
+
+		// generate header dependencies using -MMD (gcc/clang) or /showIncludes (msvc cl.exe)
+		bool generate_header_dependencies = false;
+
+		// a header to use as a precompiled header (optional)
+		fs::path precompiled_header;
+
+		// frameworks, passed via `-framework`. This is only applicable for Clang on macOS/apple targets,
+		// and nowhere else.
+		std::vector<std::string> frameworks;
+
+		// whether exceptions are disabled. for compatibility with "normal" c++ projects, this is false by default.
+		bool exceptions_disabled = false;
+
+		// only applies if the compiler/linker is msvc 'cl.exe' or 'link.exe'. specify whether or not to append
+		// .exe to the output name if it did not end in '.exe'. Windows (apparently) has trouble executing files
+		// if they don't end in '.exe', so this is TRUE by default.
+		bool msvc_ensure_exe_extension = true;
+
+		// only applicable for gcc/clang, and only on linux (but we still pass it, because it's apparently a
+		// "well-established" method, even if the OS doesn't require it)
+		bool need_pthreads = false;
+
+
+		// these are internal things -- don't set them directly!
+
+		// a list of all precompiled headers; this is only used by `ldflags`, because of msvc.
+		std::vector<fs::path> _precompiled_headers_for_linker;
+	};
+
+	/*
+		This structure simply encapsulates a set of compilers, so you can pass this around easily.
+		You can use find_toolchain() to get a Toolchain struct with sane defaults for your current
+		environment, if a sane default exists.
+	*/
+	struct Toolchain
+	{
+		Compiler cc;
+		CompilerFlags cflags;
+
+		Compiler cxx;
+		CompilerFlags cxxflags;
+
+		Compiler objcc;
+		CompilerFlags objcflags;
+
+		Compiler objcxx;
+		CompilerFlags objcxxflags;
+
+		Compiler ld;
+		CompilerFlags ldflags;
+
+
+		// helper methods
+		Toolchain& add_c_flags(const std::vector<std::string>& flags);
+		Toolchain& add_cpp_flags(const std::vector<std::string>& flags);
+
+		Toolchain& add_c_includes(const std::vector<fs::path>& includes);
+		Toolchain& add_cpp_includes(const std::vector<fs::path>& includes);
+
+		Toolchain& use_c_precompiled_header(const fs::path& header);
+		Toolchain& use_cpp_precompiled_header(const fs::path& header);
+
+		Toolchain& define(const std::string& name, const std::string& value = "");
+		Toolchain& define_c(const std::string& name, const std::string& value = "");
+		Toolchain& define_cpp(const std::string& name, const std::string& value = "");
+
+		Toolchain& use_threads(bool use);
+		Toolchain& use_exceptions(bool use);
+
+		template <typename... Flags> Toolchain& add_c_flags(Flags&&... flags);
+		template <typename... Flags> Toolchain& add_cpp_flags(Flags&&... flags);
+
+		template <typename... Includes> Toolchain& add_c_includes(Includes&&... includes);
+		template <typename... Includes> Toolchain& add_cpp_includes(Includes&&... includes);
+	};
+
+
+
 
 	/*
 		Returns a copy of `s` with leading and trailing whitespace (\t, \n, ' ', \v, \f, \r)
@@ -3362,125 +3506,6 @@ namespace nabs
 	}
 
 	/*
-		A list of languages supported by nabs. This is not an enumeration because we want
-		to make this user-extendable... probably.
-	*/
-	inline constexpr int LANGUAGE_C         = 1;
-	inline constexpr int LANGUAGE_CPP       = 2;
-	inline constexpr int LANGUAGE_OBJC      = 3;
-	inline constexpr int LANGUAGE_OBJCPP    = 4;
-
-	/*
-		Encapsulates a particular binary as a compiler. This can actually represent a compiler, a linker,
-		an assembler, objcopy, whatever you want.
-	*/
-	struct Compiler
-	{
-		// the path to the compiler binary. if you used find_*_compiler or find_toolchain, then this should exist.
-		fs::path path;
-
-		// the 'kind' of the compiler, which (for now) is either clang, gcc, or msvc's cl.exe
-		int kind;
-
-		// the language of the compiler, which (for now) is either C or C++.
-		int lang;
-
-		// a log hook that you can set to perform things (mostly logging) before the compiler is invoked.
-		// you can use default_compiler_logger for a default logging style, although compilers returned by
-		// find_toolchain already have this setup appropriately.
-		std::function<void (const fs::path&, const std::vector<fs::path>&, const std::vector<std::string>&)> log_hook;
-
-		static constexpr int KIND_UNKNOWN   = 0;
-		static constexpr int KIND_CLANG     = 1;
-		static constexpr int KIND_GCC       = 2;
-		static constexpr int KIND_MSVC_CL   = 3;
-		static constexpr int KIND_MSVC_LINK = 4;
-	};
-
-	/*
-		Encapsulates a set of flags that you pass to a compiler-like binary. Some of the fields
-		only make sense for C/C++ compilers (eg. include flags, language standard), but you can
-		just use the `options` field to pass whatever flags you want.
-	*/
-	struct CompilerFlags
-	{
-		// additional options to pass to the compiler; these are not checked, and are passed as-is.
-		std::vector<std::string> options;
-
-		// list of additional include paths (obviously, don't include the '-I', it's just a path)
-		std::vector<fs::path> include_paths;
-
-		// names of libraries to pass to the compiler; they are passed as
-		// -lfoo for `foo` (on gcc/clang), so don't include the `-l` yourself
-		std::vector<std::string> libraries;
-
-		// additional search paths for libraries, these are passed via `-L` on gcc
-		// and /link /LIBPATH on msvc. Again, don't include the -L yourself (it's just the path)
-		std::vector<fs::path> library_paths;
-
-		// list of defines (passed via -D for gcc, /D for msvc). If the value is empty,
-		// it is equivalent to passing -DFOO without any '='.
-		std::map<std::string, std::string> defines;
-
-		// folder for the intermediate files (.o, .d, objs, pdbs, that stuff)
-		// if this is empty, they'll be generated next to the source file.
-		// intermediate files will never appear in the "current directory"
-		// (ie. wherever you're running `nabs` from)
-		fs::path intermediate_output_folder;
-
-		// list of forced-includes (as if via `-include <filename>` or `/FI`)
-		std::vector<fs::path> forced_includes;
-
-		// create any missing folders in any output file paths, as if by `mkdir -p`
-		bool create_missing_folders = false;
-
-		// the language standard. this is a string because i can't be bothered right now
-		// (also because there's like c++latest on msvc, 0x/1y/1z/2a on gcc/clang)
-		std::string language_standard;
-
-		// generate header dependencies using -MMD (gcc/clang) or /showIncludes (msvc cl.exe)
-		bool generate_header_dependencies = false;
-
-		// a header to use as a precompiled header (optional)
-		fs::path precompiled_header;
-
-		// frameworks, passed via `-framework`. This is only applicable for Clang on macOS/apple targets,
-		// and nowhere else.
-		std::vector<std::string> frameworks;
-
-		// whether exceptions are disabled. for compatibility with "normal" c++ projects, this is false by default.
-		bool exceptions_disabled = false;
-
-		// only applies if the compiler/linker is msvc 'cl.exe' or 'link.exe'. specify whether or not to append
-		// .exe to the output name if it did not end in '.exe'. Windows (apparently) has trouble executing files
-		// if they don't end in '.exe', so this is TRUE by default.
-		bool msvc_ensure_exe_extension = true;
-	};
-
-	/*
-		This structure simply encapsulates a set of compilers, so you can pass this around easily.
-		You can use find_toolchain() to get a Toolchain struct with sane defaults for your current
-		environment, if a sane default exists.
-	*/
-	struct Toolchain
-	{
-		Compiler cc;
-		CompilerFlags cflags;
-
-		Compiler cxx;
-		CompilerFlags cxxflags;
-
-		Compiler objcc;
-		CompilerFlags objcflags;
-
-		Compiler objcxx;
-		CompilerFlags objcxxflags;
-
-		Compiler ld;
-		CompilerFlags ldflags;
-	};
-
-	/*
 		a very strange function. its sole purpose is to be used as `log_hook` in the Compiler. because we
 		cannot easily use string literals in template parameters (pre-C++20), it is taken as a normal
 		parameter, and this function returns a lambda.
@@ -3510,6 +3535,21 @@ namespace nabs
 				}));
 			}
 		};
+	}
+
+	namespace impl
+	{
+		struct GlobalState
+		{
+			bool pkg_config_exists;
+			bool pkg_config_checked;
+
+			std::unordered_map<std::string, Library> cached_libraries;
+
+			fs::path cached_windows_sdk_root;
+		};
+
+		zmt::Synchronised<GlobalState>& global_state();
 	}
 }
 
@@ -5152,6 +5192,110 @@ namespace nabs
 #if !NABS_DECLARATION_ONLY
 namespace nabs
 {
+	// methods for toolchain
+	Toolchain& Toolchain::add_c_flags(const std::vector<std::string>& flags)
+	{
+		this->cflags.options.insert(this->cflags.options.end(), flags.begin(), flags.end());
+		return *this;
+	}
+
+	Toolchain& Toolchain::add_cpp_flags(const std::vector<std::string>& flags)
+	{
+		this->cxxflags.options.insert(this->cxxflags.options.end(), flags.begin(), flags.end());
+		return *this;
+	}
+
+	Toolchain& Toolchain::add_c_includes(const std::vector<fs::path>& includes)
+	{
+		this->cflags.include_paths.insert(this->cflags.include_paths.end(), includes.begin(), includes.end());
+		return *this;
+	}
+
+	Toolchain& Toolchain::add_cpp_includes(const std::vector<fs::path>& includes)
+	{
+		this->cxxflags.include_paths.insert(this->cxxflags.include_paths.end(), includes.begin(), includes.end());
+		return *this;
+	}
+
+	Toolchain& Toolchain::use_c_precompiled_header(const fs::path& header)
+	{
+		this->cflags.precompiled_header = header;
+		this->ldflags._precompiled_headers_for_linker.push_back(header);
+		return *this;
+	}
+
+	Toolchain& Toolchain::use_cpp_precompiled_header(const fs::path& header)
+	{
+		this->cxxflags.precompiled_header = header;
+		this->ldflags._precompiled_headers_for_linker.push_back(header);
+		return *this;
+	}
+
+	Toolchain& Toolchain::define(const std::string& name, const std::string& value)
+	{
+		this->define_c(name, value);
+		this->define_cpp(name, value);
+		return *this;
+	}
+
+	Toolchain& Toolchain::define_c(const std::string& name, const std::string& value)
+	{
+		this->cflags.defines[name] = value;
+		return *this;
+	}
+
+	Toolchain& Toolchain::define_cpp(const std::string& name, const std::string& value)
+	{
+		this->cxxflags.defines[name] = value;
+		return *this;
+	}
+
+	Toolchain& Toolchain::use_threads(bool use)
+	{
+		this->cflags.need_pthreads = use;
+		this->cxxflags.need_pthreads = use;
+		this->ldflags.need_pthreads = use;
+		return *this;
+	}
+
+	Toolchain& Toolchain::use_exceptions(bool use)
+	{
+		this->cflags.exceptions_disabled = !use;
+		this->cxxflags.exceptions_disabled = !use;
+		this->ldflags.exceptions_disabled = !use;
+		return *this;
+	}
+
+	template <typename... Includes>
+	Toolchain& Toolchain::add_c_includes(Includes&&... includes)
+	{
+		this->cflags.include_paths.insert(this->cflags.include_paths.end(), { static_cast<Includes&&>(includes)... });
+		return *this;
+	}
+
+	template <typename... Includes>
+	Toolchain& Toolchain::add_cpp_includes(Includes&&... includes)
+	{
+		this->cxxflags.include_paths.insert(this->cxxflags.include_paths.end(), { static_cast<Includes&&>(includes)... });
+		return *this;
+	}
+
+	template <typename... Flags>
+	Toolchain& Toolchain::add_c_flags(Flags&&... flags)
+	{
+		this->cflags.options.insert(this->cflags.options.end(), { static_cast<Flags&&>(flags)... });
+		return *this;
+	}
+
+	template <typename... Flags>
+	Toolchain& Toolchain::add_cpp_flags(Flags&&... flags)
+	{
+		this->cxxflags.options.insert(this->cxxflags.options.end(), { static_cast<Flags&&>(flags)... });
+		return *this;
+	}
+
+
+
 	namespace impl
 	{
 		static std::vector<fs::path> get_path_variable()
@@ -5533,6 +5677,9 @@ namespace nabs
 
 				if(!opts.language_standard.empty())
 					args.push_back(zpr::sprint("-std={}", opts.language_standard));
+
+				if(opts.need_pthreads)
+					args.push_back("-pthread");
 			}
 			else if(cmp.kind == Compiler::KIND_MSVC_CL)
 			{
@@ -5727,38 +5874,37 @@ namespace nabs
 			// the `generate_header_dependencies` flag in the compiler options, and use the
 			// dependency graph functionality (either via auto_*, or manually on your own) to
 			// ensure that the pch is recompiled if anything it includes changes.
-			if(auto hdr = opts.precompiled_header; !hdr.empty())
+			if(linking)
 			{
-				if(linking)
+				if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
 				{
-					if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
-					{
-						// msvc generates an obj for the pch; we generated it with the default name,
-						// so all we need to do is just link it in.
-						args.push_back(get_default_object_filename(cmp, opts, hdr).string());
-					}
+					// msvc generates an obj for the pch; we generated it with the default name,
+					// so all we need to do is just link it in.
+					// args.push_back(get_default_object_filename(cmp, opts, hdr).string());
+					for(auto& pch : opts._precompiled_headers_for_linker)
+						args.push_back(get_default_object_filename(cmp, opts, pch).string());
+				}
+			}
+			else if(auto hdr = opts.precompiled_header; !hdr.empty())
+			{
+				if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				{
+					args.push_back("-include");
+					args.push_back(hdr.string());
+				}
+				else if(cmp.kind == Compiler::KIND_MSVC_CL)
+				{
+					auto pch = get_default_pch_filename(cmp, opts, hdr);
+					auto quoted_pch = quote_argument(fs::weakly_canonical(pch).string());
+					auto quoted_hdr = quote_argument(fs::weakly_canonical(hdr).string());
+
+					args.push_back(zpr::sprint("/FI{}", quoted_hdr));
+					args.push_back(zpr::sprint("/Yu{}", quoted_hdr));
+					args.push_back(zpr::sprint("/Fp{}", quoted_pch));
 				}
 				else
 				{
-					if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
-					{
-						args.push_back("-include");
-						args.push_back(hdr.string());
-					}
-					else if(cmp.kind == Compiler::KIND_MSVC_CL)
-					{
-						auto pch = get_default_pch_filename(cmp, opts, hdr);
-						auto quoted_pch = quote_argument(fs::weakly_canonical(pch).string());
-						auto quoted_hdr = quote_argument(fs::weakly_canonical(hdr).string());
-
-						args.push_back(zpr::sprint("/FI{}", quoted_hdr));
-						args.push_back(zpr::sprint("/Yu{}", quoted_hdr));
-						args.push_back(zpr::sprint("/Fp{}", quoted_pch));
-					}
-					else
-					{
-						impl::int_error("add_flags_for_precompiled_header(): unsupported compiler");
-					}
+					impl::int_error("add_flags_for_precompiled_header(): unsupported compiler");
 				}
 			}
 		}
@@ -7602,24 +7748,24 @@ namespace nabs
 		Lastly, you can provide a `AutoCompileHooks` structure which lets you:
 		1. modify the flags just before compilation starts  -- modify_flags
 	*/
-	Result<void, std::string> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
-		const dep::Graph& graph, const std::vector<dep::Item*>& targets);
+	Result<void, std::string> auto_build_targets(const Toolchain& toolchain, const dep::Graph& graph,
+		const std::vector<dep::Item*>& targets, const AutoCompileHooks& hooks = { });
 
 	/*
 		Identical to auto_build_targets, but it is just a wrapper that builds only one target.
 	*/
-	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
-		const dep::Graph& graph, dep::Item* target);
+	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const dep::Graph& graph,
+		dep::Item* target, const AutoCompileHooks& hooks = { });
 
 	/*
 		Identical to the overloads above, but using the provided thread pool for parallel job execution.
 		This means that the overloads not taking a ThreadPool are single-threaded.
 	*/
 	Result<void, std::string> auto_build_targets(zmt::ThreadPool& pool, const Toolchain& toolchain,
-		const AutoCompileHooks& hooks, const dep::Graph& graph, const std::vector<dep::Item*>& targets);
+		const dep::Graph& graph, const std::vector<dep::Item*>& targets, const AutoCompileHooks& hooks = { });
 
 	Result<void, std::string> auto_build_target(zmt::ThreadPool& pool, const Toolchain& toolchain,
-		const AutoCompileHooks& hooks, const dep::Graph& graph, dep::Item* target);
+		const dep::Graph& graph, dep::Item* target, const AutoCompileHooks& hooks = { });
 
 
 
@@ -7911,8 +8057,8 @@ namespace nabs
 	}
 
 
-	Result<void, std::string> auto_build_targets(const Toolchain& toolchain, const AutoCompileHooks& hooks,
-		const dep::Graph& graph, const std::vector<dep::Item*>& targets)
+	Result<void, std::string> auto_build_targets(const Toolchain& toolchain, const dep::Graph& graph,
+		const std::vector<dep::Item*>& targets, const AutoCompileHooks& hooks)
 	{
 		auto order = graph.topological_sort(targets)
 			.expect("failed to find a valid dependency order");
@@ -7930,7 +8076,7 @@ namespace nabs
 	}
 
 	Result<void, std::string> auto_build_targets(zmt::ThreadPool& pool, const Toolchain& toolchain,
-		const AutoCompileHooks& hooks, const dep::Graph& graph, const std::vector<dep::Item*>& targets)
+		const dep::Graph& graph, const std::vector<dep::Item*>& targets, const AutoCompileHooks& hooks)
 	{
 		auto order = graph.topological_sort(targets)
 			.expect("failed to find a valid dependency order");
@@ -7977,15 +8123,15 @@ namespace nabs
 
 
 	Result<void, std::string> auto_build_target(zmt::ThreadPool& pool, const Toolchain& toolchain,
-		const AutoCompileHooks& hooks, const dep::Graph& graph, dep::Item* target)
+		const dep::Graph& graph, dep::Item* target, const AutoCompileHooks& hooks)
 	{
-		return auto_build_targets(pool, toolchain, hooks, graph, { target });
+		return auto_build_targets(pool, toolchain, graph, { target }, hooks);
 	}
 
-	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const AutoCompileHooks& hooks,
-		const dep::Graph& graph, dep::Item* target)
+	Result<void, std::string> auto_build_target(const Toolchain& toolchain, const dep::Graph& graph,
+		dep::Item* target, const AutoCompileHooks& hooks)
 	{
-		return auto_build_targets(toolchain, hooks, graph, { target });
+		return auto_build_targets(toolchain, graph, { target }, hooks);
 	}
 
 
@@ -8128,35 +8274,8 @@ namespace nabs
 
 		(c) similar to (b), every object would depend on every library. again, this might not be good practice.
 
-
 	3.  auto_objects_from_sources, which does 90% of the work of auto_executable_from_sources. It just
 		returns a list of the object files, minus the executable stuff. This would also need some way of
 		specifying libraries, probably in the same way
-
-
-	4.  right now to use precompiled headers on windows, we need to set the precompiled_header field in
-		the link flags as well. this is due to msvc (a) generating an obj file when compiling a pch,
-		and (b) requiring it to be passed to the linker.
-
-		this creates a few problems:
-		(a) since the precompiled_header field is *not* a list, it means each toolchain is limited to only
-			one pch on windows, which isn't very ideal (in theory you can have as many as you want)
-
-		(b) the recipe needs to manually set the pch name in ldflags as well, because link_objects only
-			has access to the linker and knows nothing about the compiler.
-			- we could have it also accept the compiler as a parameter, but that's very ugly
-
-		the obvious solution to (a) is to just have the precompiled headers be a list instead of a singleton,
-		but that requires checking that it is at most 1-large for the cflags/cxxflags, which is not very intuitive.
-
-		the solution to (b) is either
-		(i)  have a method on the Toolchain, something like `use_c_pch()` that adds to both the cflags and the ldflags
-		(ii) not actually do anything about it and force the recipe to set it manually
-
-
-	5.  a similar situation exists for the `-pthread` flag -- you must specify it for both the compiler and the linker
-		to be safe, and so it becomes very awkward to use.
-
-		a potential solution is to go with methods on Toolchain that setup the flags appropriately...
 */
 
