@@ -4101,7 +4101,7 @@ namespace nabs
 					}
 					else
 					{
-						// TODO: make closing stdin configurable
+						// TODO(#4): make closing stdin configurable
 						// for now, we leave stdin open. this might be a problem later,
 						// and we definitely want to make it configurable later on.
 					}
@@ -4132,7 +4132,7 @@ namespace nabs
 					return os::open_file(this->name.c_str(), os::FileOpenFlags()
 						.needs_write(in_fd != os::FD_NONE)
 
-						// TODO: make a way to specify the file opening flags/modes
+						// TODO(#5): make a way to specify the file opening flags/modes
 						.append_mode(true)      // append by default
 						.should_create(true)    // create by default
 						.create_perms(0664)
@@ -4347,7 +4347,7 @@ namespace nabs
 				}
 
 				/*
-					TODO: stderr is (still) not handled in a very nice way.
+					TODO(#6): stderr is (still) not handled in a very nice way.
 					right now, we can run an entire pipeline and capture the stderr, but that
 					stderr is only for the last process in the chain. everyone else's stderr
 					is printed to console, and that might not be very desirable.
@@ -4498,8 +4498,7 @@ namespace nabs::dep
 		name is the only identifying key.
 
 
-		TODO (dependency stuff):
-		1. need a way to specify optional dependencies
+		TODO(#7): no way to specify optional dependencies
 	*/
 	struct Item
 	{
@@ -5264,7 +5263,7 @@ namespace nabs
 
 	Result<Compiler, std::string> find_c_compiler()
 	{
-		// TODO: support cross-compilation better
+		// TODO(#10): support cross-compilation better
 		// basically we need a way to define the target, provide a sysroot, and
 		// find a specific "brand" of compiler, if you will.
 
@@ -5297,7 +5296,7 @@ namespace nabs
 		#error "unknown host architecture"
 	#endif
 
-		// TODO: not sure how msvc-finder deals with the situation where msvc is not installed
+		// TODO(#11): not sure how msvc-finder deals with the situation where msvc is not installed
 		Compiler ret { };
 		ret.path = os::msvc_toolchain_binaries() / ARCH / "cl.exe";
 		if(!fs::exists(ret.path))
@@ -6498,11 +6497,11 @@ namespace nabs
 				flags.options.push_back("-Wall");
 				flags.options.push_back("-O2");
 
-				// TODO: checking for stdc++fs and/or c++fs needs to be more robust
+				// TODO(#8): checking for stdc++fs and/or c++fs needs to be more robust
 				// eg. we should check if we were linked with libstdc++ or libc++, first of all
 				// then, we also need to check the compiler version (or... the lib version?) properly
 
-				// TODO: expose stdc++fs checking to the user
+				// TODO(#9): expose stdc++fs checking to the user
 				// whatever we know about the STL we want the user to be able to know also,
 				// so that they can compile files using std::filesystem seamlessly as well.
 
@@ -7478,8 +7477,6 @@ namespace nabs
 			// either way, the return value doesn't change.
 			Library ret { };
 
-			zpr::println("searching for '{}' in '{}'", lib, base);
-
 			ret.name = lib;
 			ret.library_paths.push_back(base / "lib");
 			ret.include_paths.push_back(base / "include");
@@ -7825,6 +7822,8 @@ namespace nabs
 
 			if(lib == nullptr)
 			{
+				// TODO(#2): multiple jobs can call find_library at the same time
+				// while semantics are correct (only one can update the cache at a time), it is wasted work
 				auto library = find_library(cmp, target->name(), target->lib_finder_options);
 				if(!library.ok())
 					return Err<std::string>(zpr::sprint("could not find required library '{}'", target->name()));
@@ -8119,7 +8118,8 @@ namespace nabs
 
 
 
-	// TODO: refactor this out into more constituent parts (eg. auto_objects_from_sources)
+	// TODO(#3): missing API to build shared and static libraries
+	// probably refactor this out into more constituent parts (eg. auto_objects_from_sources) and reuse those.
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
 		const fs::path& _exe_name, const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_dependencies)
 	{
@@ -8235,12 +8235,6 @@ namespace nabs
 
 
 
-/*
-	TODOs:
-	3.  auto_objects_from_sources, which does 90% of the work of auto_executable_from_sources. It just
-		returns a list of the object files, minus the executable stuff. This would also need some way of
-		specifying libraries, probably in the same way
-*/
 
 
 
