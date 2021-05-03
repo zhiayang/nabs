@@ -3307,7 +3307,7 @@ namespace nabs
 				base = fs::weakly_canonical(__FILE__).parent_path();
 
 			auto relative_path = [&base](const auto& p) -> auto {
-				return p.lexically_relative(base);
+				return p.lexically_proximate(base);
 			};
 
 			if(output)
