@@ -125,6 +125,12 @@ namespace zpr::tt
 {
 	using namespace std;
 
+	template <typename A>
+	A min(const A& a, const A& b)
+	{
+		return a < b ? a : b;
+	}
+
 	/* from here on, all the code should be exactly the same as the released version of zpr.h */
 	/* -------------------------------------------------------------------------------------- */
 
@@ -2965,29 +2971,12 @@ namespace nabs
 
 		std::vector<fs::path> include_paths;
 		std::vector<std::string> compiler_flags;
+		std::vector<fs::path> additional_compiler_inputs;
 
 		std::vector<fs::path> library_paths;
 		std::vector<std::string> libraries;
 		std::vector<std::string> linker_flags;
-	};
-
-	struct LibraryFinderOptions
-	{
-		// use this to define your own search algorithm. this is always used if it is set.
-		// this is the first field to allow initialising with `{ your_finder_fn }` without using
-		// designated initialisers.
-		std::function<Result<Library, std::string> (const std::string& lib, const LibraryFinderOptions& opts)> custom_searcher;
-
-		bool prefer_static_library = false;
-		bool require_static_library = false;
-		std::vector<fs::path> additional_search_folders = { };
-
-		// this is contingent on pkg-config being available (also works on windows)
-		bool use_pkg_config = true;
-
-		// this is only used on unix (ie. not windows)
-		bool use_usr = true;
-		bool use_usr_local = true;
+		std::vector<fs::path> additional_linker_inputs;
 	};
 
 	/*
@@ -3060,6 +3049,13 @@ namespace nabs
 		// list of forced-includes (as if via `-include <filename>` or `/FI`)
 		std::vector<fs::path> forced_includes;
 
+		// a list of additional input files to pass to the compiler. these are passed
+		// *before* the "normal" input files, for every invocation.
+		std::vector<fs::path> pre_additional_input_files;
+
+		// a list of additional input files, but these are passed *after* the normal input files.
+		std::vector<fs::path> post_additional_input_files;
+
 		// create any missing folders in any output file paths, as if by `mkdir -p`
 		bool create_missing_folders = false;
 
@@ -3122,6 +3118,7 @@ namespace nabs
 		// helper methods
 		Toolchain& add_c_flags(const std::vector<std::string>& flags);
 		Toolchain& add_cpp_flags(const std::vector<std::string>& flags);
+		Toolchain& add_link_flags(const std::vector<std::string>& flags);
 
 		Toolchain& add_c_includes(const std::vector<fs::path>& includes);
 		Toolchain& add_cpp_includes(const std::vector<fs::path>& includes);
@@ -3136,14 +3133,46 @@ namespace nabs
 		Toolchain& use_threads(bool use);
 		Toolchain& use_exceptions(bool use);
 
+		Toolchain& set_c_standard(const std::string& std);
+		Toolchain& set_cpp_standard(const std::string& std);
+
 		template <typename... Flags> Toolchain& add_c_flags(Flags&&... flags);
 		template <typename... Flags> Toolchain& add_cpp_flags(Flags&&... flags);
+		template <typename... Flags> Toolchain& add_link_flags(Flags&&... flags);
 
 		template <typename... Includes> Toolchain& add_c_includes(Includes&&... includes);
 		template <typename... Includes> Toolchain& add_cpp_includes(Includes&&... includes);
 	};
 
+	struct LibraryFinderOptions
+	{
+		// use this to define your own search algorithm. this is always used if it is set.
+		// this is the first field to allow initialising with `{ your_finder_fn }` without using
+		// designated initialisers.
+		std::function<Result<Library, std::string>(const Compiler&, const std::string&, const LibraryFinderOptions&)> custom_searcher;
 
+		bool prefer_static_library = false;
+		bool require_static_library = false;
+		std::vector<fs::path> additional_search_paths = { };
+
+		// this is contingent on pkg-config being available (also works on windows)
+		bool use_pkg_config = true;
+
+		/*
+			whether or not to try the "alternate" library folder layout. when searching for things in `additional_search_paths`,
+			we try to look for /lib/libNAME.a, etc. however, to be flexible there is this alternate layout, which, if enabled,
+			will additionally look for: /NAME/<extra_prefix>/lib/libNAME.a.
+
+			For example, if you have /home/anon/external_libs/llvm/11.0.0/Release/lib/libLLVM.a, you would add
+			'/home/anon/external_libs' to the additional search folders, and use '11.0.0/Release' as the extra prefix.
+		*/
+		bool use_alternate_layout = false;
+		std::string alternate_layout_extra_prefix = { };
+
+		// this is only used on unix (ie. not windows)
+		bool use_usr = true;
+		bool use_usr_local = true;
+	};
 
 
 	/*
@@ -3294,6 +3323,7 @@ namespace nabs
 		};
 	}
 
+	// functions changing the global state
 	namespace impl
 	{
 		struct GlobalState
@@ -3304,9 +3334,16 @@ namespace nabs
 			std::unordered_map<std::string, Library> cached_libraries;
 
 			fs::path cached_windows_sdk_root;
+
+			LibraryFinderOptions default_finder_opts;
 		};
 
 		zmt::Synchronised<GlobalState>& global_state();
+	}
+
+	inline void set_default_library_finder_options(LibraryFinderOptions opts)
+	{
+		impl::global_state().wlock()->default_finder_opts = std::move(opts);
 	}
 }
 
@@ -3348,6 +3385,7 @@ namespace nabs
 			HANDLE handle;
 
 			bool is_thread;
+			DWORD error_code;
 
 			bool operator== (const Proc& p) const
 			{
@@ -3359,11 +3397,11 @@ namespace nabs
 
 			bool operator!= (const Proc& p) const { return !(*this == p); };
 
-			static inline Proc of_pid(HANDLE pid) { return Proc { pid, false }; }
-			static inline Proc of_tid(HANDLE tid) { return Proc { tid, true }; }
+			static inline Proc of_pid(HANDLE pid) { return Proc { pid, false, 0 }; }
+			static inline Proc of_tid(HANDLE tid) { return Proc { tid, true, 0 }; }
 		};
 
-		static constexpr Proc PROC_NONE = Proc { nullptr, false };
+		static constexpr Proc PROC_NONE = Proc { nullptr, false, 0 };
 
 		static size_t PIPE_BUFFER_SIZE = 16384;
 
@@ -3372,6 +3410,7 @@ namespace nabs
 		inline fs::path msvc_toolchain_binaries();
 
 		LPSTR GetLastErrorAsString();
+		LPSTR GetErrorCodeAsString(DWORD error);
 	#else
 		using Fd = int;
 		static constexpr Fd FD_NONE = -1;
@@ -3382,6 +3421,8 @@ namespace nabs
 
 			bool is_thread;
 			pthread_t tid;
+
+			int error_code;
 
 			bool operator== (const Proc& p) const
 			{
@@ -3396,11 +3437,11 @@ namespace nabs
 
 			bool operator!= (const Proc& p) const { return !(*this == p); };
 
-			static inline Proc of_pid(pid_t pid) { return Proc { pid, false, 0 }; }
-			static inline Proc of_tid(pthread_t tid) { return Proc { -1, true, tid }; }
+			static inline Proc of_pid(pid_t pid) { return Proc { pid, false, 0, 0 }; }
+			static inline Proc of_tid(pthread_t tid) { return Proc { -1, true, tid, 0 }; }
 		};
 
-		static constexpr Proc PROC_NONE = Proc { -1, false, 0 };
+		static constexpr Proc PROC_NONE = Proc { -1, false, 0, 0 };
 
 		void dupe_fd(os::Fd src, os::Fd dst);
 	#endif
@@ -3942,6 +3983,9 @@ namespace nabs
 		int Part::run(os::Fd in_fd, os::Fd out_fd, os::Fd err_fd)
 		{
 			auto child_pid = this->runAsync(in_fd, out_fd, err_fd);
+			if(child_pid.error_code != 0)
+				return static_cast<int>(child_pid.error_code);
+
 			if(child_pid == os::PROC_NONE)
 				return 0;
 
@@ -4030,14 +4074,20 @@ namespace nabs
 					&procinfo                       // LPPROCESS_INFORMATION    lpProcessInformation
 				);
 
-				if(!result)
-					impl::int_error("CreateProcess('{}'): {}", cmdline, os::GetLastErrorAsString());
-
 				DeleteProcThreadAttributeList(attrib_list);
 				delete[] attrib_buffer;
 
-				CloseHandle(procinfo.hThread);
-				return os::Proc::of_pid(procinfo.hProcess);
+				if(!result)
+				{
+					// impl::int_error("CreateProcess('{}'): {}", cmdline, os::GetLastErrorAsString());
+					// return Err(static_cast<int>(GetLastError()));
+					return os::Proc { 0, false, GetLastError() };
+				}
+				else
+				{
+					CloseHandle(procinfo.hThread);
+					return os::Proc::of_pid(procinfo.hProcess);
+				}
 			#else
 				if(auto child = fork(); child < 0)
 				{
@@ -4062,9 +4112,11 @@ namespace nabs
 					if(err_fd != os::FD_NONE)
 						os::dupe_fd(err_fd, STDERR_FILENO);
 
-					if(execvp(this->name.c_str(), this->make_args()) < 0)
-						int_error("execvp('{}'): {}", this->name, os::strerror_wrapper());
+					if(auto err = execvp(this->name.c_str(), this->make_args()); err < 0)
+						exit(errno);
 
+					// we want to return an error to the caller in a nice way instead of terminating everything.
+					// int_error("execvp('{}'): {}", this->name, os::strerror_wrapper());
 					abort();
 				}
 				else
@@ -4536,7 +4588,7 @@ namespace nabs::dep
 		Item* add(const fs::path& path);
 
 		// add a library. assumes the kind is KIND_SYSTEM_LIBRARY
-		Item* add_system_library(std::string name, LibraryFinderOptions opts = { });
+		Item* add_system_library(std::string name, std::optional<LibraryFinderOptions> opts = { });
 
 		// Get the item with the given name. For items representing files, the name should be `path.string()`.
 		// if the item with this name/path does not exist, NULL is returned.
@@ -4807,10 +4859,14 @@ namespace nabs::dep
 			return nullptr;
 	}
 
-	Item* Graph::add_system_library(std::string name, LibraryFinderOptions opts)
+	Item* Graph::add_system_library(std::string name, std::optional<LibraryFinderOptions> opts)
 	{
 		auto item = this->add(KIND_SYSTEM_LIBRARY, std::move(name));
-		item->lib_finder_options = std::move(opts);
+		if(opts.has_value())
+			item->lib_finder_options = std::move(opts.value());
+		else
+			item->lib_finder_options = impl::global_state().rlock()->default_finder_opts;
+
 		return item;
 	}
 
@@ -4972,6 +5028,12 @@ namespace nabs
 		return *this;
 	}
 
+	Toolchain& Toolchain::add_link_flags(const std::vector<std::string>& flags)
+	{
+		this->ldflags.options.insert(this->ldflags.options.end(), flags.begin(), flags.end());
+		return *this;
+	}
+
 	Toolchain& Toolchain::add_c_includes(const std::vector<fs::path>& includes)
 	{
 		this->cflags.include_paths.insert(this->cflags.include_paths.end(), includes.begin(), includes.end());
@@ -5033,6 +5095,19 @@ namespace nabs
 		return *this;
 	}
 
+	Toolchain& Toolchain::set_c_standard(const std::string& std)
+	{
+		this->cflags.language_standard = std;
+		return *this;
+	}
+
+	Toolchain& Toolchain::set_cpp_standard(const std::string& std)
+	{
+		this->cxxflags.language_standard = std;
+		return *this;
+	}
+
+
 	template <typename... Includes>
 	Toolchain& Toolchain::add_c_includes(Includes&&... includes)
 	{
@@ -5061,6 +5136,12 @@ namespace nabs
 		return *this;
 	}
 
+	template <typename... Flags>
+	Toolchain& Toolchain::add_link_flags(Flags&&... flags)
+	{
+		this->ldflags.options.insert(this->ldflags.options.end(), { static_cast<Flags&&>(flags)... });
+		return *this;
+	}
 
 
 	namespace impl
@@ -5612,7 +5693,7 @@ namespace nabs
 			return f;
 		}
 
-		static fs::path setup_args_for_compiling_to_obj(std::vector<std::string>& args, const Compiler& cmp,
+		static fs::path add_flags_for_compiling_to_obj(std::vector<std::string>& args, const Compiler& cmp,
 			const CompilerFlags& opts, const std::optional<fs::path>& output, const fs::path& file)
 		{
 			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
@@ -5629,7 +5710,7 @@ namespace nabs
 			}
 			else
 			{
-				impl::int_error("setup_args_for_compiling_to_obj(): unsupported compiler");
+				impl::int_error("add_flags_for_compiling_to_obj(): unsupported compiler");
 			}
 		}
 
@@ -5676,7 +5757,7 @@ namespace nabs
 			}
 		}
 
-		static void set_flags_for_dependency_file(std::vector<std::string>& args, const Compiler& cmp,
+		static void add_flags_for_dependency_file(std::vector<std::string>& args, const Compiler& cmp,
 			const CompilerFlags& opts, const fs::path& file)
 		{
 			if(opts.generate_header_dependencies)
@@ -5695,12 +5776,12 @@ namespace nabs
 				}
 				else
 				{
-					impl::int_error("set_flags_for_dependency_file(): unsupported compiler");
+					impl::int_error("add_flags_for_dependency_file(): unsupported compiler");
 				}
 			}
 		}
 
-		static void parse_msvc_show_includes_and_write_to_file(std::string& std_out, const fs::path& out_path,
+		static void parse_msvc_show_includes_and_write_to_file(std::string& std_out, const fs::path& out_path, const fs::path& src_path,
 			const fs::path& dep_path, bool write_file)
 		{
 			/*
@@ -5738,6 +5819,9 @@ namespace nabs
 					zpr::fprint(static_cast<decltype(args)&&>(args)...);
 			};
 
+			if(std_out.empty())
+				return;
+
 
 			constexpr const char MAGIC_WORDS[] = "Note: including file:";
 
@@ -5759,7 +5843,7 @@ namespace nabs
 				dep_file = _dep_file.unwrap();
 			}
 
-			write_wrapper(dep_file, "{}: ", escape_spaces(out_path.string()));
+			write_wrapper(dep_file, "{}: {} ", escape_spaces(out_path.string()), escape_spaces(src_path.string()));
 
 			// we are forced to accumulate these here, for reasons.
 			std::vector<std::string> headers;
@@ -5792,6 +5876,55 @@ namespace nabs
 
 			write_wrapper(dep_file, "\n");
 			fclose(dep_file);
+		}
+
+		static void add_flags_for_linking_objects(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts,
+			const std::vector<fs::path>& inputs)
+		{
+			for(auto& pre_inputs : opts.pre_additional_input_files)
+				args.push_back(pre_inputs.string());
+
+			for(auto& f : inputs)
+				args.push_back(f.string());
+
+			for(auto& post_inputs : opts.post_additional_input_files)
+				args.push_back(post_inputs.string());
+
+			// libraries go after.
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+			{
+				for(auto& lib : opts.library_paths)
+					args.push_back(zpr::sprint("-L{}", lib.string()));
+
+				for(auto& lib : opts.libraries)
+					args.push_back(zpr::sprint("-l{}", lib));
+
+				// TODO: this should be a runtime check, based on the target!
+			#if defined(__APPLE__)
+				if(cmp.kind == Compiler::KIND_CLANG)
+				{
+					for(auto& f : opts.frameworks)
+						args.push_back("-framework"), args.push_back(f);
+				}
+			#endif
+			}
+			else if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
+			{
+				if(cmp.kind == Compiler::KIND_MSVC_CL)
+					args.push_back("/link");
+
+				for(auto& dir : opts.library_paths)
+					args.push_back(zpr::sprint("/LIBPATH:{}", quote_argument(dir.string())));
+
+				// we assume that whoever "found" the library used the right compiler, so
+				// all the entries in 'libraries' will be actual filenames with .lib/.dll extensions.
+				for(auto& lib : opts.libraries)
+					args.push_back(lib);
+			}
+			else
+			{
+				impl::int_error("unsupported compiler");
+			}
 		}
 	}
 
@@ -5857,7 +5990,7 @@ namespace nabs
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
 		impl::setup_exception_args(args, cmp, opts);
-		impl::set_flags_for_dependency_file(args, cmp, opts, header);
+		impl::add_flags_for_dependency_file(args, cmp, opts, header);
 
 		auto pch = get_default_pch_filename(cmp, opts, header);
 
@@ -5920,7 +6053,7 @@ namespace nabs
 			auto depfile = get_dependency_filename(cmp, opts, header);
 
 			// stderr is irrelevant, because the people at microsoft don't know what's up
-			impl::parse_msvc_show_includes_and_write_to_file(out, pch, depfile,
+			impl::parse_msvc_show_includes_and_write_to_file(out, pch, header, depfile,
 				/* write_file: */ (status == 0));
 
 			// just in case, print the stderr as well.
@@ -5941,12 +6074,18 @@ namespace nabs
 		const fs::path& file)
 	{
 		auto args = impl::setup_basic_args(cmp, opts);
-		auto out_name = impl::setup_args_for_compiling_to_obj(args, cmp, opts, output, { file });
+		auto out_name = impl::add_flags_for_compiling_to_obj(args, cmp, opts, output, { file });
 		impl::add_flags_for_precompiled_header(args, cmp, opts, /* linking: */ false);
 		impl::setup_exception_args(args, cmp, opts);
-		impl::set_flags_for_dependency_file(args, cmp, opts, file);
+		impl::add_flags_for_dependency_file(args, cmp, opts, file);
+
+		for(auto& pre_inputs : opts.pre_additional_input_files)
+			args.push_back(pre_inputs.string());
 
 		args.push_back(file.string());
+
+		for(auto& post_inputs : opts.post_additional_input_files)
+			args.push_back(post_inputs.string());
 
 		if(cmp.log_hook)
 			cmp.log_hook(out_name, { file }, args);
@@ -5966,7 +6105,7 @@ namespace nabs
 			auto depfile = get_dependency_filename(cmp, opts, file);
 
 			// stderr is irrelevant, because the people at microsoft don't know what's up
-			impl::parse_msvc_show_includes_and_write_to_file(out, out_name, depfile,
+			impl::parse_msvc_show_includes_and_write_to_file(out, out_name, file, depfile,
 				/* write_file: */ (status == 0));
 
 			// just in case, print the stderr as well.
@@ -5991,38 +6130,7 @@ namespace nabs
 
 		auto out = impl::set_output_name(args, cmp, opts, /* obj: */ false, output, files);
 
-		// assume all compilers let you just throw the input files at the end with no regard.
-		for(auto& f : files)
-			args.push_back(f.string());
-
-		// libraries go after.
-		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
-		{
-			for(auto& lib : opts.library_paths)
-				args.push_back(zpr::sprint("-L{}", lib.string()));
-
-			for(auto& lib : opts.libraries)
-				args.push_back(zpr::sprint("-l{}", lib));
-
-			// TODO: this should be a runtime check, based on the target!
-		#if defined(__APPLE__)
-			if(cmp.kind == Compiler::KIND_CLANG)
-			{
-				for(auto& f : opts.frameworks)
-					args.push_back("-framework"), args.push_back(f);
-			}
-		#endif
-		}
-		else if(cmp.kind == Compiler::KIND_MSVC_CL)
-		{
-			args.push_back("/nologo");
-			if(!opts.libraries.empty())
-				impl::int_error("libraries unsupported");
-		}
-		else
-		{
-			impl::int_error("unsupported compiler");
-		}
+		impl::add_flags_for_linking_objects(args, cmp, opts, files);
 
 		if(cmp.log_hook)
 			cmp.log_hook(out, files, args);
@@ -6052,35 +6160,8 @@ namespace nabs
 
 		auto out = impl::set_output_name(args, linker, opts, /* obj: */ false, output, files);
 
-		for(auto& f : files)
-			args.push_back(f.string());
+		impl::add_flags_for_linking_objects(args, linker, opts, files);
 
-		if(linker.kind == Compiler::KIND_CLANG || linker.kind == Compiler::KIND_GCC)
-		{
-			for(auto& lib : opts.library_paths)
-				args.push_back(zpr::sprint("-L{}", lib.string()));
-
-			for(auto& lib : opts.libraries)
-				args.push_back(zpr::sprint("-l{}", lib));
-
-			// TODO: this should be a runtime check, based on the target!
-		#if defined(__APPLE__)
-			if(linker.kind == Compiler::KIND_CLANG)
-			{
-				for(auto& f : opts.frameworks)
-					args.push_back("-framework"), args.push_back(f);
-			}
-		#endif
-		}
-		else if(linker.kind == Compiler::KIND_MSVC_LINK)
-		{
-			if(!opts.libraries.empty())
-				impl::int_error("libraries unsupported");
-		}
-		else
-		{
-			impl::int_error("link_object_files(): unsupported linker");
-		}
 
 		if(linker.log_hook)
 			linker.log_hook(out, files, args);
@@ -6438,7 +6519,6 @@ namespace nabs
 				flags.language_standard = "c++17";
 				flags.options.push_back("/O2");
 				flags.options.push_back("/W3");
-				flags.options.push_back("/DASDF");
 			}
 			else
 			{
@@ -7083,16 +7163,19 @@ namespace nabs
 	#if defined(_WIN32)
 		LPSTR GetLastErrorAsString()
 		{
-			// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
+			DWORD error = GetLastError();
+			return GetErrorCodeAsString(error);
+		}
 
-			DWORD errorMessageId = GetLastError();
-			assert(errorMessageId != 0);
+		LPSTR GetErrorCodeAsString(DWORD error)
+		{
+			// https://stackoverflow.com/questions/1387064/how-to-get-the-error-message-from-the-error-code-returned-by-getlasterror
 
 			LPSTR messageBuffer = nullptr;
 
 			DWORD size = FormatMessage(
 				FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-				nullptr, errorMessageId, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				nullptr, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
 				reinterpret_cast<LPSTR>(&messageBuffer), 0, nullptr);
 
 			return messageBuffer;
@@ -7277,7 +7360,7 @@ namespace nabs
 */
 namespace nabs
 {
-	Result<Library, std::string> find_library(const std::string& lib, const LibraryFinderOptions& opts);
+	Result<Library, std::string> find_library(const std::string& lib, const std::optional<LibraryFinderOptions>& opts);
 
 	void use_library(const Library& lib, CompilerFlags& cflags, CompilerFlags& ldflags, bool separate_linking);
 }
@@ -7374,7 +7457,7 @@ namespace nabs
 		}
 
 
-		static Result<Library, std::string> find_in_folder_assuming_unix_convention(const std::string& lib,
+		static Result<Library, std::string> find_in_unixlike_layout(const Compiler& compiler, const std::string& lib,
 			const fs::path& base, const LibraryFinderOptions& opts)
 		{
 			// TODO(platform): this should probably be a runtime check for host/target
@@ -7395,50 +7478,75 @@ namespace nabs
 			// either way, the return value doesn't change.
 			Library ret { };
 
+			zpr::println("searching for '{}' in '{}'", lib, base);
+
 			ret.name = lib;
-			ret.libraries.push_back(lib);
 			ret.library_paths.push_back(base / "lib");
 			ret.include_paths.push_back(base / "include");
 
-			auto static_lib = base / "lib" / fs::path(name_prefix + lib).replace_extension(static_extension);
-			auto dynamic_lib = base / "lib" / fs::path(name_prefix + lib).replace_extension(dylib_extension);
+			auto static_lib_name = fs::path(name_prefix + lib).replace_extension(static_extension);
+			auto dynamic_lib_name = fs::path(name_prefix + lib).replace_extension(dylib_extension);
+
+			auto static_lib = base / "lib" / static_lib_name;
+			auto dynamic_lib = base / "lib" / dynamic_lib_name;
+
+			auto foozle = [&](const fs::path& name) -> auto {
+				if(compiler.kind == Compiler::KIND_MSVC_CL || compiler.kind == Compiler::KIND_MSVC_LINK)
+					ret.libraries.push_back(name.string());
+				else
+					ret.libraries.push_back(lib);
+
+				return Ok(ret);
+			};
+
 
 			// i don't actually know if this makes a difference.
 			if(opts.prefer_static_library)
 			{
 				if(fs::exists(static_lib))
-					return Ok(ret);
+					return foozle(static_lib_name);
 
 				else if(!opts.require_static_library && fs::exists(dynamic_lib))
-					return Ok(ret);
+					return foozle(dynamic_lib_name);
 			}
 			else
 			{
 				if(!opts.require_static_library && fs::exists(dynamic_lib))
-					return Ok(ret);
+					return foozle(dynamic_lib_name);
 
 				else if(fs::exists(static_lib))
-					return Ok(ret);
+					return foozle(static_lib_name);
 			}
 
 			return Err<std::string>(zpr::sprint("library '{}' was not found in {}", lib, base));
 		}
 	}
 
-	// TODO(msvc): find_library() should probably take a Compiler so we know what kind of files to search for
-	Result<Library, std::string> find_library(const std::string& lib, const LibraryFinderOptions& opts)
+	Result<Library, std::string> find_library(const Compiler& compiler, const std::string& lib,
+		const std::optional<LibraryFinderOptions>& _opts)
 	{
+		const auto& opts = _opts.has_value()
+			? _opts.value()
+			: impl::global_state().rlock()->default_finder_opts;
+
 		// search in the additional directories first
 		if(opts.custom_searcher)
 		{
-			auto l = opts.custom_searcher(lib, opts);
+			auto l = opts.custom_searcher(compiler, lib, opts);
 			if(l.ok()) return l;
 		}
 
-		for(auto& dir : opts.additional_search_folders)
+		for(auto& dir : opts.additional_search_paths)
 		{
-			auto l = impl::find_in_folder_assuming_unix_convention(lib, dir, opts);
+			auto l = impl::find_in_unixlike_layout(compiler, lib, dir, opts);
 			if(l.ok()) return l;
+
+			if(opts.use_alternate_layout)
+			{
+				auto base = dir / lib / opts.alternate_layout_extra_prefix;
+				auto l = impl::find_in_unixlike_layout(compiler, lib, base, opts);
+				if(l.ok()) return l;
+			}
 		}
 
 		if(opts.use_pkg_config)
@@ -7450,13 +7558,13 @@ namespace nabs
 	#if !defined(_WIN32)
 		if(opts.use_usr)
 		{
-			auto l = impl::find_in_folder_assuming_unix_convention(lib, "/usr", opts);
+			auto l = impl::find_in_unixlike_layout(compiler, lib, "/usr", opts);
 			if(l.ok()) return l;
 		}
 
 		if(opts.use_usr_local)
 		{
-			auto l = impl::find_in_folder_assuming_unix_convention(lib, "/usr/local", opts);
+			auto l = impl::find_in_unixlike_layout(compiler, lib, "/usr/local", opts);
 			if(l.ok()) return l;
 		}
 	#endif
@@ -7469,10 +7577,12 @@ namespace nabs
 	{
 		append_vector(cf.options, lib.compiler_flags);
 		append_vector(cf.include_paths, lib.include_paths);
+		append_vector(cf.post_additional_input_files, lib.additional_compiler_inputs);
 
 		append_vector(lf.library_paths, lib.library_paths);
 		append_vector(lf.options, lib.linker_flags);
 		append_vector(lf.libraries, lib.libraries);
+		append_vector(lf.post_additional_input_files, lib.additional_linker_inputs);
 
 		// if we are not linking as a separate step, then the compiler must also be invoked with the libraries.
 		if(!separate_linking)
@@ -7480,6 +7590,7 @@ namespace nabs
 			append_vector(cf.library_paths, lib.library_paths);
 			append_vector(cf.options, lib.linker_flags);
 			append_vector(cf.libraries, lib.libraries);
+			append_vector(cf.post_additional_input_files, lib.additional_linker_inputs);
 		}
 	}
 }
@@ -7692,7 +7803,7 @@ namespace nabs
 			dependencies, resolving them with pkg-config if necessary, accumulating all the resolved
 			libraries into the output parameter `depended_libs`.
 		*/
-		static Result<void, std::string> recursively_traverse_system_libraries(dep::Item* target,
+		static Result<void, std::string> recursively_traverse_system_libraries(const Compiler& cmp, dep::Item* target,
 			std::vector<const Library*>& depended_libs)
 		{
 			using namespace nabs::dep;
@@ -7702,7 +7813,7 @@ namespace nabs
 			for(auto& dep : target->deps)
 			{
 				if(dep->kind() == KIND_SYSTEM_LIBRARY)
-					recursively_traverse_system_libraries(dep, depended_libs);
+					recursively_traverse_system_libraries(cmp, dep, depended_libs);
 			}
 
 			auto lib = impl::global_state().map_read([&target](auto& gs) -> const Library* {
@@ -7714,7 +7825,7 @@ namespace nabs
 
 			if(lib == nullptr)
 			{
-				auto library = find_library(target->name(), target->lib_finder_options);
+				auto library = find_library(cmp, target->name(), target->lib_finder_options);
 				if(!library.ok())
 					return Err<std::string>(zpr::sprint("could not find required library '{}'", target->name()));
 
@@ -7786,17 +7897,40 @@ namespace nabs
 				return Ok(false);
 			};
 
-			std::vector<const Library*> depended_libs;
-			auto use_libraries = [&depended_libs](CompilerFlags& flags, bool linking) {
+
+			auto use_libraries = [&](const Compiler& cmp, CompilerFlags& flags, bool linking) -> Result<void, std::string> {
+
+				std::vector<const Library*> depended_libs;
+
+				for(auto& dep : target->deps)
+				{
+					// we already handled the non-weak dependencies, so skip them.
+					if(dep->kind() != KIND_SYSTEM_LIBRARY)
+						continue;
+
+					// for system libraries, they are also considered phony -- so they will always be
+					// "rebuilt", which involves (a) pkg-config-ing them if not cached, and more importantly
+					// (b) adding to the depended_libs list, which our object file will then use.
+					if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
+					{
+						return Err(foo.error());
+					}
+					else if(foo.unwrap())
+					{
+						if(auto r = recursively_traverse_system_libraries(cmp, dep, depended_libs); !r.ok())
+							return Err(r.error());
+					}
+				}
+
 				for(auto lib : depended_libs)
 				{
 					CompilerFlags dummy;
 					if(linking) use_library(*lib, dummy, flags, /* separate_linking: */ true);
 					else        use_library(*lib, flags, dummy, /* separate_linking: */ true);
 				}
-			};
 
-			// TODO: is there a better way to do this than some 2-pass nonsense?
+				return Ok();
+			};
 
 			// this is a check that the target is phonyLIKE -- not that it is actually KIND_PHONY.
 			// only "pure" phony (ie. really phony) targets are never built, but some targets that
@@ -7814,40 +7948,14 @@ namespace nabs
 				if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
 					return Err(foo.error());
 				else
-					rebuild = foo.unwrap();
+					rebuild |= foo.unwrap();
 
-			}
-
-			// pass number 2 -- check if we actually had to rebuild the target for real (because one of its
-			// 'non-weak' dependencies was rebuilt), and if so *then* rebuild the weak dependencies if needed.
-			if(rebuild)
-			{
-				for(auto& dep : target->deps)
-				{
-					// we already handled the non-weak dependencies, so skip them.
-					if(dep->kind() != KIND_SYSTEM_LIBRARY)
-						continue;
-
-					// for system libraries, they are also considered phony -- so they will always be
-					// "rebuilt", which involves (a) pkg-config-ing them if not cached, and more importantly
-					// (b) adding to the depended_libs list, which our object file will then use.
-					if(auto foo = dependency_needs_rebuilding(target, dep); !foo.ok())
-					{
-						return Err(foo.error());
-					}
-					else if(foo.unwrap())
-					{
-						if(auto r = recursively_traverse_system_libraries(dep, depended_libs); !r.ok())
-							return Err(r.error());
-					}
-				}
 			}
 
 			// now, we check if the target is actually KIND_PHONY. in this case, it has no commands that it
 			// needs to run, so we quit now. note that phonyLIKE targets get past here and still get to "build".
 			if(!rebuild || target->kind() == KIND_PHONY || is_kind_sourcefile(target->kind()))
 				return Ok();
-
 
 			if(target->kind() == KIND_OBJECT)
 			{
@@ -7870,7 +7978,7 @@ namespace nabs
 				else
 					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
 
-				use_libraries(flags, /* linking: */ false);
+				use_libraries(cmp, flags, /* linking: */ false);
 
 				if(hooks.modify_flags)
 					hooks.modify_flags(cmp, flags, target, target->produced_by);
@@ -7899,7 +8007,7 @@ namespace nabs
 				else
 					impl::int_error("auto_build_targets(): unsupported source file '{}'", src->name());
 
-				use_libraries(flags, /* linking: */ false);
+				use_libraries(cmp, flags, /* linking: */ false);
 
 				if(hooks.modify_flags)
 					hooks.modify_flags(cmp, flags, target, target->produced_by);
@@ -7912,7 +8020,7 @@ namespace nabs
 				auto ld = tc.ld;
 				auto ldflags = tc.ldflags;
 
-				use_libraries(ldflags, /* linking: */ true);
+				use_libraries(ld, ldflags, /* linking: */ true);
 
 				if(hooks.modify_flags)
 					hooks.modify_flags(ld, ldflags, target, target->produced_by);
