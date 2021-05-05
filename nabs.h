@@ -2995,13 +2995,13 @@ namespace nabs
 	inline constexpr int ARCH_ARMV7     = 3;
 	inline constexpr int ARCH_AARCH64   = 4;
 
-	inline constexpr int OS_NONE        = 0x0000;
-	inline constexpr int OS_WINDOWS     = 0x0001;
+	inline constexpr int OS_NONE        = 0;
+	inline constexpr int OS_WINDOWS     = 1;
 
-	inline constexpr int OS_UNIXLIKE    = 0x4000;
-	inline constexpr int OS_MACOS       = OS_UNIXLIKE | 0x0001;
-	inline constexpr int OS_LINUX       = OS_UNIXLIKE | 0x0002;
-	inline constexpr int OS_FREEBSD     = OS_UNIXLIKE | 0x0003;
+	inline constexpr int OS_UNIXLIKE    = 0x4000'0000;
+	inline constexpr int OS_MACOS       = OS_UNIXLIKE | 2;
+	inline constexpr int OS_LINUX       = OS_UNIXLIKE | 3;
+	inline constexpr int OS_FREEBSD     = OS_UNIXLIKE | 4;
 
 	inline constexpr int ABI_NONE       = 0;
 	inline constexpr int ABI_GNU        = 1;
@@ -3025,21 +3025,30 @@ namespace nabs
 		When parsing a triple (`from_triple`), we split the string by dashes; this
 		means that your OS, architecture, and ABI cannot have dashes in them, if not
 		they will be parsed incorrectly.
+
+
+
+		TODO(#17): no (easy) way to get the host Platform
+		while we can usually count on the empty Platform working to find host=target toolchains,
+		we probably want to make this more robust.
 	*/
 	struct Platform
 	{
-		int arch = 0;
-		int os   = 0;
-		int abi  = 0;
+		int arch = ARCH_UNKNOWN;
+		int abi  = ABI_NONE;
+		int os   = OS_NONE;
 
+		template <typename = void>
 		std::string triple() const;
+
+		template <typename = void>
 		static Result<Platform, std::string> from_triple(std::string_view triple);
 
 		inline bool operator== (const Platform& p) const
 		{
 			return this->arch == p.arch
-				&& this->os == p.os
-				&& this->abi == p.abi;
+				&& this->abi == p.abi
+				&& this->os == p.os;
 		}
 
 		inline bool operator!= (const Platform& p) const
@@ -3055,13 +3064,13 @@ namespace nabs
 
 		For the `user_parse_` functions, return -1 (or any negative number) to signal an error.
 	*/
-	template <typename T> std::string user_os_to_string(int os);
-	template <typename T> std::string user_abi_to_string(int abi);
-	template <typename T> std::string user_arch_to_string(int arch);
+	template <typename = int> std::string user_os_to_string(int os);
+	template <typename = int> std::string user_abi_to_string(int abi);
+	template <typename = int> std::string user_arch_to_string(int arch);
 
-	template <typename T> int user_parse_os(std::string_view sv);
-	template <typename T> int user_parse_abi(std::string_view sv);
-	template <typename T> int user_parse_arch(std::string_view sv);
+	template <typename = int> int user_parse_os(std::string_view sv);
+	template <typename = int> int user_parse_abi(std::string_view sv);
+	template <typename = int> int user_parse_arch(std::string_view sv);
 
 
 
@@ -3096,6 +3105,7 @@ namespace nabs
 		A list of languages supported by nabs. This is not an enumeration because we want
 		to make this user-extendable... probably.
 	*/
+	inline constexpr int LANGUAGE_NONE      = 0;
 	inline constexpr int LANGUAGE_C         = 1;
 	inline constexpr int LANGUAGE_CPP       = 2;
 	inline constexpr int LANGUAGE_OBJC      = 3;
@@ -3124,8 +3134,15 @@ namespace nabs
 		static constexpr int KIND_UNKNOWN   = 0;
 		static constexpr int KIND_CLANG     = 1;
 		static constexpr int KIND_GCC       = 2;
-		static constexpr int KIND_MSVC_CL   = 3;
-		static constexpr int KIND_MSVC_LINK = 4;
+		static constexpr int KIND_LD        = 3;
+		static constexpr int KIND_GNU_AS    = 4;
+		static constexpr int KIND_AR        = 5;
+		static constexpr int KIND_STRIP     = 6;
+		static constexpr int KIND_OBJCOPY   = 7;
+
+		static constexpr int KIND_MSVC_CL   = 8;
+		static constexpr int KIND_MSVC_LINK = 9;
+		static constexpr int KIND_MSVC_LIB  = 10;
 	};
 
 	/*
@@ -3260,28 +3277,52 @@ namespace nabs
 	/*
 		The kinds of tools (that make up a toolchain) that we know about.
 	*/
-	inline constexpr uint64_t TOOL_C_COMPILER       = (1UL <<  0);
-	inline constexpr uint64_t TOOL_CPP_COMPILER     = (1UL <<  1);
-	inline constexpr uint64_t TOOL_PREPROCESSOR     = (1UL <<  2);
-	inline constexpr uint64_t TOOL_LINKER           = (1UL <<  3);
-	inline constexpr uint64_t TOOL_ASSEMBLER        = (1UL <<  4);
-	inline constexpr uint64_t TOOL_AR               = (1UL <<  5);
-	inline constexpr uint64_t TOOL_OBJCOPY          = (1UL <<  6);
-	inline constexpr uint64_t TOOL_STRIP            = (1UL <<  7);
-	inline constexpr uint64_t TOOL_NM               = (1UL <<  8);
-	inline constexpr uint64_t TOOL_OBJC_COMPILER    = (1UL <<  9);
-	inline constexpr uint64_t TOOL_OBJCPP_COMPILER  = (1UL << 10);
+	inline constexpr int TOOL_C_COMPILER        = (1 <<  0);
+	inline constexpr int TOOL_CPP_COMPILER      = (1 <<  1);
+	inline constexpr int TOOL_PREPROCESSOR      = (1 <<  2);
+	inline constexpr int TOOL_LINKER            = (1 <<  3);
+	inline constexpr int TOOL_ASSEMBLER         = (1 <<  4);
+	inline constexpr int TOOL_AR                = (1 <<  5);
+	inline constexpr int TOOL_OBJCOPY           = (1 <<  6);
+	inline constexpr int TOOL_STRIP             = (1 <<  7);
+	inline constexpr int TOOL_OBJC_COMPILER     = (1 <<  8);
+	inline constexpr int TOOL_OBJCPP_COMPILER   = (1 <<  9);
 
 
 
 	/*
 		A structure encapsulating the various options and flags you can use to look for a toolchain.
+
+		Since there are multiple potentially contradictory options, this is the priority order:
+
+		1. If `use_environment` is true *and* the appropriate variable exists (eg. $CC), then
+			that is used -- if it actually exists. If the variable could be resolved directly,
+			then that is used. Otherwise, if `use_path` is also true, it is also looked for in $PATH.
+			If both are not found, fallthrough.
+
+		2. Else, if `sysroot` is not empty, then in the folder `<sysroot>/<prefix>/<bin_name>`:
+			2a. first look for `<triple>-<tool_name>`, eg. `x86_64-linux-gnu-gcc`
+			2b. if that does not exist, then look for simply `<tool_name>`, eg. `gcc`
+
+		3. Else, if we are on Windows:
+			3a. if `use_msvc && use_mingw`, determine which compiler was used to compile the nabs recipe.
+				3ai.  if mingw was used *and* `use_path` is true, go to (4), looking for `<tool_name>` in `$PATH`.
+				3aii. if msvc was used, find and return MSVC.
+			3b. if `use_msvc && !use_mingw`, find and return MSVC.
+			3c. if `!use_msvc && use_mingw`, go to (3ai). If it fails, fallthrough.
+			3d. if `!use_msvc && !use_mingw`, fallthrough.
+
+		4. Else (we are not on windows), if `use_path` is true, and a file `<tool_name>` exists in
+			one of the folders in $PATH, that is used. In this case, the binary file must exist
+			(though it may be a symlink).
+
+		5. Else, give up.
 	*/
 	struct ToolchainFinderOptions
 	{
 		// a bitmask of tools that you need to find. see `TOOL_*` above. By default
 		// we look for a C compiler, a C++ compiler, a linker, and an archive creator (AR).
-		uint64_t required_tools = TOOL_C_COMPILER | TOOL_CPP_COMPILER | TOOL_LINKER | TOOL_AR;
+		int required_tools = TOOL_C_COMPILER | TOOL_CPP_COMPILER | TOOL_LINKER | TOOL_AR;
 
 		// taken together, we look for executables under `<sysroot>/<prefix>/<bin_name>`, so for
 		// a default setup, we would find `/usr/bin/clang` for instance.
@@ -3301,6 +3342,27 @@ namespace nabs
 		// of the tool prefixed with the target triple (eg. `x86_64-linux-gnu-gcc`) before trying
 		// the plain name (eg. `gcc`).
 		Platform target { };
+
+		// whether or not we should use anything we find in `$PATH`. If you are using a sysroot,
+		// this should probably be `false`.
+		bool use_path = true;
+
+		// whether or not we should consider looking for the appropriate environment variable,
+		// eg. $CC or $OBJCOPY, to find the tool.
+		bool use_environment = true;
+
+		// if we are running on windows, try to find msvc. Typically this shouldn't need to be set
+		// manually, because we also detect if your nabs recipe was compiled with cygwin/mingw and
+		// if so, try to find gcc/clang in your `%PATH%`. However, you might have compiled your nabs
+		// recipe with a different compiler than what you want to use to compile your projects, so
+		// use this flag to control that.
+		bool use_msvc = true;
+
+		// works similarly to `use_msvc`. If this is true, we try to find `gcc/clang` in your `%PATH%`.
+		// note that if both `use_msvc` and `use_mingw` are false, you will not be able to find any
+		// toolchains (on windows) unless you provide a sysroot. Conversely, if they are both true,
+		// ** we prefer whatever you used to compile your nabs recipe **
+		bool use_mingw = true;
 	};
 
 
@@ -3589,9 +3651,11 @@ namespace nabs
 
 		static size_t PIPE_BUFFER_SIZE = 16384;
 
-		inline fs::path msvc_windows_sdk();
-		inline fs::path msvc_toolchain_libraries();
-		inline fs::path msvc_toolchain_binaries();
+		inline const char* get_host_arch_name();
+
+		fs::path msvc_windows_sdk();
+		fs::path msvc_toolchain_libraries();
+		fs::path msvc_toolchain_binaries();
 
 		LPSTR GetLastErrorAsString();
 		LPSTR GetErrorCodeAsString(DWORD error);
@@ -5187,8 +5251,8 @@ namespace zpr
 // compiler specifics
 namespace nabs
 {
-	Result<Compiler, std::string> find_c_compiler();
-	Result<Compiler, std::string> find_cpp_compiler();
+	Result<Compiler, std::string> find_c_compiler(const ToolchainFinderOptions& opts);
+	Result<Compiler, std::string> find_cpp_compiler(const ToolchainFinderOptions& opts);
 
 	CompilerFlags get_default_cflags();
 	CompilerFlags get_default_cxxflags();
@@ -5200,6 +5264,462 @@ namespace nabs
 #if !NABS_DECLARATION_ONLY
 namespace nabs
 {
+	namespace impl
+	{
+		static std::vector<fs::path> get_path_variable()
+		{
+			std::vector<fs::path> ret;
+			auto _var = os::get_environment_var("PATH");
+
+			if(!_var.has_value())
+				return { };
+
+			auto var = _var.value();
+			while(true)
+			{
+				auto i = var.find(':');
+				if(i == std::string::npos)
+				{
+					ret.push_back(std::string(var));
+					break;
+				}
+				else
+				{
+					auto comp = var.substr(0, i);
+					ret.push_back(std::string(comp));
+					var = var.substr(i + 1);
+				}
+			}
+
+			return ret;
+		}
+
+		static fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path)
+		{
+			for(auto& p : path)
+			{
+				auto tmp = (p / file);
+				if(fs::exists(tmp))
+					return tmp;
+			}
+
+			return { };
+		}
+
+		static int get_compiler_kind(const fs::path& path)
+		{
+			// do a simple check first. note that this isn't *really* correct, because people might
+			// do stupid things (eg. make `gcc` actually run `clang`... cough apple cough), so give
+			// users a macro to force the strict check. Otherwise, this saves us from having to run
+			// the compiler just to check its kind.
+			#if !NABS_STRICT_COMPILER_CHECK
+				if(auto name = path.filename().string(); name == "cl.exe" || name == "cl")
+					return Compiler::KIND_MSVC_CL;
+				else if(ends_with(name, "clang") || ends_with(name, "clang++"))
+					return Compiler::KIND_CLANG;
+				else if(ends_with(name, "gcc") || ends_with(name, "g++"))
+					return Compiler::KIND_GCC;
+			#endif
+
+			// tbh the exit code doesn't matter, since we know it exists
+			std::string out, err;
+			cmd(path.string(), "--version").run(&out, &err);
+
+			/*
+				gcc:
+				`gcc: fatal error: no input files`
+
+				clang:
+				`clang: error: no input files`
+
+				msvc:
+				`Microsoft (R) C/C++ Optimizing Compiler Version 19.23.28107 for x64`
+			*/
+
+			auto lines = split_string_lines(out);
+			if(!lines.empty() && lines[0].find("Microsoft (R)") != std::string::npos)
+			{
+				return Compiler::KIND_MSVC_CL;
+			}
+			else
+			{
+				if(lines[0].find("clang") != std::string::npos)
+					return Compiler::KIND_CLANG;
+
+				else if(lines[0].find("gcc") != std::string::npos)
+					return Compiler::KIND_GCC;
+			}
+
+			int_warn("could not determine the kind for compiler '{}'", path);
+			return Compiler::KIND_UNKNOWN;
+		}
+
+		static Compiler get_compiler_from_filepath(const fs::path& path, int lang)
+		{
+			Compiler cc { };
+			cc.path = path;
+			cc.kind = get_compiler_kind(path);
+			cc.lang = lang;
+			return cc;
+		}
+
+		static Result<Compiler, std::string> get_compiler_from_env_var(const std::vector<fs::path>& path_env,
+			const std::string& var, int lang, bool consider_path = true)
+		{
+			if(fs::exists(var))
+			{
+				// first, check if this file exists "just like that" (in case an absolute path,
+				// or something relative to the current dir, was provided)
+				return Ok(get_compiler_from_filepath(var, lang));
+			}
+			else if(auto path = impl::find_file_in_path(var, path_env); consider_path && !path.empty())
+			{
+				// if not, look for it in the path
+				return Ok(get_compiler_from_filepath(path, lang));
+			}
+			else
+			{
+				return Err<std::string>(zpr::sprint("specified compiler '{}' does not exist", var));
+			}
+		}
+
+
+
+		static Result<Compiler, std::string> find_tool(const std::string& name, const std::string& envname, int lang,
+			int tool, const ToolchainFinderOptions& opts)
+		{
+			// this is only needed for windows, because the things have different names.
+			(void) tool;
+
+			if(opts.use_environment)
+			{
+				auto path_env = impl::get_path_variable();
+				if(auto env = os::get_environment_var(envname); env.has_value())
+				{
+					if(auto c = get_compiler_from_env_var(path_env, envname, lang, /* use_path: */ false); c.ok())
+					{
+						return Ok(c.unwrap());
+					}
+				}
+			}
+
+			if(const auto& sysroot = opts.sysroot; !sysroot.empty())
+			{
+				auto folder = sysroot / opts.prefix / opts.bin_name;
+				auto bin1 = zpr::sprint("{}-{}", opts.target.triple(), name);
+
+				if(auto cc1 = folder / bin1; fs::exists(cc1))
+					return Ok(get_compiler_from_filepath(cc1, lang));
+
+				else if(auto cc2 = folder / name; fs::exists(cc2))
+					return Ok(get_compiler_from_filepath(cc2, lang));
+			}
+
+			#if defined(_WIN32)
+				// TODO(#16): cygwin is not supported.
+				#if defined(__MINGW32__) || defined(__MINGW64__)
+					constexpr bool is_mingw = true;
+				#else
+					constexpr bool is_mingw = false;
+				#endif
+
+				#if defined(_MSC_VER)
+					constexpr bool is_msvc = true;
+				#else
+					constexpr bool is_msvc = false;
+				#endif
+
+				if(opts.use_msvc && opts.use_mingw)
+				{
+					if(is_msvc)
+						goto try_msvc;
+
+					// else, fallthrough to the $PATH case.
+				}
+				else if(opts.use_msvc)
+				{
+					// TODO(#11): not sure how msvc-finder deals with the situation where msvc is not installed
+				try_msvc:
+					auto binpath = os::msvc_toolchain_binaries();
+					if(!binpath.empty())
+					{
+						std::string arch;
+						switch(opts.target.arch)
+						{
+							case ARCH_X86_64:   arch = "x64"; break;
+							case ARCH_X86_I686: arch = "x86"; break;
+							case ARCH_ARMV7:    arch = "arm"; break;
+							case ARCH_AARCH64:  arch = "arm64"; break;
+							case ARCH_UNKNOWN:  arch = os::get_host_arch_name(); break;
+							default:
+								int_error("unsupported arch ({})! (how did you get windows to run here?)", opts.target.arch);
+								break;
+						}
+
+
+						Compiler ret { };
+
+						// change the name based on the tool.
+						switch(tool)
+						{
+							case TOOL_C_COMPILER:
+							case TOOL_CPP_COMPILER:
+								name = "cl.exe";
+								ret.kind = Compiler::KIND_MSVC_CL;
+								break;
+
+							case TOOL_LINKER:
+								name = "link.exe";
+								ret.kind = Compiler::KIND_MSVC_LINK;
+								break;
+
+							case TOOL_AR:
+								name = "lib.exe";
+								ret.kind = Compiler::KIND_MSVC_LIB;
+								break;
+
+							default:
+								return Err<std::string>(zpr::sprint("unsupported tool '{}'", tool));
+						}
+
+						ret.lang = lang;
+						ret.path = binpath / arch / name;
+
+						if(!fs::exists(ret.path))
+							return Err<std::string>(zpr::sprint("could not find '{}'", name));
+
+						return Ok(ret);
+					}
+				}
+			#endif
+
+			if(opts.use_path)
+			{
+				auto path_env = impl::get_path_variable();
+				if(auto exe = impl::find_file_in_path(name, path_env); !exe.empty())
+					return Ok(get_compiler_from_filepath(exe, lang));
+			}
+
+			return Err<std::string>(zpr::sprint("could not find '{}'", name));
+		}
+	}
+
+	Result<Compiler, std::string> find_c_compiler(const ToolchainFinderOptions& opts)
+	{
+		// look for clang, gcc, cc, in that order.
+		for(auto name : { "clang", "gcc", "cc" })
+		{
+			if(auto cc = impl::find_tool(name, "CC", LANGUAGE_C, TOOL_C_COMPILER, opts); cc.ok())
+				return cc;
+		}
+
+		return Err<std::string>("could not find C compiler");
+	}
+
+	Result<Compiler, std::string> find_cpp_compiler(const ToolchainFinderOptions& opts)
+	{
+		// look for clang, gcc, cc, in that order.
+		for(auto name : { "clang++", "g++", "c++" })
+		{
+			if(auto cxx = impl::find_tool(name, "CXX", LANGUAGE_CPP, TOOL_CPP_COMPILER, opts); cxx.ok())
+				return cxx;
+		}
+
+		return Err<std::string>("could not find C compiler");
+	}
+
+	Result<Toolchain, std::string> find_toolchain(const ToolchainFinderOptions& opts)
+	{
+		Toolchain ret;
+		if(auto cc = find_c_compiler(opts); !cc.ok())
+			return Err(cc.error());
+		else
+			ret.cc = cc.unwrap();
+
+		if(auto cxx = find_cpp_compiler(opts); !cxx.ok())
+			return Err(cxx.error());
+		else
+			ret.cxx = cxx.unwrap();
+
+		if(ret.cxx.kind == Compiler::KIND_MSVC_CL)
+		{
+			// use link.exe, which is in the same folder as cl.exe
+			ret.ld.path = ret.cxx.path.parent_path() / "link.exe";
+			ret.ld.kind = Compiler::KIND_MSVC_LINK;
+			ret.ld.lang = LANGUAGE_CPP;
+		}
+		else
+		{
+			// use the c++ compiler to link.
+			ret.ld = ret.cxx;
+		}
+
+		ret.cflags = get_default_cflags();
+		ret.cxxflags = get_default_cxxflags();
+
+		// by default, create it.
+		ret.ldflags.create_missing_folders = true;
+
+		ret.cc.log_hook  = default_compiler_logger(false, "cc");
+		ret.cxx.log_hook = default_compiler_logger(false, "cxx");
+		ret.ld.log_hook  = default_compiler_logger(true, "ld");
+
+	#if defined(__APPLE__)
+		ret.objcc = ret.cc;
+		ret.objcflags = get_default_cflags();
+
+		ret.objcxx = ret.cxx;
+		ret.objcxxflags = get_default_cxxflags();
+	#endif
+
+		return Ok(std::move(ret));
+	}
+
+	CompilerFlags get_default_cflags()
+	{
+		CompilerFlags ret;
+		ret.language_standard = "c11";
+		ret.create_missing_folders = true;
+		ret.generate_header_dependencies = true;
+
+		return ret;
+	}
+
+	CompilerFlags get_default_cxxflags()
+	{
+		CompilerFlags ret;
+		ret.language_standard = "c++17";
+		ret.create_missing_folders = true;
+		ret.generate_header_dependencies = true;
+
+		return ret;
+	}
+
+
+
+
+
+
+
+
+
+	// dummy implementations
+	template <typename> std::string user_os_to_string(int) { return ""; }
+	template <typename> std::string user_abi_to_string(int) { return ""; }
+	template <typename> std::string user_arch_to_string(int) { return ""; }
+
+	template <typename> int user_parse_os(std::string_view) { return -1; }
+	template <typename> int user_parse_abi(std::string_view) { return -1; }
+	template <typename> int user_parse_arch(std::string_view) { return -1; }
+
+	template <typename>
+	std::string Platform::triple() const
+	{
+		std::string sos;
+		std::string sabi;
+		std::string sarch;
+
+		switch(this->arch)
+		{
+			case ARCH_X86_64:   sarch = "x86_64"; break;
+			case ARCH_X86_I686: sarch = "i686"; break;
+			case ARCH_ARMV7:    sarch = "arm"; break;
+			case ARCH_AARCH64:  sarch = "aarch64"; break;
+			case ARCH_UNKNOWN:  sarch = ""; break;
+			default:            sarch = user_arch_to_string(this->arch); break;
+		}
+
+		switch(this->os)
+		{
+			case OS_WINDOWS:    sos = "w64"; break;
+			case OS_MACOS:      sos = "macos"; break;
+			case OS_LINUX:      sos = "linux"; break;
+			case OS_FREEBSD:    sos = "freebsd"; break;
+			case OS_UNIXLIKE:   sos = "unix"; break;
+			case OS_NONE:       sos = ""; break;
+			default:            sos = user_os_to_string(this->os); break;
+		}
+
+		switch(this->abi)
+		{
+			case ABI_GNU:       sabi = "gnu"; break;
+			case ABI_MINGW32:   sabi = "mingw32"; break;
+			case ABI_EABI:      sabi = "eabi"; break;
+			case ABI_NONE:      sabi = ""; break;
+			default:            sabi = user_abi_to_string(this->abi); break;
+		}
+
+		auto join = [](const std::vector<std::string>& foo) -> std::string {
+			std::string ret;
+			for(size_t i = 0; i < foo.size(); i++)
+			{
+				ret += foo[i];
+				if(i + 1 != foo.size() && !foo[i + 1].empty())
+					ret += "-";
+			}
+			return ret;
+		};
+
+		return join({ sarch, sos, sabi });
+	}
+
+	template <typename>
+	Result<Platform, std::string> Platform::from_triple(std::string_view triple)
+	{
+		auto parts = split_string(triple, '-');
+
+		// we need at least 1 thing -- arch.
+		if(parts.empty())
+			return Err<std::string>("empty triple");
+
+		Platform platform { };
+
+		auto& arch = parts[0];
+		if(arch == "unknown" || arch == "none") platform.arch = ARCH_UNKNOWN;
+		else if(arch == "x86_64")               platform.arch = ARCH_X86_64;
+		else if(arch == "i686")                 platform.arch = ARCH_X86_I686;
+		else if(arch == "arm")                  platform.arch = ARCH_ARMV7;
+		else if(arch == "aarch64")              platform.arch = ARCH_AARCH64;
+		else if(auto user = user_parse_arch(arch); user >= 0)
+			platform.arch = user;
+		else
+			return Err<std::string>(zpr::sprint("unknown architecture '{}'", arch));
+
+		if(parts.size() > 1)
+		{
+			auto& os = parts[1];
+			// TODO: we might want to differentiate between win32 and win64
+			if(os == "win32" || os == "w32")        platform.os = OS_WINDOWS;
+			else if(os == "win64" || os == "w64")   platform.os = OS_WINDOWS;
+			else if(os == "macos")                  platform.os = OS_MACOS;
+			else if(os == "linux")                  platform.os = OS_LINUX;
+			else if(os == "freebsd")                platform.os = OS_FREEBSD;
+			else if(auto user = user_parse_os(os); user >= 0)
+				platform.os = user;
+			else
+				return Err<std::string>(zpr::sprint("unknown os '{}'", os));
+		}
+
+		if(parts.size() > 2)
+		{
+			auto& abi = parts[2];
+			if(abi == "none")           platform.abi = ABI_NONE;
+			else if(abi == "eabi")      platform.abi = ABI_EABI;
+			else if(abi == "gnu")       platform.abi = ABI_GNU;
+			else if(abi == "mingw32")   platform.abi = ABI_MINGW32;
+			else if(auto user = user_parse_abi(abi); user >= 0)
+				platform.abi = user;
+			else
+				return Err<std::string>(zpr::sprint("unknown abi '{}'", abi));
+		}
+
+		return Ok(platform);
+	}
+
+
+
+
+
 	// methods for toolchain
 	Toolchain& Toolchain::add_c_flags(const std::vector<std::string>& flags)
 	{
@@ -5326,402 +5846,6 @@ namespace nabs
 	{
 		this->ldflags.options.insert(this->ldflags.options.end(), { static_cast<Flags&&>(flags)... });
 		return *this;
-	}
-
-
-	namespace impl
-	{
-		static std::vector<fs::path> get_path_variable()
-		{
-			std::vector<fs::path> ret;
-			auto _var = os::get_environment_var("PATH");
-
-			if(!_var.has_value())
-				return { };
-
-			auto var = _var.value();
-			while(true)
-			{
-				auto i = var.find(':');
-				if(i == std::string::npos)
-				{
-					ret.push_back(std::string(var));
-					break;
-				}
-				else
-				{
-					auto comp = var.substr(0, i);
-					ret.push_back(std::string(comp));
-					var = var.substr(i + 1);
-				}
-			}
-
-			return ret;
-		}
-
-		static fs::path find_file_in_path(const fs::path& file, const std::vector<fs::path>& path)
-		{
-			for(auto& p : path)
-			{
-				auto tmp = (p / file);
-				if(fs::exists(tmp))
-					return tmp;
-			}
-
-			return { };
-		}
-
-		static int get_compiler_kind(const fs::path& path)
-		{
-			// do a simple check first. note that this isn't *really* correct, because people might
-			// do stupid things (eg. make `gcc` actually run `clang`... cough apple cough), so give
-			// users a macro to force the strict check. Otherwise, this saves us from having to run
-			// the compiler just to check its kind.
-			#if !NABS_STRICT_COMPILER_CHECK
-				if(auto name = path.filename(); name == "cl.exe" || name == "cl")
-					return Compiler::KIND_MSVC_CL;
-				else if(name == "clang" || name == "clang++")
-					return Compiler::KIND_CLANG;
-				else if(name == "gcc" || name == "g++")
-					return Compiler::KIND_GCC;
-			#endif
-
-			// tbh the exit code doesn't matter, since we know it exists
-			std::string out, err;
-			cmd(path.string(), "--version").run(&out, &err);
-
-			/*
-				gcc:
-				`gcc: fatal error: no input files`
-
-				clang:
-				`clang: error: no input files`
-
-				msvc:
-				`Microsoft (R) C/C++ Optimizing Compiler Version 19.23.28107 for x64`
-			*/
-
-			auto lines = split_string_lines(out);
-			if(!lines.empty() && lines[0].find("Microsoft (R)") != std::string::npos)
-			{
-				return Compiler::KIND_MSVC_CL;
-			}
-			else
-			{
-				if(lines[0].find("clang") != std::string::npos)
-					return Compiler::KIND_CLANG;
-
-				else if(lines[0].find("gcc") != std::string::npos)
-					return Compiler::KIND_GCC;
-			}
-
-			int_warn("could not determine the kind for compiler '{}'", path);
-			return Compiler::KIND_UNKNOWN;
-		}
-
-		static Result<Compiler, std::string> get_compiler_from_env_var(const std::vector<fs::path>& path_env,
-			const std::string& var, int lang)
-		{
-			if(fs::exists(var))
-			{
-				// first, check if this file exists "just like that" (in case an absolute path,
-				// or something relative to the current dir, was provided)
-				Compiler cc;
-				cc.path = var;
-				cc.kind = get_compiler_kind(var);
-				cc.lang = lang;
-				return Ok(std::move(cc));
-			}
-			else if(auto path = impl::find_file_in_path(var, path_env); !path.empty())
-			{
-				// if not, look for it in the path
-				Compiler cc;
-				cc.path = path;
-				cc.kind = get_compiler_kind(path);
-				cc.lang = lang;
-				return Ok(std::move(cc));
-			}
-			else
-			{
-				return Err<std::string>(zpr::sprint("specified compiler '{}' does not exist", var));
-			}
-		}
-	}
-
-	// dummy implementations
-	template <typename T> std::string user_os_to_string(int) { return ""; }
-	template <typename T> std::string user_abi_to_string(int) { return ""; }
-	template <typename T> std::string user_arch_to_string(int) { return ""; }
-
-	template <typename T> int user_parse_os(std::string_view) { return -1; }
-	template <typename T> int user_parse_abi(std::string_view) { return -1; }
-	template <typename T> int user_parse_arch(std::string_view) { return -1; }
-
-	std::string Platform::triple() const
-	{
-		std::string sos;
-		std::string sabi;
-		std::string sarch;
-
-		switch(this->arch)
-		{
-			case ARCH_X86_64:   sarch = "x86_64"; break;
-			case ARCH_X86_I686: sarch = "i686"; break;
-			case ARCH_ARMV7:    sarch = "arm"; break;
-			case ARCH_AARCH64:  sarch = "aarch64"; break;
-			case ARCH_UNKNOWN:  sarch = ""; break;
-			default:            sarch = user_arch_to_string<int>(this->arch); break;
-		}
-
-		switch(this->os)
-		{
-			case OS_WINDOWS:    sos = "w64"; break;
-			case OS_MACOS:      sos = "macos"; break;
-			case OS_LINUX:      sos = "linux"; break;
-			case OS_FREEBSD:    sos = "freebsd"; break;
-			case OS_UNIXLIKE:   sos = "unix"; break;
-			case OS_NONE:       sos = ""; break;
-			default:            sos = user_os_to_string<int>(this->os); break;
-		}
-
-		switch(this->abi)
-		{
-			case ABI_GNU:       sabi = "gnu"; break;
-			case ABI_MINGW32:   sabi = "mingw32"; break;
-			case ABI_EABI:      sabi = "eabi"; break;
-			case ABI_NONE:      sabi = ""; break;
-			default:            sabi = user_abi_to_string<int>(this->abi); break;
-		}
-
-		auto join = [](const std::vector<std::string>& foo) -> std::string {
-			std::string ret;
-			for(size_t i = 0; i < foo.size(); i++)
-			{
-				ret += foo[i];
-				if(i + 1 != foo.size())
-					ret += "-";
-			}
-			return ret;
-		};
-
-		return join({ sarch, sos, sabi });
-	}
-
-	Result<Platform, std::string> Platform::from_triple(std::string_view triple)
-	{
-		auto parts = split_string(triple, '-');
-
-		// we need at least 1 thing -- arch.
-		if(parts.empty())
-			return Err<std::string>("empty triple");
-
-		Platform platform { };
-
-		auto& arch = parts[0];
-		if(arch == "unknown" || arch == "none") platform.arch = ARCH_UNKNOWN;
-		else if(arch == "x86_64")               platform.arch = ARCH_X86_64;
-		else if(arch == "i686")                 platform.arch = ARCH_X86_I686;
-		else if(arch == "arm")                  platform.arch = ARCH_ARMV7;
-		else if(arch == "aarch64")              platform.arch = ARCH_AARCH64;
-		else if(auto user = user_parse_arch<int>(arch); user >= 0)
-			platform.arch = user;
-		else
-			return Err<std::string>(zpr::sprint("unknown architecture '{}'", arch));
-
-		if(parts.size() > 1)
-		{
-			auto& os = parts[1];
-			// TODO: we might want to differentiate between win32 and win64
-			if(os == "win32" || os == "w32")        platform.os = OS_WINDOWS;
-			else if(os == "win64" || os == "w64")   platform.os = OS_WINDOWS;
-			else if(os == "macos")                  platform.os = OS_MACOS;
-			else if(os == "linux")                  platform.os = OS_LINUX;
-			else if(os == "freebsd")                platform.os = OS_FREEBSD;
-			else if(auto user = user_parse_os<int>(os); user >= 0)
-				platform.os = user;
-			else
-				return Err<std::string>(zpr::sprint("unknown os '{}'", os));
-		}
-
-		if(parts.size() > 2)
-		{
-			auto& abi = parts[2];
-			if(abi == "none")           platform.abi = ABI_NONE;
-			else if(abi == "eabi")      platform.abi = ABI_EABI;
-			else if(abi == "gnu")       platform.abi = ABI_GNU;
-			else if(abi == "mingw32")   platform.abi = ABI_MINGW32;
-			else if(auto user = user_parse_abi<int>(abi); user >= 0)
-				platform.abi = user;
-			else
-				return Err<std::string>(zpr::sprint("unknown abi '{}'", abi));
-		}
-
-		return Ok(platform);
-	}
-
-	Result<Compiler, std::string> find_c_compiler()
-	{
-		// TODO(#10): support cross-compilation better
-		// basically we need a way to define the target, provide a sysroot, and
-		// find a specific "brand" of compiler, if you will.
-
-		// for now, we just use the platform #defines to see which compiler to
-		// search for. if we see _WIN32 but nothing suggesting cygwin or mingw,
-		// then use MSVC's cl.exe. else, just use `cc` like a unix system.
-
-		// also, it could be the case that the compiler used to compile nabs.cpp
-		// is *not* the same compiler you want to use for the rest of the project;
-		// in these situations we also need to be able to have a method of selecting
-		// the kind of compiler. for example, you might compile nabs with cl.exe, but
-		// want to use mingw to compile the project.
-
-		auto path_env = impl::get_path_variable();
-		if(auto cc = os::get_environment_var("CC"); cc.has_value())
-			return impl::get_compiler_from_env_var(path_env, *cc, LANGUAGE_C);
-
-	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
-
-		// assume we are always compiling for the host, because that is a reasonable assumption.
-	#if defined(_M_X64) || defined(_M_AMD64)
-		const char* ARCH = "x64";
-	#elif defined(_M_IX86)
-		const char* ARCH = "x86";
-	#elif defined(_M_ARM64)
-		const char* ARCH = "arm64";
-	#elif defined(_M_ARM)
-		const char* ARCH = "arm";
-	#else
-		#error "unknown host architecture"
-	#endif
-
-		// TODO(#11): not sure how msvc-finder deals with the situation where msvc is not installed
-		Compiler ret { };
-		ret.path = os::msvc_toolchain_binaries() / ARCH / "cl.exe";
-		if(!fs::exists(ret.path))
-			return Err<std::string>("'cl.exe' does not exist");
-
-		ret.kind = Compiler::KIND_MSVC_CL;
-		ret.lang = LANGUAGE_C;
-		return Ok(ret);
-
-	#else
-		for(auto foo : { "clang", "gcc", "cc" })
-		{
-			if(auto exe = impl::find_file_in_path(foo, path_env); !exe.empty())
-			{
-				Compiler cc;
-				cc.path = exe;
-				cc.kind = impl::get_compiler_kind(exe);
-				cc.lang = LANGUAGE_C;
-				return Ok(std::move(cc));
-			}
-		}
-
-		return Err<std::string>("no compiler in $PATH");
-	#endif // _WIN32
-	}
-
-	Result<Compiler, std::string> find_cpp_compiler()
-	{
-		auto path_env = impl::get_path_variable();
-		if(auto cxx = os::get_environment_var("CXX"); cxx.has_value())
-			return impl::get_compiler_from_env_var(path_env, *cxx, LANGUAGE_CPP);
-
-	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
-
-		// msvc uses cl.exe for both C and C++ -- the hard part is actually finding the damn thing.
-		if(auto ret = find_c_compiler(); ret.ok())
-		{
-			ret->lang = LANGUAGE_CPP;
-			return ret;
-		}
-		else
-		{
-			return Err<std::string>("could not find MSVC");
-		}
-	#else
-		// basically, find 'c++' in the path.
-		for(auto foo : { "clang++", "g++", "c++" })
-		{
-			if(auto exe = impl::find_file_in_path(foo, path_env); !exe.empty())
-			{
-				Compiler cxx;
-				cxx.path = exe;
-				cxx.kind = impl::get_compiler_kind(exe);
-				cxx.lang = LANGUAGE_CPP;
-				return Ok(std::move(cxx));
-			}
-		}
-
-		return Err<std::string>("no compiler in $PATH");
-	#endif // _WIN32
-	}
-
-	Result<Toolchain, std::string> find_toolchain(const ToolchainFinderOptions& opts)
-	{
-		Toolchain ret;
-		if(auto cc = find_c_compiler(); !cc.ok())
-			return Err(cc.error());
-		else
-			ret.cc = cc.unwrap();
-
-		if(auto cxx = find_cpp_compiler(); !cxx.ok())
-			return Err(cxx.error());
-		else
-			ret.cxx = cxx.unwrap();
-
-		if(ret.cxx.kind == Compiler::KIND_MSVC_CL)
-		{
-			// use link.exe, which is in the same folder as cl.exe
-			ret.ld.path = ret.cxx.path.parent_path() / "link.exe";
-			ret.ld.kind = Compiler::KIND_MSVC_LINK;
-			ret.ld.lang = LANGUAGE_CPP;
-		}
-		else
-		{
-			// use the c++ compiler to link.
-			ret.ld = ret.cxx;
-		}
-
-		ret.cflags = get_default_cflags();
-		ret.cxxflags = get_default_cxxflags();
-
-		// by default, create it.
-		ret.ldflags.create_missing_folders = true;
-
-		ret.cc.log_hook  = default_compiler_logger(false, "cc");
-		ret.cxx.log_hook = default_compiler_logger(false, "cxx");
-		ret.ld.log_hook  = default_compiler_logger(true, "ld");
-
-	#if defined(__APPLE__)
-		ret.objcc = ret.cc;
-		ret.objcflags = get_default_cflags();
-
-		ret.objcxx = ret.cxx;
-		ret.objcxxflags = get_default_cxxflags();
-	#endif
-
-		return Ok(std::move(ret));
-	}
-
-	CompilerFlags get_default_cflags()
-	{
-		CompilerFlags ret;
-		ret.language_standard = "c11";
-		ret.create_missing_folders = true;
-		ret.generate_header_dependencies = true;
-
-		return ret;
-	}
-
-	CompilerFlags get_default_cxxflags()
-	{
-		CompilerFlags ret;
-		ret.language_standard = "c++17";
-		ret.create_missing_folders = true;
-		ret.generate_header_dependencies = true;
-
-		return ret;
 	}
 }
 #endif // !NABS_DECLARATION_ONLY
@@ -6824,7 +6948,7 @@ namespace nabs
 		{
 			log("build recipe changed, rebuilding...");
 
-			auto _cpp = find_cpp_compiler();
+			auto _cpp = find_cpp_compiler(ToolchainFinderOptions { });
 			if(!_cpp.ok())
 			{
 				impl::int_warn("aborting self-rebuild, could not find C++ compiler: {}", _cpp.error());
@@ -7475,6 +7599,21 @@ namespace nabs::impl
 namespace nabs::os
 {
 	#if defined(_WIN32)
+		inline const char* get_host_arch_name()
+		{
+			#if defined(_M_X64) || defined(_M_AMD64)
+				return "x64";
+			#elif defined(_M_IX86)
+				return "x86";
+			#elif defined(_M_ARM64)
+				return "arm64";
+			#elif defined(_M_ARM)
+				return "arm";
+			#else
+				#error "unknown host architecture"
+			#endif
+		}
+
 		// note: only the sdk directory is cached, for now. it's the only one that is kinda used
 		// more than onace (ie. after
 		fs::path msvc_windows_sdk()
