@@ -2980,7 +2980,13 @@ namespace nabs
 			inline FileOpenFlags& create_perms(int x)   { _create_perms = x; return *this; }
 		};
 
-		std::string get_environment_var(const std::string& name);
+		/*
+			Get an environment variable with the given name. If the variable does not
+			exist, an empty optional is returned. Otherwise, its value is returned.
+
+			Note that a *set* variable with an empty string is different from it not existing.
+		*/
+		std::optional<std::string> get_environment_var(const std::string& name);
 	}
 
 	inline constexpr int ARCH_UNKNOWN   = 0;
@@ -5328,11 +5334,12 @@ namespace nabs
 		static std::vector<fs::path> get_path_variable()
 		{
 			std::vector<fs::path> ret;
-			auto var = os::get_environment_var("PATH");
+			auto _var = os::get_environment_var("PATH");
 
-			if(var.empty())
+			if(!_var.has_value())
 				return { };
 
+			auto var = _var.value();
 			while(true)
 			{
 				auto i = var.find(':');
@@ -5569,8 +5576,8 @@ namespace nabs
 		// want to use mingw to compile the project.
 
 		auto path_env = impl::get_path_variable();
-		if(auto cc = os::get_environment_var("CC"); !cc.empty())
-			return impl::get_compiler_from_env_var(path_env, cc, LANGUAGE_C);
+		if(auto cc = os::get_environment_var("CC"); cc.has_value())
+			return impl::get_compiler_from_env_var(path_env, *cc, LANGUAGE_C);
 
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
@@ -5617,8 +5624,8 @@ namespace nabs
 	Result<Compiler, std::string> find_cpp_compiler()
 	{
 		auto path_env = impl::get_path_variable();
-		if(auto cc = os::get_environment_var("CXX"); !cc.empty())
-			return impl::get_compiler_from_env_var(path_env, cc, LANGUAGE_CPP);
+		if(auto cxx = os::get_environment_var("CXX"); cxx.has_value())
+			return impl::get_compiler_from_env_var(path_env, *cxx, LANGUAGE_CPP);
 
 	#if defined(_MSC_VER) || (defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MINGW32__) && !defined(__MINGW64__))
 
@@ -7698,20 +7705,22 @@ namespace nabs
 		return stoi(std::string(s), base);
 	}
 
-	std::string os::get_environment_var(const std::string& name)
+	std::optional<std::string> os::get_environment_var(const std::string& name)
 	{
 	#if defined(_WIN32)
 		std::string var;
 		var.resize(4096, ' ');
 		size_t len = 0;
 		getenv_s(&len, var.data(), 4096, name.c_str());
-		var.resize(len);
+		if(len == 0)
+			return { };
 
+		var.resize(len);
 		return var;
 	#else
 		char* buf = getenv(name.c_str());
 		if(buf == nullptr)
-			return "";
+			return { };
 		else
 			return std::string(buf);
 	#endif
