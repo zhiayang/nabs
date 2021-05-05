@@ -3110,6 +3110,7 @@ namespace nabs
 	inline constexpr int LANGUAGE_CPP       = 2;
 	inline constexpr int LANGUAGE_OBJC      = 3;
 	inline constexpr int LANGUAGE_OBJCPP    = 4;
+	inline constexpr int LANGUAGE_ASSEMBLY  = 5;
 
 	/*
 		Encapsulates a particular binary as a compiler. This can actually represent a compiler, a linker,
@@ -3244,6 +3245,11 @@ namespace nabs
 		Compiler ld;
 		CompilerFlags ldflags;
 
+		Compiler as;
+		CompilerFlags asflags;
+
+		Compiler ar;
+		CompilerFlags arflags;
 
 		// helper methods
 		Toolchain& add_c_flags(const std::vector<std::string>& flags);
@@ -3323,6 +3329,11 @@ namespace nabs
 		// a bitmask of tools that you need to find. see `TOOL_*` above. By default
 		// we look for a C compiler, a C++ compiler, a linker, and an archive creator (AR).
 		int required_tools = TOOL_C_COMPILER | TOOL_CPP_COMPILER | TOOL_LINKER | TOOL_AR;
+
+		// whether we should use the c++ compiler as the linker. On most platforms, the c++
+		// compiler actually calls the linker with a bunch of stuff so the STL can be linked,
+		// so it's easier to use that as the linker.
+		bool use_cpp_compiler_as_linker = true;
 
 		// taken together, we look for executables under `<sysroot>/<prefix>/<bin_name>`, so for
 		// a default setup, we would find `/usr/bin/clang` for instance.
@@ -5315,10 +5326,20 @@ namespace nabs
 			#if !NABS_STRICT_COMPILER_CHECK
 				if(auto name = path.filename().string(); name == "cl.exe" || name == "cl")
 					return Compiler::KIND_MSVC_CL;
-				else if(ends_with(name, "clang") || ends_with(name, "clang++"))
+				else if(name == "clang" || name == "clang++" || ends_with(name, "-clang") || ends_with(name, "-clang++"))
 					return Compiler::KIND_CLANG;
-				else if(ends_with(name, "gcc") || ends_with(name, "g++"))
+				else if(name == "gcc" || name == "g++" || ends_with(name, "-gcc") || ends_with(name, "-g++"))
 					return Compiler::KIND_GCC;
+				else if(name == "ld" || ends_with(name, "-ld"))
+					return Compiler::KIND_LD;
+				else if(name == "ar" || ends_with(name, "-ar"))
+					return Compiler::KIND_AR;
+				else if(name == "as" || ends_with(name, "-as"))
+					return Compiler::KIND_GNU_AS;
+				else if(name == "strip" || ends_with(name, "-strip"))
+					return Compiler::KIND_STRIP;
+				else if(name == "objcopy" || ends_with(name, "-objcopy"))
+					return Compiler::KIND_OBJCOPY;
 			#endif
 
 			// tbh the exit code doesn't matter, since we know it exists
@@ -5530,47 +5551,97 @@ namespace nabs
 
 	Result<Toolchain, std::string> find_toolchain(const ToolchainFinderOptions& opts)
 	{
-		Toolchain ret;
-		if(auto cc = find_c_compiler(opts); !cc.ok())
-			return Err(cc.error());
-		else
-			ret.cc = cc.unwrap();
-
-		if(auto cxx = find_cpp_compiler(opts); !cxx.ok())
-			return Err(cxx.error());
-		else
-			ret.cxx = cxx.unwrap();
-
-		if(ret.cxx.kind == Compiler::KIND_MSVC_CL)
+		Toolchain ret { };
+		if(opts.required_tools & TOOL_C_COMPILER)
 		{
-			// use link.exe, which is in the same folder as cl.exe
-			ret.ld.path = ret.cxx.path.parent_path() / "link.exe";
-			ret.ld.kind = Compiler::KIND_MSVC_LINK;
-			ret.ld.lang = LANGUAGE_CPP;
-		}
-		else
-		{
-			// use the c++ compiler to link.
-			ret.ld = ret.cxx;
+			if(auto cc = find_c_compiler(opts); !cc.ok())
+				return Err(cc.error());
+			else
+				ret.cc = cc.unwrap();
+
+			ret.cflags = get_default_cflags();
+			ret.cc.log_hook = default_compiler_logger(false, "cc");
 		}
 
-		ret.cflags = get_default_cflags();
-		ret.cxxflags = get_default_cxxflags();
+		if(opts.required_tools & TOOL_CPP_COMPILER)
+		{
+			if(auto cxx = find_cpp_compiler(opts); !cxx.ok())
+				return Err(cxx.error());
+			else
+				ret.cxx = cxx.unwrap();
 
-		// by default, create it.
-		ret.ldflags.create_missing_folders = true;
+			ret.cxxflags = get_default_cxxflags();
+			ret.cxx.log_hook = default_compiler_logger(false, "cxx");
+		}
 
-		ret.cc.log_hook  = default_compiler_logger(false, "cc");
-		ret.cxx.log_hook = default_compiler_logger(false, "cxx");
-		ret.ld.log_hook  = default_compiler_logger(true, "ld");
+		if(opts.required_tools & TOOL_LINKER)
+		{
+			if(ret.cxx.kind == Compiler::KIND_MSVC_CL || !opts.use_cpp_compiler_as_linker)
+			{
+				if(auto ld = impl::find_tool("ld", "LD", LANGUAGE_NONE, TOOL_LINKER, opts); !ld.ok())
+					return Err(ld.error());
+				else
+					ret.ld = ld.unwrap();
+			}
+			else
+			{
+				// use the c++ compiler to link.
+				ret.ld = ret.cxx;
+			}
 
-	#if defined(__APPLE__)
-		ret.objcc = ret.cc;
-		ret.objcflags = get_default_cflags();
+			ret.ldflags.create_missing_folders = true;
+			ret.ld.log_hook = default_compiler_logger(true, "ld");
+		}
 
-		ret.objcxx = ret.cxx;
-		ret.objcxxflags = get_default_cxxflags();
-	#endif
+		if(opts.required_tools & TOOL_ASSEMBLER)
+		{
+			if(auto as = impl::find_tool("as", "AS", LANGUAGE_ASSEMBLY, TOOL_ASSEMBLER, opts); !as.ok())
+				return Err(as.error());
+			else
+				ret.as = as.unwrap();
+
+			ret.as.log_hook = default_compiler_logger(false, "as");
+		}
+
+		if(opts.required_tools & TOOL_AR)
+		{
+			if(auto ar = impl::find_tool("ar", "AR", LANGUAGE_NONE, TOOL_AR, opts); !ar.ok())
+				return Err(ar.error());
+			else
+				ret.ar = ar.unwrap();
+
+			ret.ar.log_hook = default_compiler_logger(false, "ar");
+		}
+
+
+		/*
+			missing:
+			TOOL_PREPROCESSOR
+			TOOL_OBJCOPY
+			TOOL_STRIP
+		*/
+
+
+
+		if(opts.required_tools & TOOL_OBJC_COMPILER)
+		{
+		#if defined(__APPLE__)
+			ret.objcc = ret.cc;
+			ret.objcflags = get_default_cflags();
+		#else
+			return Err<std::string>("obj-c on non-apple platforms not supported");
+		#endif
+		}
+
+		if(opts.required_tools & TOOL_OBJCPP_COMPILER)
+		{
+		#if defined(__APPLE__)
+			ret.objcxx = ret.cxx;
+			ret.objcxxflags = get_default_cxxflags();
+		#else
+			return Err<std::string>("obj-c++ on non-apple platforms not supported");
+		#endif
+		}
 
 		return Ok(std::move(ret));
 	}
