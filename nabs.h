@@ -1887,20 +1887,20 @@ namespace nabs
 			return *this;
 		}
 
-		T* operator -> () { assert(this->state == STATE_VAL); return &this->val; }
-		const T* operator -> () const { assert(this->state == STATE_VAL); return &this->val; }
+		T* operator -> () { this->assert_has_value(); return &this->val; }
+		const T* operator -> () const { this->assert_has_value(); return &this->val; }
 
-		T& operator* () { assert(this->state == STATE_VAL); return this->val; }
-		const T& operator* () const  { assert(this->state == STATE_VAL); return this->val; }
+		T& operator* () { this->assert_has_value(); return this->val; }
+		const T& operator* () const  { this->assert_has_value(); return this->val; }
 
 		operator bool() const { return this->state == STATE_VAL; }
 		bool ok() const { return this->state == STATE_VAL; }
 
-		const T& unwrap() const { assert(this->state == STATE_VAL); return this->val; }
-		const E& error() const { assert(this->state == STATE_ERR); return this->err; }
+		const T& unwrap() const { this->assert_has_value(); return this->val; }
+		const E& error() const { this->assert_is_error(); return this->err; }
 
-		T& unwrap() { assert(this->state == STATE_VAL); return this->val; }
-		E& error() { assert(this->state == STATE_ERR); return this->err; }
+		T& unwrap() { this->assert_has_value(); return this->val; }
+		E& error() { this->assert_is_error(); return this->err; }
 
 		// enable implicit upcast to a base type
 		template <typename U, typename = std::enable_if_t<
@@ -1928,6 +1928,19 @@ namespace nabs
 		}
 
 	private:
+		inline void assert_has_value() const
+		{
+			if(this->state != STATE_VAL)
+				error_and_exit("unwrapping result of Err: {}", this->error());
+		}
+
+		inline void assert_is_error() const
+		{
+			if(this->state != STATE_ERR)
+				error_and_exit("result is not an Err");
+		}
+
+
 		// 0 = schrodinger -- no error, no value.
 		// 1 = valid
 		// 2 = error
@@ -2002,8 +2015,8 @@ namespace nabs
 		operator bool() const { return this->state == STATE_VAL; }
 		bool ok() const { return this->state == STATE_VAL; }
 
-		const E& error() const { assert(this->state == STATE_ERR); return this->err; }
-		E& error() { assert(this->state == STATE_ERR); return this->err; }
+		const E& error() const { this->assert_is_error(); return this->err; }
+		E& error() { this->assert_is_error(); return this->err; }
 
 		void expect(std::string_view msg) const
 		{
@@ -2029,6 +2042,12 @@ namespace nabs
 		}
 
 	private:
+		inline void assert_is_error() const
+		{
+			if(this->state != STATE_ERR)
+				error_and_exit("result is not an Err");
+		}
+
 		int state = 0;
 		E err;
 	};
