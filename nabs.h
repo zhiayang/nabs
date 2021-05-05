@@ -2983,6 +2983,93 @@ namespace nabs
 		std::string get_environment_var(const std::string& name);
 	}
 
+	inline constexpr int ARCH_UNKNOWN   = 0;
+	inline constexpr int ARCH_X86_64    = 1;
+	inline constexpr int ARCH_X86_I686  = 2;
+	inline constexpr int ARCH_ARMV7     = 3;
+	inline constexpr int ARCH_AARCH64   = 4;
+
+	inline constexpr int OS_NONE        = 0x0000;
+	inline constexpr int OS_WINDOWS     = 0x0001;
+
+	inline constexpr int OS_UNIXLIKE    = 0x4000;
+	inline constexpr int OS_MACOS       = OS_UNIXLIKE | 0x0001;
+	inline constexpr int OS_LINUX       = OS_UNIXLIKE | 0x0002;
+	inline constexpr int OS_FREEBSD     = OS_UNIXLIKE | 0x0003;
+
+	inline constexpr int ABI_NONE       = 0;
+	inline constexpr int ABI_GNU        = 1;
+	inline constexpr int ABI_MINGW32    = 2;
+	inline constexpr int ABI_EABI       = 3;
+
+	/*
+		An abstraction of a particular platform, which comprises (for now):
+		1. architecture
+		2. OS
+		3. ABI
+
+		As the name suggests, the triple only has... at most 3 arguments. Some triples
+		can only have two elements, for example x86_64-orionx is a valid target triple:
+		the ABI is implied to be System V in this particular case.
+
+		However, triples like `x86_64-pc-linux-gnu` don't exist. this will be
+		`x86_64-linux-gnu` under our system, or `x86_64-linux`, since the gnu abi is
+		also (most of the time) implied to the System V abi.
+
+		When parsing a triple (`from_triple`), we split the string by dashes; this
+		means that your OS, architecture, and ABI cannot have dashes in them, if not
+		they will be parsed incorrectly.
+	*/
+	struct Platform
+	{
+		int arch = 0;
+		int os   = 0;
+		int abi  = 0;
+
+		std::string triple() const;
+		static Result<Platform, std::string> from_triple(std::string_view triple);
+
+		inline bool operator== (const Platform& p) const
+		{
+			return this->arch == p.arch
+				&& this->os == p.os
+				&& this->abi == p.abi;
+		}
+
+		inline bool operator!= (const Platform& p) const
+		{
+			return !(*this == p);
+		}
+	};
+
+	/*
+		To support user-defined OSes, ABIs, and architectures, we provide a customisation point
+		to output and parse triples from their integer values. Just specialise this template
+		for <int>, and your function will be called automatically.
+
+		For the `user_parse_` functions, return -1 (or any negative number) to signal an error.
+	*/
+	template <typename T> std::string user_os_to_string(int os);
+	template <typename T> std::string user_abi_to_string(int abi);
+	template <typename T> std::string user_arch_to_string(int arch);
+
+	template <typename T> int user_parse_os(std::string_view sv);
+	template <typename T> int user_parse_abi(std::string_view sv);
+	template <typename T> int user_parse_arch(std::string_view sv);
+
+
+
+
+
+
+
+	/*
+		An abstraction of a library that needs to be linked. It encapsulates all the flags that need to
+		be passed to both the compiler and the linker in order to use the library. You can initialise
+		this yourself and call `use_library()` to use its flags.
+
+		The other (recommended) method is to use the `auto_` functions and let us do everything for you.
+	*/
 	struct Library
 	{
 		std::string name;
@@ -2997,6 +3084,7 @@ namespace nabs
 		std::vector<std::string> linker_flags;
 		std::vector<fs::path> additional_linker_inputs;
 	};
+
 
 	/*
 		A list of languages supported by nabs. This is not an enumeration because we want
@@ -3206,18 +3294,21 @@ namespace nabs
 		and the sane \n Unix line ending.
 	*/
 	std::vector<std::string_view> split_string_lines(std::string& s);
+	std::vector<std::string_view> split_string_lines(std::string_view sv);
 
 	/*
 		Split a string by the given delimiter. You cannot perfectly emulate split_string_lines
 		by using '\n' as the delimiter (thanks, windows...), so don't do it.
 	*/
 	std::vector<std::string_view> split_string(std::string& s, char delim);
+	std::vector<std::string_view> split_string(std::string_view sv, char delim);
 
 	/*
 		Split a string by any whitespace (including \r, \n, \t, ' '). This is useful to emulate
 		shell-isms (or make-isms) that split arguments like that.
 	*/
 	std::vector<std::string_view> split_string_whitespace(std::string& s);
+	std::vector<std::string_view> split_string_whitespace(std::string_view sv);
 
 	/*
 		similar to std::stoi, but instead of throwing an exception (seriously...) it returns
@@ -5280,6 +5371,117 @@ namespace nabs
 		}
 	}
 
+	// dummy implementations
+	template <typename T> std::string user_os_to_string(int) { return ""; }
+	template <typename T> std::string user_abi_to_string(int) { return ""; }
+	template <typename T> std::string user_arch_to_string(int) { return ""; }
+
+	template <typename T> int user_parse_os(std::string_view) { return -1; }
+	template <typename T> int user_parse_abi(std::string_view) { return -1; }
+	template <typename T> int user_parse_arch(std::string_view) { return -1; }
+
+	std::string Platform::triple() const
+	{
+		std::string sos;
+		std::string sabi;
+		std::string sarch;
+
+		switch(this->arch)
+		{
+			case ARCH_X86_64:   sarch = "x86_64"; break;
+			case ARCH_X86_I686: sarch = "i686"; break;
+			case ARCH_ARMV7:    sarch = "arm"; break;
+			case ARCH_AARCH64:  sarch = "aarch64"; break;
+			case ARCH_UNKNOWN:  sarch = ""; break;
+			default:            sarch = user_arch_to_string<int>(this->arch); break;
+		}
+
+		switch(this->os)
+		{
+			case OS_WINDOWS:    sos = "w64"; break;
+			case OS_MACOS:      sos = "macos"; break;
+			case OS_LINUX:      sos = "linux"; break;
+			case OS_FREEBSD:    sos = "freebsd"; break;
+			case OS_UNIXLIKE:   sos = "unix"; break;
+			case OS_NONE:       sos = ""; break;
+			default:            sos = user_os_to_string<int>(this->os); break;
+		}
+
+		switch(this->abi)
+		{
+			case ABI_GNU:       sabi = "gnu"; break;
+			case ABI_MINGW32:   sabi = "mingw32"; break;
+			case ABI_EABI:      sabi = "eabi"; break;
+			case ABI_NONE:      sabi = ""; break;
+			default:            sabi = user_abi_to_string<int>(this->abi); break;
+		}
+
+		auto join = [](const std::vector<std::string>& foo) -> std::string {
+			std::string ret;
+			for(size_t i = 0; i < foo.size(); i++)
+			{
+				ret += foo[i];
+				if(i + 1 != foo.size())
+					ret += "-";
+			}
+			return ret;
+		};
+
+		return join({ sarch, sos, sabi });
+	}
+
+	Result<Platform, std::string> Platform::from_triple(std::string_view triple)
+	{
+		auto parts = split_string(triple, '-');
+
+		// we need at least 1 thing -- arch.
+		if(parts.empty())
+			return Err<std::string>("empty triple");
+
+		Platform platform { };
+
+		auto& arch = parts[0];
+		if(arch == "unknown" || arch == "none") platform.arch = ARCH_UNKNOWN;
+		else if(arch == "x86_64")               platform.arch = ARCH_X86_64;
+		else if(arch == "i686")                 platform.arch = ARCH_X86_I686;
+		else if(arch == "arm")                  platform.arch = ARCH_ARMV7;
+		else if(arch == "aarch64")              platform.arch = ARCH_AARCH64;
+		else if(auto user = user_parse_arch<int>(arch); user >= 0)
+			platform.arch = user;
+		else
+			return Err<std::string>(zpr::sprint("unknown architecture '{}'", arch));
+
+		if(parts.size() > 1)
+		{
+			auto& os = parts[1];
+			// TODO: we might want to differentiate between win32 and win64
+			if(os == "win32" || os == "w32")        platform.os = OS_WINDOWS;
+			else if(os == "win64" || os == "w64")   platform.os = OS_WINDOWS;
+			else if(os == "macos")                  platform.os = OS_MACOS;
+			else if(os == "linux")                  platform.os = OS_LINUX;
+			else if(os == "freebsd")                platform.os = OS_FREEBSD;
+			else if(auto user = user_parse_os<int>(os); user >= 0)
+				platform.os = user;
+			else
+				return Err<std::string>(zpr::sprint("unknown os '{}'", os));
+		}
+
+		if(parts.size() > 2)
+		{
+			auto& abi = parts[2];
+			if(abi == "none")           platform.abi = ABI_NONE;
+			else if(abi == "eabi")      platform.abi = ABI_EABI;
+			else if(abi == "gnu")       platform.abi = ABI_GNU;
+			else if(abi == "mingw32")   platform.abi = ABI_MINGW32;
+			else if(auto user = user_parse_abi<int>(abi); user >= 0)
+				platform.abi = user;
+			else
+				return Err<std::string>(zpr::sprint("unknown abi '{}'", abi));
+		}
+
+		return Ok(platform);
+	}
+
 	Result<Compiler, std::string> find_c_compiler()
 	{
 		// TODO(#10): support cross-compilation better
@@ -6306,8 +6508,6 @@ namespace nabs::fs
 	*/
 	std::vector<fs::path> find_files_ext_recursively(const std::initializer_list<fs::path>& dir, std::string_view ext);
 
-
-
 	/*
 		Just a nonsense struct that reduces the amount of code you need to type to look for source files in
 		disjoint folders with different extensions (eg. c and c++)
@@ -7317,11 +7517,9 @@ namespace nabs
 		return ltrim(rtrim(s));
 	}
 
-	std::vector<std::string_view> split_string_lines(std::string& str)
+	std::vector<std::string_view> split_string_lines(std::string_view view)
 	{
 		std::vector<std::string_view> ret;
-		std::string_view view = str;
-
 		while(!view.empty())
 		{
 			size_t ln = view.find('\n');
@@ -7353,12 +7551,16 @@ namespace nabs
 		return ret;
 	}
 
+	std::vector<std::string_view> split_string_lines(std::string& str)
+	{
+		return split_string_lines(std::string_view(str));
+	}
+
 	namespace impl
 	{
 		template <typename Predicate>
-		inline std::vector<std::string_view> split_string_pred(std::string& str, Predicate&& pred)
+		inline std::vector<std::string_view> split_string_pred(std::string_view view, Predicate&& pred)
 		{
-			std::string_view view = str;
 			std::vector<std::string_view> ret;
 			while(true)
 			{
@@ -7384,19 +7586,29 @@ namespace nabs
 		}
 	}
 
+	std::vector<std::string_view> split_string(std::string_view sv, char delim)
+	{
+		return impl::split_string_pred(sv, [delim](char c) -> bool {
+			return c == delim;
+		});
+	}
+
 	std::vector<std::string_view> split_string(std::string& str, char delim)
 	{
-		return impl::split_string_pred(str, [delim](char c) -> bool {
-			return c == delim;
+		return split_string(std::string_view(str), delim);
+	}
+
+	std::vector<std::string_view> split_string_whitespace(std::string_view sv)
+	{
+		return impl::split_string_pred(sv, [](char c) -> bool {
+			return c == ' ' || c == '\t' || c == '\r' || c == '\n'
+				|| c == '\v' || c == '\f';
 		});
 	}
 
 	std::vector<std::string_view> split_string_whitespace(std::string& str)
 	{
-		return impl::split_string_pred(str, [](char c) -> bool {
-			return c == ' ' || c == '\t' || c == '\r' || c == '\n'
-				|| c == '\v' || c == '\f';
-		});
+		return split_string_whitespace(std::string_view(str));
 	}
 
 	std::optional<int64_t> stoi(const std::string& s, int base)
