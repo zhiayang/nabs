@@ -3251,6 +3251,61 @@ namespace nabs
 		template <typename... Includes> Toolchain& add_cpp_includes(Includes&&... includes);
 	};
 
+	/*
+		The kinds of tools (that make up a toolchain) that we know about.
+	*/
+	inline constexpr uint64_t TOOL_C_COMPILER       = (1UL <<  0);
+	inline constexpr uint64_t TOOL_CPP_COMPILER     = (1UL <<  1);
+	inline constexpr uint64_t TOOL_PREPROCESSOR     = (1UL <<  2);
+	inline constexpr uint64_t TOOL_LINKER           = (1UL <<  3);
+	inline constexpr uint64_t TOOL_ASSEMBLER        = (1UL <<  4);
+	inline constexpr uint64_t TOOL_AR               = (1UL <<  5);
+	inline constexpr uint64_t TOOL_OBJCOPY          = (1UL <<  6);
+	inline constexpr uint64_t TOOL_STRIP            = (1UL <<  7);
+	inline constexpr uint64_t TOOL_NM               = (1UL <<  8);
+	inline constexpr uint64_t TOOL_OBJC_COMPILER    = (1UL <<  9);
+	inline constexpr uint64_t TOOL_OBJCPP_COMPILER  = (1UL << 10);
+
+
+
+	/*
+		A structure encapsulating the various options and flags you can use to look for a toolchain.
+	*/
+	struct ToolchainFinderOptions
+	{
+		// a bitmask of tools that you need to find. see `TOOL_*` above. By default
+		// we look for a C compiler, a C++ compiler, a linker, and an archive creator (AR).
+		uint64_t required_tools = TOOL_C_COMPILER | TOOL_CPP_COMPILER | TOOL_LINKER | TOOL_AR;
+
+		// taken together, we look for executables under `<sysroot>/<prefix>/<bin_name>`, so for
+		// a default setup, we would find `/usr/bin/clang` for instance.
+
+		// the sysroot of the toolchain (that acts as `/`). All searches for toolchains
+		// will pretend that this is `/` and start from there.
+		fs::path sysroot = { };
+
+		// the prefix of the toolchain. for most unix systems, the default prefix is `usr`
+		fs::path prefix = "usr";
+
+		// the name of the bin folder. by default, this is `bin`. you shouldn't need to change this
+		// unless your toolchain is laid out in a very strange manner.
+		fs::path bin_name = "bin";
+
+		// the target platform of the toolchain. when searching for binaries, we first try the name
+		// of the tool prefixed with the target triple (eg. `x86_64-linux-gnu-gcc`) before trying
+		// the plain name (eg. `gcc`).
+		Platform target { };
+	};
+
+
+
+
+	/*
+		A structure encapsulating the various options and flags you can use to look for a library; you
+		pass this to find_library alongside the name of the library you want to find. You can also
+		change the default finder options (so you don't have to keep passing them) by using
+		`set_default_library_finder_options()`.
+	*/
 	struct LibraryFinderOptions
 	{
 		// use this to define your own search algorithm. this is always used if it is set.
@@ -5131,6 +5186,8 @@ namespace nabs
 
 	CompilerFlags get_default_cflags();
 	CompilerFlags get_default_cxxflags();
+
+	Result<Toolchain, std::string> find_toolchain(const ToolchainFinderOptions& opts = { });
 }
 
 // implementation
@@ -5593,8 +5650,7 @@ namespace nabs
 	#endif // _WIN32
 	}
 
-	// TODO: again, support cross-compilation, prefix/sysroot, etc.
-	Result<Toolchain, std::string> find_toolchain()
+	Result<Toolchain, std::string> find_toolchain(const ToolchainFinderOptions& opts)
 	{
 		Toolchain ret;
 		if(auto cc = find_c_compiler(); !cc.ok())
