@@ -3262,6 +3262,13 @@ namespace nabs
 		bool require_static_library = false;
 		std::vector<fs::path> additional_search_paths = { };
 
+		// the sysroot to use when looking for libraries. this field only affects the default unix locations.
+		// (usr/ and usr/local/ -- so we would only look in `<sysroot>/usr/lib` and `<sysroot>/usr/local/lib`)
+		// this field *does not* affect anything in `additional_search_paths`. also, when this option/path is set
+		// (ie. not empty), we will *not* attempt to search for libraries under the "real" /usr or /usr/local.
+		fs::path sysroot = { };
+
+		// TODO(#15) Cannot specify path to pkg-config
 		// this is contingent on pkg-config being available (also works on windows)
 		bool use_pkg_config = true;
 
@@ -3451,6 +3458,12 @@ namespace nabs
 		zmt::Synchronised<GlobalState>& global_state();
 	}
 
+	/*
+		Set the default LibraryFinderOptions struct that will be used by `find_library()` (and
+		anything using it indirectly) if no options are passed in. For example, if you know
+		that all your libraries are in a separate path, you can add that to `additional_search_paths`
+		and set it as the default.
+	*/
 	inline void set_default_library_finder_options(LibraryFinderOptions opts)
 	{
 		impl::global_state().wlock()->default_finder_opts = std::move(opts);
@@ -7865,16 +7878,20 @@ namespace nabs
 			if(l.ok()) return l;
 		}
 
+		fs::path sysroot = "/";
+		if(!opts.sysroot.empty())
+			sysroot = opts.sysroot;
+
 	#if !defined(_WIN32)
 		if(opts.use_usr)
 		{
-			auto l = impl::find_in_unixlike_layout(compiler, lib, "/usr", opts);
+			auto l = impl::find_in_unixlike_layout(compiler, lib, sysroot / "usr", opts);
 			if(l.ok()) return l;
 		}
 
 		if(opts.use_usr_local)
 		{
-			auto l = impl::find_in_unixlike_layout(compiler, lib, "/usr/local", opts);
+			auto l = impl::find_in_unixlike_layout(compiler, lib, sysroot / "usr/local", opts);
 			if(l.ok()) return l;
 		}
 	#endif
