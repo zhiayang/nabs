@@ -6202,21 +6202,18 @@ namespace nabs::fs
 	namespace impl
 	{
 		template <typename Iter, typename Predicate>
-		inline std::vector<fs::path> find_files_helper(const fs::path& dir, Predicate&& pred)
+		inline void find_files_helper(std::vector<fs::path>& list, const fs::path& dir, Predicate&& pred)
 		{
 			// i guess this is not an error...?
 			if(!fs::is_directory(dir))
-				return { };
+				return;
 
-			std::vector<fs::path> paths;
 			auto iter = Iter(dir);
 			for(auto& ent : iter)
 			{
 				if((ent.is_regular_file() || ent.is_symlink()) && pred(ent))
-					paths.push_back(ent.path());
+					list.push_back(ent.path());
 			}
-
-			return paths;
 		}
 	}
 
@@ -6228,7 +6225,9 @@ namespace nabs::fs
 	template <typename Predicate>
 	inline std::vector<fs::path> find_files(const fs::path& dir, Predicate&& pred)
 	{
-		return impl::find_files_helper<fs::directory_iterator>(dir, pred);
+		std::vector<fs::path> ret;
+		impl::find_files_helper<fs::directory_iterator>(ret, dir, pred);
+		return ret;
 	}
 
 	/*
@@ -6237,8 +6236,36 @@ namespace nabs::fs
 	template <typename Predicate>
 	inline std::vector<fs::path> find_files_recursively(const fs::path& dir, Predicate&& pred)
 	{
-		return impl::find_files_helper<fs::recursive_directory_iterator>(dir, pred);
+		std::vector<fs::path> ret;
+		impl::find_files_helper<fs::recursive_directory_iterator>(ret, dir, pred);
+		return ret;
 	}
+
+	/*
+		Same as `find_files`, but in multiple (distinct) directories at once.
+	*/
+	template <typename Predicate>
+	inline std::vector<fs::path> find_files(const std::vector<fs::path>& dirs, Predicate&& pred)
+	{
+		std::vector<fs::path> ret;
+		for(auto& dir : dirs)
+			impl::find_files_helper<fs::directory_iterator>(ret, dir, pred);
+		return ret;
+	}
+
+	/*
+		Same as `find_files_recursively`, but in multiple (distinct) directories at once.
+	*/
+	template <typename Predicate>
+	inline std::vector<fs::path> find_files_recursively(const std::vector<fs::path>& dirs, Predicate&& pred)
+	{
+		std::vector<fs::path> ret;
+		for(auto& dir : dirs)
+			impl::find_files_helper<fs::recursive_directory_iterator>(ret, dir, pred);
+		return ret;
+	}
+
+
 
 	/*
 		Same semantics as `find_files`, but it returns files matching the given extension.
@@ -6249,6 +6276,45 @@ namespace nabs::fs
 		Same semantics as `find_files_recursively`, but it returns files matching the given extension.
 	*/
 	std::vector<fs::path> find_files_ext_recursively(const fs::path& dir, std::string_view ext);
+
+	/*
+		Same semantics as `find_files`, but for multiple directories at once.
+	*/
+	std::vector<fs::path> find_files_ext(const std::initializer_list<fs::path>& dir, std::string_view ext);
+
+	/*
+		Same semantics as `find_files_recursively`, but for multiple directories at once.
+	*/
+	std::vector<fs::path> find_files_ext_recursively(const std::initializer_list<fs::path>& dir, std::string_view ext);
+
+
+
+	/*
+		Just a nonsense struct that reduces the amount of code you need to type to look for source files in
+		disjoint folders with different extensions (eg. c and c++)
+	*/
+	struct FileFinder
+	{
+		inline FileFinder& add(const fs::path& dir, const std::string& ext)
+		{
+			this->list.push_back({ dir, ext });
+			return *this;
+		}
+
+		inline std::vector<fs::path> find() const
+		{
+			std::vector<fs::path> ret;
+			for(auto& [ dir, ext ] : this->list)
+			{
+				auto foo = find_files_ext_recursively(dir, ext);
+				ret.insert(ret.end(), std::make_move_iterator(foo.begin()), std::make_move_iterator(foo.end()));
+			}
+			return ret;
+		}
+
+	private:
+		std::vector<std::pair<fs::path, std::string>> list;
+	};
 }
 
 #if !NABS_DECLARATION_ONLY
@@ -6267,6 +6333,22 @@ namespace nabs::fs
 			return ent.path().extension() == ext;
 		});
 	}
+
+	std::vector<fs::path> find_files_ext(const std::initializer_list<fs::path>& dirs, std::string_view ext)
+	{
+		return find_files(dirs, [&ext](auto ent) -> bool {
+			return ent.path().extension() == ext;
+		});
+	}
+
+	std::vector<fs::path> find_files_ext_recursively(const std::initializer_list<fs::path>& dirs, std::string_view ext)
+	{
+		return find_files_recursively(dirs, [&ext](auto ent) -> bool {
+			return ent.path().extension() == ext;
+		});
+	}
+
+
 
 	// thanks to xXSuperCuberXx for teaching me about good naming conventions
 	Result<FILE*, std::string> fopen_wrapper(const fs::path& path, const char* mode)
