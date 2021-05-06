@@ -8668,6 +8668,52 @@ namespace nabs
 
 			return Ok();
 		}
+
+		template <typename Callback>
+		static Result<std::vector<dep::Item*>, std::string> objects_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+			const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_dependencies, Callback&& obj_callback)
+		{
+			using namespace dep;
+
+			std::vector<Item*> objs;
+
+			for(auto& f : src_files)
+			{
+				auto _opt = auto_infer_compiler_from_file(toolchain, f);
+				if(!_opt.has_value())
+				{
+					impl::int_warn("*_from_sources(): could not infer compiler for source file '{}'", f);
+					return Err<std::string>(f.string());
+				}
+
+				auto [ compiler, flags ] = *_opt;
+
+				auto src = graph.get_or_add(f);
+				auto obj = graph.get_or_add(get_default_object_filename(compiler, flags, f));
+
+				// setup the dependency from obj <- source
+				obj->add_produced_by(src);
+
+				// depend on the libraries
+				for(auto edep : extra_dependencies)
+					obj->depend(edep);
+
+				// also setup the header depends for the source
+				read_dependencies_from_file(graph, get_dependency_filename(compiler, flags, f));
+
+				// lastly, check precompiled headers.
+				if(auto pch = flags.precompiled_header; !pch.empty())
+				{
+					auto pchname = get_default_pch_filename(compiler, flags, pch);
+					obj->depend(graph.get_or_add(KIND_PCH, pchname));
+				}
+
+				obj_callback(src, obj);
+				objs.push_back(obj);
+			}
+
+			return Ok(std::move(objs));
+		}
 	}
 
 
@@ -8748,6 +8794,11 @@ namespace nabs
 		return auto_build_targets(toolchain, graph, { target }, hooks);
 	}
 
+	Result<std::vector<dep::Item*>, std::string> auto_objects_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_dependencies)
+	{
+		return impl::objects_from_sources(graph, toolchain, src_files, extra_dependencies, [](auto...) { });
+	}
 
 
 
@@ -8764,38 +8815,13 @@ namespace nabs
 		for(auto edep : extra_dependencies)
 			exe_file->depend(edep);
 
-		for(auto& f : src_files)
-		{
-			auto _opt = auto_infer_compiler_from_file(toolchain, f);
-			if(!_opt.has_value())
-			{
-				impl::int_warn("auto_executable_from_sources(): could not infer compiler for source file '{}'", f);
-				return Err<std::string>(f.string());
-			}
-
-			auto [ compiler, flags ] = *_opt;
-
-			auto src = graph.get_or_add(f);
-			auto obj = graph.get_or_add(get_default_object_filename(compiler, flags, f));
-
-			// setup the dependency from obj <- source
-			obj->add_produced_by(src);
+		auto objs = impl::objects_from_sources(graph, toolchain, src_files, extra_dependencies, [&exe_file](Item* src, Item* obj) {
+			(void) src;
 			exe_file->add_produced_by(obj);
+		});
 
-			// depend on the libraries
-			for(auto edep : extra_dependencies)
-				obj->depend(edep);
-
-			// also setup the header depends for the source
-			read_dependencies_from_file(graph, get_dependency_filename(compiler, flags, f));
-
-			// lastly, check precompiled headers.
-			if(auto pch = flags.precompiled_header; !pch.empty())
-			{
-				auto pchname = get_default_pch_filename(compiler, flags, pch);
-				obj->depend(graph.get_or_add(KIND_PCH, pchname));
-			}
-		}
+		if(objs.ok())   return Ok(exe_file);
+		else            return Err(objs.error());
 
 		return Ok(exe_file);
 	}
