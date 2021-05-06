@@ -5937,7 +5937,10 @@ namespace nabs
 		const fs::path& files);
 
 	// this actually calls 'c++' or 'cc', and not 'ld'.
-	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
+	int link_object_files(const Compiler& linker, const CompilerFlags& opts, const std::optional<fs::path>& output,
+		const std::vector<fs::path>& files);
+
+	int make_static_library(const Compiler& ar, const CompilerFlags& opts, const fs::path& output,
 		const std::vector<fs::path>& files);
 
 	template <typename... Args, typename = std::enable_if_t<((std::is_convertible_v<Args, fs::path>) && ...)>>
@@ -5950,7 +5953,7 @@ namespace nabs
 	// just overloads that don't take the output path.
 	int compile_to_object_file(const Compiler& compiler, const CompilerFlags& opts, const fs::path& file);
 	int compile_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files);
-	int link_object_files(const Compiler& compiler, const CompilerFlags& opts, const std::vector<fs::path>& files);
+	int link_object_files(const Compiler& linker, const CompilerFlags& opts, const std::vector<fs::path>& files);
 
 	fs::path get_default_object_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path file);
 	fs::path get_dependency_filename(const Compiler& compiler, const CompilerFlags& opts, fs::path file);
@@ -6653,15 +6656,40 @@ namespace nabs
 
 		impl::add_flags_for_linking_objects(args, linker, opts, files);
 
-
 		if(linker.log_hook)
 			linker.log_hook(out, files, args);
 
 		// construct the command, and run it.
+		// TODO(#22): msvc link.exe generates noise on stdout
 		return cmd(linker.path.string(), std::move(args)).run();
 	}
 
+	int make_static_library(const Compiler& ar, const CompilerFlags& opts, const fs::path& output,
+		const std::vector<fs::path>& files)
+	{
+		// we don't use the standard arg-setup things here, because ar/lib.exe is fundamentally
+		// quite a different program.
+		impl::create_missing_dirs(opts, output);
 
+		std::vector<std::string> args;
+		if(ar.kind == Compiler::KIND_AR)
+		{
+			// by default, assume -r -c -s.
+			args.push_back("-r");
+			args.push_back("-c");
+			args.push_back("-s");
+			args.push_back(output.string());
+
+			for(auto& f : files)
+				args.push_back(f.string());
+		}
+		else
+		{
+			impl::int_error("make_static_library(): unsupported compiler");
+		}
+
+		return cmd(ar.path.string(), std::move(args)).run();
+	}
 
 
 
