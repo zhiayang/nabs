@@ -3559,18 +3559,14 @@ namespace nabs
 			if(base.empty())
 				base = fs::weakly_canonical(__FILE__).parent_path();
 
-			auto relative_path = [&base](const auto& p) -> auto {
-				return p.lexically_proximate(base);
-			};
-
 			if(output)
 			{
-				nabs::log("{} {}", name, relative_path(out).string());
+				nabs::log("{} {}", name, out.lexically_proximate(base).string());
 			}
 			else
 			{
 				nabs::log("{} {#}", name, map(in, [&](const auto& x) {
-					return relative_path(x).string();
+					return x.lexically_proximate(base).string();
 				}));
 			}
 		};
@@ -7164,7 +7160,7 @@ namespace nabs
 				flags.options.push_back("-fno-exceptions");
 				flags.options.push_back("-Wextra");
 				flags.options.push_back("-Wall");
-				flags.options.push_back("-O2");
+				// flags.options.push_back("-O2");
 
 				// TODO(#8): checking for stdc++fs and/or c++fs needs to be more robust
 				// eg. we should check if we were linked with libstdc++ or libc++, first of all
@@ -7185,8 +7181,8 @@ namespace nabs
 			else if(cpp.kind == Compiler::KIND_MSVC_CL)
 			{
 				flags.language_standard = "c++17";
-				flags.options.push_back("/O2");
 				flags.options.push_back("/W3");
+				// flags.options.push_back("/O2");
 			}
 			else
 			{
