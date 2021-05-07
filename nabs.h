@@ -6852,9 +6852,16 @@ namespace nabs::fs
 	*/
 	struct FileFinder
 	{
-		inline FileFinder& add(const fs::path& dir, const std::string& ext)
+		inline FileFinder& add(fs::path dir, std::string ext)
 		{
-			this->list.push_back({ dir, ext });
+			this->list.emplace_back(std::move(dir), std::move(ext));
+			return *this;
+		}
+
+		inline FileFinder& add_excluding(fs::path dir, std::string ext, std::vector<fs::path> excluding)
+		{
+			this->list_excluding.emplace_back(std::make_pair(std::move(dir), std::move(excluding)),
+				std::move(ext));
 			return *this;
 		}
 
@@ -6866,10 +6873,33 @@ namespace nabs::fs
 				auto foo = find_files_ext_recursively(dir, ext);
 				ret.insert(ret.end(), std::make_move_iterator(foo.begin()), std::make_move_iterator(foo.end()));
 			}
+
+			for(auto& [ dirs, _ext ] : this->list_excluding)
+			{
+				// FUCK
+				auto& ext = _ext;
+				auto& dir = dirs.first;
+				auto& excls = dirs.second;
+				auto foo = find_files_recursively(dir, [&](const auto& dirent) -> bool {
+					if(dirent.path().extension() != ext)
+						return false;
+
+					for(auto& excl : excls)
+					{
+						std::error_code ec { };
+						if(!fs::proximate(dirent.path(), excl, ec).empty())
+							return false;
+					}
+					return true;
+				});
+				ret.insert(ret.end(), std::make_move_iterator(foo.begin()), std::make_move_iterator(foo.end()));
+			}
+
 			return ret;
 		}
 
 	private:
+		std::vector<std::pair<std::pair<fs::path, std::vector<fs::path>>, std::string>> list_excluding;
 		std::vector<std::pair<fs::path, std::string>> list;
 	};
 }
