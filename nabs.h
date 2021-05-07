@@ -4779,6 +4779,10 @@ namespace nabs::dep
 		// this is only used if kind == KIND_SYSTEM_LIBRARY i guess
 		LibraryFinderOptions lib_finder_options;
 
+		// if this is set, the auto_* methods will use this toolchain when compiling
+		// this target, instead of the one provided at the top-level.
+		std::optional<Toolchain> override_toolchain;
+
 		// this is for your own use.
 		uint64_t user_flags = 0;
 		void* user_data = nullptr;
@@ -8512,7 +8516,7 @@ namespace nabs
 			So when we are compiling something that has KIND_SYSTEM_LIBRARY as a dependency, we do the
 			recursively_traverse_system_libraries thing above.
 		*/
-		static Result<void, std::string> auto_compile_one_thing(dep::Item* target, const Toolchain& tc,
+		static Result<void, std::string> auto_compile_one_thing(dep::Item* target, const Toolchain& _tc,
 			const AutoCompileHooks& hooks)
 		{
 			using namespace nabs::dep;
@@ -8604,6 +8608,10 @@ namespace nabs
 			// needs to run, so we quit now. note that phonyLIKE targets get past here and still get to "build".
 			if(!rebuild || target->kind() == KIND_PHONY || is_kind_sourcefile(target->kind()))
 				return Ok();
+
+			const Toolchain& tc = target->override_toolchain
+				? *target->override_toolchain
+				: _tc;
 
 			if(target->kind() == KIND_OBJECT)
 			{
@@ -8709,6 +8717,7 @@ namespace nabs
 
 				// setup the dependency from obj <- source
 				obj->add_produced_by(src);
+				obj->override_toolchain = toolchain;
 
 				// depend on the libraries
 				for(auto edep : extra_dependencies)
@@ -8821,25 +8830,24 @@ namespace nabs
 	// TODO(#3): missing API to build shared and static libraries
 	// probably refactor this out into more constituent parts (eg. auto_objects_from_sources) and reuse those.
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
-		const fs::path& _exe_name, const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_dependencies)
+		const fs::path& _exe_name, const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_deps)
 	{
 		using namespace dep;
 
 		auto exe_name = impl::ensure_exe_extension_if_necessary(toolchain.ld, toolchain.ldflags, _exe_name);
 		auto exe_file = graph.get_or_add(KIND_EXE, exe_name);
+		exe_file->override_toolchain = toolchain;
 
-		for(auto edep : extra_dependencies)
+		for(auto edep : extra_deps)
 			exe_file->depend(edep);
 
-		auto objs = impl::objects_from_sources(graph, toolchain, src_files, extra_dependencies, [&exe_file](Item* src, Item* obj) {
+		auto objs = impl::objects_from_sources(graph, toolchain, src_files, extra_deps, [&exe_file](Item* src, Item* obj) {
 			(void) src;
 			exe_file->add_produced_by(obj);
 		});
 
 		if(objs.ok())   return Ok(exe_file);
 		else            return Err(objs.error());
-
-		return Ok(exe_file);
 	}
 
 	Result<dep::Item*, std::string> auto_executable_from_sources(dep::Graph& graph, const Toolchain& toolchain,
@@ -8883,7 +8891,7 @@ namespace nabs
 		else if(lang == LANGUAGE_CPP)     hdr_kind = KIND_CPP_SOURCE, cmp = &tc.cxx, opts = &tc.cxxflags;
 		else if(lang == LANGUAGE_OBJC)    hdr_kind = KIND_OBJC_SOURCE, cmp = &tc.objcc, opts = &tc.objcflags;
 		else if(lang == LANGUAGE_OBJCPP)  hdr_kind = KIND_OBJCPP_SOURCE, cmp = &tc.objcxx, opts = &tc.objcxxflags;
-		else                                    impl::int_error("unsupported language '{}'", lang);
+		else                              impl::int_error("unsupported language '{}'", lang);
 
 		assert(cmp != nullptr && opts != nullptr);
 		auto pch_name = get_default_pch_filename(*cmp, *opts, header);
@@ -8892,6 +8900,7 @@ namespace nabs
 		auto pch = graph.get_or_add(KIND_PCH, pch_name);
 
 		pch->add_produced_by(hdr);
+		pch->override_toolchain = tc;
 
 		// also read the dependencies
 		read_dependencies_from_file(graph, get_dependency_filename(*cmp, *opts, header));
