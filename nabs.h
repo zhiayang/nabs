@@ -3255,6 +3255,7 @@ namespace nabs
 		Toolchain& add_c_flags(const std::vector<std::string>& flags);
 		Toolchain& add_cpp_flags(const std::vector<std::string>& flags);
 		Toolchain& add_link_flags(const std::vector<std::string>& flags);
+		Toolchain& add_c_cpp_flags(const std::vector<std::string>& flags);
 
 		Toolchain& add_c_includes(const std::vector<fs::path>& includes);
 		Toolchain& add_cpp_includes(const std::vector<fs::path>& includes);
@@ -3275,6 +3276,7 @@ namespace nabs
 		template <typename... Flags> Toolchain& add_c_flags(Flags&&... flags);
 		template <typename... Flags> Toolchain& add_cpp_flags(Flags&&... flags);
 		template <typename... Flags> Toolchain& add_link_flags(Flags&&... flags);
+		template <typename... Flags> Toolchain& add_c_cpp_flags(Flags&&... flags);
 
 		template <typename... Includes> Toolchain& add_c_includes(Includes&&... includes);
 		template <typename... Includes> Toolchain& add_cpp_includes(Includes&&... includes);
@@ -5810,6 +5812,13 @@ namespace nabs
 		return *this;
 	}
 
+	Toolchain& Toolchain::add_c_cpp_flags(const std::vector<std::string>& flags)
+	{
+		this->cflags.options.insert(this->cflags.options.end(), flags.begin(), flags.end());
+		this->cxxflags.options.insert(this->cxxflags.options.end(), flags.begin(), flags.end());
+		return *this;
+	}
+
 	Toolchain& Toolchain::add_c_includes(const std::vector<fs::path>& includes)
 	{
 		this->cflags.include_paths.insert(this->cflags.include_paths.end(), includes.begin(), includes.end());
@@ -5916,6 +5925,13 @@ namespace nabs
 	Toolchain& Toolchain::add_link_flags(Flags&&... flags)
 	{
 		this->ldflags.options.insert(this->ldflags.options.end(), { static_cast<Flags&&>(flags)... });
+		return *this;
+	}
+
+	template <typename... Flags> Toolchain& Toolchain::add_c_cpp_flags(Flags&&... flags)
+	{
+		this->cflags.options.insert(this->cflags.options.end(), { flags... });
+		this->cxxflags.options.insert(this->cxxflags.options.end(), { flags... });
 		return *this;
 	}
 }
