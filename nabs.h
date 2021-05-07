@@ -4820,6 +4820,8 @@ namespace nabs::dep
 	inline constexpr int KIND_OBJC_SOURCE    = 7;
 	inline constexpr int KIND_OBJCPP_SOURCE  = 8;
 	inline constexpr int KIND_SYSTEM_LIBRARY = 9;
+	inline constexpr int KIND_STATIC_LIB     = 10;
+	inline constexpr int KIND_ASM_SOURCE     = 11;
 
 	/*
 		A dependency graph, containing zero or more items. The graph is the owner of items created by it, and
@@ -4909,6 +4911,7 @@ namespace nabs::dep
 		5. If the extension is '.pch' or '.gch', return KIND_PCH
 		6. If the extension is '.m', return KIND_OBJC_SOURCE
 		7. If the extension is '.mm', return KIND_OBJCPP_SOURCE
+		8. If the extension is '.s', '.S', or '.asm', return KIND_ASM_SOURCE
 		8. otherwise, return KIND_NONE
 	*/
 	int infer_kind_from_filename(const fs::path& filename);
@@ -4937,6 +4940,8 @@ namespace nabs::dep
 			return KIND_OBJC_SOURCE;
 		else if(ext == ".mm")
 			return KIND_OBJCPP_SOURCE;
+		else if(ext == ".s" || ext == ".S" || ext == ".asm")
+			return KIND_ASM_SOURCE;
 		else
 			return KIND_NONE;
 	}
@@ -6112,6 +6117,18 @@ namespace nabs
 				return f;
 		}
 
+		static fs::path ensure_lib_extension_if_necessary(const Compiler& cmp, const CompilerFlags& opts, fs::path f)
+		{
+			(void) opts;
+
+			bool is_msvc = (cmp.kind == Compiler::KIND_MSVC_CL
+				|| cmp.kind == Compiler::KIND_MSVC_LINK || cmp.kind == Compiler::KIND_MSVC_LIB);
+			if(is_msvc)
+				return f.replace_extension(".lib");
+			else
+				return f.replace_extension(".a");
+		}
+
 		static fs::path set_output_name(std::vector<std::string>& args, const Compiler& cmp, const CompilerFlags& opts,
 			bool obj, const std::optional<fs::path>& output_name, const std::vector<fs::path>& files)
 		{
@@ -6444,21 +6461,23 @@ namespace nabs
 
 	fs::path get_default_object_filename(const Compiler& cmp, const CompilerFlags& opts, fs::path file)
 	{
+		using Cmp = Compiler;
+
 		// i guess we emit the same file for every compiler.
 		if(auto inter = impl::get_intermediate_dir(opts); inter.has_value())
 		{
-			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+			if(cmp.kind == Cmp::KIND_CLANG || cmp.kind == Cmp::KIND_GCC || cmp.kind == Cmp::KIND_GNU_AS)
 				return *inter / (file.concat(".o"));
-			else if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
+			else if(cmp.kind == Cmp::KIND_MSVC_CL || cmp.kind == Cmp::KIND_MSVC_LINK)
 				return *inter / (file.replace_extension(".obj"));
 			else
-				impl::int_error("get_default_object_filename(): unsupported compiler");
+				impl::int_error("get_default_object_filename(): unsupported Cmp");
 		}
 		else
 		{
-			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+			if(cmp.kind == Cmp::KIND_CLANG || cmp.kind == Cmp::KIND_GCC || cmp.kind == Cmp::KIND_GNU_AS)
 				return file.concat(".o");
-			else if(cmp.kind == Compiler::KIND_MSVC_CL || cmp.kind == Compiler::KIND_MSVC_LINK)
+			else if(cmp.kind == Cmp::KIND_MSVC_CL || cmp.kind == Cmp::KIND_MSVC_LINK)
 				return file.replace_extension(".obj");
 			else
 				impl::int_error("get_default_object_filename(): unsupported compiler");
@@ -8356,6 +8375,31 @@ namespace nabs
 
 
 	/*
+		This does 90% of the work of `auto_executable_from_sources`; it takes a list of source files, reads
+		the dependency information (from a '.d' file on disk, if it exists), automatically adds dependencies
+		on precompiled headers, etc. etc.
+
+		The only differences are:
+		(a) it returns a list of Items representing the object file
+		(b) no exe file is involved; nothing directly depends on the object files
+	*/
+	Result<std::vector<dep::Item*>, std::string> auto_objects_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const std::vector<fs::path>& src_files, const std::vector<dep::Item*>& extra_dependencies);
+
+
+	/*
+		Similar to `auto_executable_from_sources`; it also uses `auto_objects_from_sources` internally to
+		generate the appropriate dependency graph, so the features are also similar. The output of the
+		build target is then a static library file (.a, or .lib, depending on platform).
+	*/
+	Result<dep::Item*, std::string> auto_static_library_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& lib_path, const std::vector<fs::path>& src_files, const std::vector<dep::Item*> extra_dependencies);
+
+
+
+
+
+	/*
 		Automatically build all the targets provided in the list, by using the dependency graph and
 		sorting it in topological order. In case of success, an empty result is returned. In case of
 		error, the path to the offending file is returned.
@@ -8394,7 +8438,7 @@ namespace nabs
 
 	/*
 		Identical to the overloads above, but using the provided thread pool for parallel job execution.
-		This means that the overloads not taking a ThreadPool are single-threaded.
+		This implies that the overloads not taking a ThreadPool are single-threaded.
 	*/
 	Result<void, std::string> auto_build_targets(zmt::ThreadPool& pool, const Toolchain& toolchain,
 		const dep::Graph& graph, const std::vector<dep::Item*>& targets, const AutoCompileHooks& hooks = { });
@@ -8444,7 +8488,8 @@ namespace nabs
 		static bool is_kind_sourcefile(int kind)
 		{
 			return kind == dep::KIND_C_SOURCE || kind == dep::KIND_CPP_SOURCE
-				|| kind == dep::KIND_OBJC_SOURCE || kind == dep::KIND_OBJCPP_SOURCE;
+				|| kind == dep::KIND_OBJC_SOURCE || kind == dep::KIND_OBJCPP_SOURCE
+				|| kind == dep::KIND_ASM_SOURCE;
 		}
 
 
@@ -8499,8 +8544,6 @@ namespace nabs
 
 
 		/*
-			NOTE: don't call this directly, call the other overload.
-
 			principle of operation:
 			the topological sort already sorts things in dependency order. so, under normal circumstances
 			this does not need to recursively traverse the dependencies of a target.
@@ -8627,6 +8670,8 @@ namespace nabs
 					cmp = tc.cc, flags = tc.cflags;
 				else if(src->kind() == KIND_CPP_SOURCE)
 					cmp = tc.cxx, flags = tc.cxxflags;
+				else if(src->kind() == KIND_ASM_SOURCE)
+					cmp = tc.as, flags = tc.asflags;
 				else if(src->kind() == KIND_OBJC_SOURCE)
 					cmp = tc.objcc, flags = tc.objcflags;
 				else if(src->kind() == KIND_OBJCPP_SOURCE)
@@ -8683,6 +8728,18 @@ namespace nabs
 
 				auto prod = map(target->produced_by, [](auto x) { return fs::path(x->name()); });
 				if(link_object_files(ld, ldflags, target->name(), prod) != 0)
+					return Err<std::string>(target->name());
+			}
+			else if(target->kind() == KIND_STATIC_LIB)
+			{
+				auto ar = tc.ar;
+				auto arflags = tc.arflags;
+
+				if(hooks.modify_flags)
+					hooks.modify_flags(ar, arflags, target, target->produced_by);
+
+				auto prod = map(target->produced_by, [](auto x) { return fs::path(x->name()); });
+				if(make_static_library(ar, arflags, target->name(), prod) != 0)
 					return Err<std::string>(target->name());
 			}
 			else
@@ -8860,6 +8917,30 @@ namespace nabs
 		return auto_executable_from_sources(graph, toolchain, exe_name, src_files, libs);
 	}
 
+	Result<dep::Item*, std::string> auto_static_library_from_sources(dep::Graph& graph, const Toolchain& toolchain,
+		const fs::path& lib_path, const std::vector<fs::path>& src_files, const std::vector<dep::Item*> extra_deps)
+	{
+		using namespace dep;
+
+		auto lib_name = impl::ensure_lib_extension_if_necessary(toolchain.ar, toolchain.arflags, lib_path);
+		auto lib_file = graph.get_or_add(KIND_STATIC_LIB, lib_name);
+		lib_file->override_toolchain = toolchain;
+
+		for(auto edep : extra_deps)
+			lib_file->depend(edep);
+
+		auto objs = impl::objects_from_sources(graph, toolchain, src_files, extra_deps, [&lib_file](Item* src, Item* obj) {
+			(void) src;
+			lib_file->add_produced_by(obj);
+		});
+
+		if(objs.ok())   return Ok(lib_file);
+		else            return Err(objs.error());
+	}
+
+
+
+
 	std::optional<std::pair<Compiler, CompilerFlags>> auto_infer_compiler_from_file(const Toolchain& toolchain,
 		const fs::path& path)
 	{
@@ -8870,6 +8951,8 @@ namespace nabs
 			return std::make_pair(toolchain.cc, toolchain.cflags);
 		else if(kind == KIND_CPP_SOURCE)
 			return std::make_pair(toolchain.cxx, toolchain.cxxflags);
+		else if(kind == KIND_ASM_SOURCE)
+			return std::make_pair(toolchain.as, toolchain.asflags);
 		else if(kind == KIND_OBJC_SOURCE)
 			return std::make_pair(toolchain.objcc, toolchain.objcflags);
 		else if(kind == KIND_OBJCPP_SOURCE)
