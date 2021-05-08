@@ -2939,9 +2939,12 @@ namespace nabs
 		exit(1);
 	}
 
+	namespace stdfs = std::filesystem;
+
 	namespace fs
 	{
-		using namespace std::filesystem;
+		// using namespace std::filesystem;
+		using path = std::filesystem::path;
 
 		Result<FILE*, std::string> fopen_wrapper(const fs::path& file, const char* mode);
 		Result<std::string, std::string> read_file(const fs::path& file);
@@ -3557,7 +3560,7 @@ namespace nabs
 			(void) args;
 
 			if(base.empty())
-				base = fs::weakly_canonical(__FILE__).parent_path();
+				base = stdfs::weakly_canonical(__FILE__).parent_path();
 
 			if(output)
 			{
@@ -5069,7 +5072,7 @@ namespace nabs::dep
 
 	Item* Graph::add(int kind, const fs::path& path)
 	{
-		auto name = fs::weakly_canonical(path).string();
+		auto name = stdfs::weakly_canonical(path).string();
 		if(auto it = this->items.find(name); it != this->items.end())
 		{
 			nabs::impl::int_warn("item '{}' already exists in the dependency graph", name);
@@ -5092,7 +5095,7 @@ namespace nabs::dep
 
 	Item* Graph::get_or_add(int kind, const fs::path& path)
 	{
-		auto canon = fs::weakly_canonical(path).string();
+		auto canon = stdfs::weakly_canonical(path).string();
 		if(auto item = this->get(canon); item != nullptr)
 			return item;
 
@@ -5118,7 +5121,7 @@ namespace nabs::dep
 
 	Item* Graph::get(const fs::path& path) const
 	{
-		if(auto it = this->items.find(fs::weakly_canonical(path).string()); it != this->items.end())
+		if(auto it = this->items.find(stdfs::weakly_canonical(path).string()); it != this->items.end())
 			return it->second;
 		else
 			return nullptr;
@@ -5145,7 +5148,7 @@ namespace nabs::dep
 	bool read_dependencies_from_file(Graph& graph, const fs::path& dependency_file)
 	{
 		// it is *NOT* an error to not have this file!
-		if(!fs::exists(dependency_file))
+		if(!stdfs::exists(dependency_file))
 			return false;
 
 		auto contents = fs::read_file(dependency_file).expect("failed to read file");
@@ -5317,7 +5320,7 @@ namespace nabs
 			for(auto& p : path)
 			{
 				auto tmp = (p / file);
-				if(fs::exists(tmp))
+				if(stdfs::exists(tmp))
 					return tmp;
 			}
 
@@ -5394,7 +5397,7 @@ namespace nabs
 		static Result<Compiler, std::string> get_compiler_from_env_var(const std::vector<fs::path>& path_env,
 			const std::string& var, int lang, bool consider_path = true)
 		{
-			if(fs::exists(var))
+			if(stdfs::exists(var))
 			{
 				// first, check if this file exists "just like that" (in case an absolute path,
 				// or something relative to the current dir, was provided)
@@ -5436,10 +5439,10 @@ namespace nabs
 				auto folder = sysroot / opts.prefix / opts.bin_name;
 				auto bin1 = zpr::sprint("{}-{}", opts.target.triple(), name);
 
-				if(auto cc1 = folder / bin1; fs::exists(cc1))
+				if(auto cc1 = folder / bin1; stdfs::exists(cc1))
 					return Ok(get_compiler_from_filepath(cc1, lang));
 
-				else if(auto cc2 = folder / name; fs::exists(cc2))
+				else if(auto cc2 = folder / name; stdfs::exists(cc2))
 					return Ok(get_compiler_from_filepath(cc2, lang));
 			}
 
@@ -5513,7 +5516,7 @@ namespace nabs
 						ret.lang = lang;
 						ret.path = binpath / arch / name;
 
-						if(!fs::exists(ret.path))
+						if(!stdfs::exists(ret.path))
 							return Err<std::string>(zpr::sprint("could not find '{}'", name));
 
 						return Ok(ret);
@@ -5933,7 +5936,8 @@ namespace nabs
 		return *this;
 	}
 
-	template <typename... Flags> Toolchain& Toolchain::add_c_cpp_flags(Flags&&... flags)
+	template <typename... Flags>
+	Toolchain& Toolchain::add_c_cpp_flags(Flags&&... flags)
 	{
 		this->cflags.options.insert(this->cflags.options.end(), { flags... });
 		this->cxxflags.options.insert(this->cxxflags.options.end(), { flags... });
@@ -5957,7 +5961,6 @@ namespace nabs
 	int compile_to_object_file(const Compiler& compiler, const CompilerFlags& opts, const std::optional<fs::path>& output,
 		const fs::path& files);
 
-	// this actually calls 'c++' or 'cc', and not 'ld'.
 	int link_object_files(const Compiler& linker, const CompilerFlags& opts, const std::optional<fs::path>& output,
 		const std::vector<fs::path>& files);
 
@@ -6010,7 +6013,7 @@ namespace nabs
 				if(opts.exceptions_disabled)
 					args.push_back("-D_HAS_EXCEPTIONS=0");
 			}
-			else if(cmp.kind == Compiler::KIND_MSVC_LINK)
+			else if(cmp.kind == Compiler::KIND_MSVC_LINK || cmp.kind == Compiler::KIND_GNU_AS || cmp.kind == Compiler::KIND_LD)
 			{
 				// nothing is required
 			}
@@ -6024,7 +6027,7 @@ namespace nabs
 		{
 			auto args = opts.options;
 
-			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC || cmp.kind == Compiler::KIND_GNU_AS)
 			{
 				for(auto& inc : opts.include_paths)
 					args.push_back(zpr::sprint("-I{}", inc.string()));
@@ -6069,9 +6072,12 @@ namespace nabs
 				// this is very important.
 				args.push_back("/NOLOGO");
 			}
+			else if(cmp.kind == Compiler::KIND_LD)
+			{
+			}
 			else
 			{
-				impl::int_error("setup_basic_args(): unsupported compiler");
+				impl::int_error("setup_basic_args(): unsupported compiler", cmp.kind);
 			}
 
 			return args;
@@ -6081,14 +6087,14 @@ namespace nabs
 		{
 			if(auto dir = opts.intermediate_output_folder; !dir.empty())
 			{
-				if(fs::exists(dir) && !fs::is_directory(dir))
+				if(stdfs::exists(dir) && !stdfs::is_directory(dir))
 				{
 					impl::int_warn("intermediate file directory '{}' is not a folder, ignoring", dir.string());
 					return { };
 				}
 
-				if(!fs::exists(dir))
-					fs::create_directories(dir);
+				if(!stdfs::exists(dir))
+					stdfs::create_directories(dir);
 
 				return dir;
 			}
@@ -6100,8 +6106,8 @@ namespace nabs
 
 		static void create_missing_dirs(const CompilerFlags& opts, const fs::path& for_file)
 		{
-			if(auto p = for_file.parent_path(); p != for_file && opts.create_missing_folders && !fs::exists(p))
-				fs::create_directories(p);
+			if(auto p = for_file.parent_path(); p != for_file && opts.create_missing_folders && !stdfs::exists(p))
+				stdfs::create_directories(p);
 		}
 
 		static fs::path ensure_exe_extension_if_necessary(const Compiler& cmp, const CompilerFlags& opts, fs::path f)
@@ -6179,15 +6185,11 @@ namespace nabs
 					// i think we should be ok to just go to normal here as well.
 					goto normal;
 				}
-				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				else
 				{
 					// there's no special behaviour for this, because gcc/clang don't throw stupid obj
 					// files everywhere if they're making an executable. so, we can just -o to set the output name.
 					goto normal;
-				}
-				else
-				{
-					impl::int_error("set_output_name(): unsupported compiler");
 				}
 			}
 			else
@@ -6206,7 +6208,8 @@ namespace nabs
 
 					args.push_back(zpr::sprint("/OUT:{}", quote_argument(f.string())));
 				}
-				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+				else if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC
+					|| cmp.kind == Compiler::KIND_GNU_AS || cmp.kind == Compiler::KIND_LD)
 				{
 					args.push_back("-o");
 					args.push_back(f.string());
@@ -6226,6 +6229,10 @@ namespace nabs
 			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
 			{
 				args.push_back("-c");
+				return impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
+			}
+			else if(cmp.kind == Compiler::KIND_GNU_AS)
+			{
 				return impl::set_output_name(args, cmp, opts, /* obj: */ true, output, { file });
 			}
 			else if(cmp.kind == Compiler::KIND_MSVC_CL)
@@ -6270,8 +6277,8 @@ namespace nabs
 				else if(cmp.kind == Compiler::KIND_MSVC_CL)
 				{
 					auto pch = get_default_pch_filename(cmp, opts, hdr);
-					auto quoted_pch = quote_argument(fs::weakly_canonical(pch).string());
-					auto quoted_hdr = quote_argument(fs::weakly_canonical(hdr).string());
+					auto quoted_pch = quote_argument(stdfs::weakly_canonical(pch).string());
+					auto quoted_hdr = quote_argument(stdfs::weakly_canonical(hdr).string());
 
 					args.push_back(zpr::sprint("/FI{}", quoted_hdr));
 					args.push_back(zpr::sprint("/Yu{}", quoted_hdr));
@@ -6418,7 +6425,7 @@ namespace nabs
 				args.push_back(post_inputs.string());
 
 			// libraries go after.
-			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+			if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC || cmp.kind == Compiler::KIND_LD)
 			{
 				for(auto& lib : opts.library_paths)
 					args.push_back(zpr::sprint("-L{}", lib.string()));
@@ -6450,7 +6457,7 @@ namespace nabs
 			}
 			else
 			{
-				impl::int_error("unsupported compiler");
+				impl::int_error("add_flags_for_linking_objects(): unsupported compiler");
 			}
 		}
 	}
@@ -6619,7 +6626,7 @@ namespace nabs
 		if(cmp.log_hook)
 			cmp.log_hook(out_name, { file }, args);
 
-		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC)
+		if(cmp.kind == Compiler::KIND_CLANG || cmp.kind == Compiler::KIND_GCC || cmp.kind == Compiler::KIND_GNU_AS)
 		{
 			// this is easy, since the compiler writes it for us.
 			return cmd(cmp.path.string(), std::move(args)).run();
@@ -6760,7 +6767,7 @@ namespace nabs::fs
 		inline void find_files_helper(std::vector<fs::path>& list, const fs::path& dir, Predicate&& pred)
 		{
 			// i guess this is not an error...?
-			if(!fs::is_directory(dir))
+			if(!stdfs::is_directory(dir))
 				return;
 
 			auto iter = Iter(dir);
@@ -6781,7 +6788,7 @@ namespace nabs::fs
 	inline std::vector<fs::path> find_files(const fs::path& dir, Predicate&& pred)
 	{
 		std::vector<fs::path> ret;
-		impl::find_files_helper<fs::directory_iterator>(ret, dir, pred);
+		impl::find_files_helper<stdfs::directory_iterator>(ret, dir, pred);
 		return ret;
 	}
 
@@ -6792,7 +6799,7 @@ namespace nabs::fs
 	inline std::vector<fs::path> find_files_recursively(const fs::path& dir, Predicate&& pred)
 	{
 		std::vector<fs::path> ret;
-		impl::find_files_helper<fs::recursive_directory_iterator>(ret, dir, pred);
+		impl::find_files_helper<stdfs::recursive_directory_iterator>(ret, dir, pred);
 		return ret;
 	}
 
@@ -6804,7 +6811,7 @@ namespace nabs::fs
 	{
 		std::vector<fs::path> ret;
 		for(auto& dir : dirs)
-			impl::find_files_helper<fs::directory_iterator>(ret, dir, pred);
+			impl::find_files_helper<stdfs::directory_iterator>(ret, dir, pred);
 		return ret;
 	}
 
@@ -6816,7 +6823,7 @@ namespace nabs::fs
 	{
 		std::vector<fs::path> ret;
 		for(auto& dir : dirs)
-			impl::find_files_helper<fs::recursive_directory_iterator>(ret, dir, pred);
+			impl::find_files_helper<stdfs::recursive_directory_iterator>(ret, dir, pred);
 		return ret;
 	}
 
@@ -6870,6 +6877,22 @@ namespace nabs::fs
 				ret.insert(ret.end(), std::make_move_iterator(foo.begin()), std::make_move_iterator(foo.end()));
 			}
 
+			auto is_parent_path = [](const fs::path& parent, fs::path child) -> bool {
+				while(!child.empty())
+				{
+					auto p = child.parent_path();
+					if(p == child)
+						return false;
+
+					if(p == parent)
+						return true;
+
+					child = p;
+				}
+
+				return false;
+			};
+
 			for(auto& [ dirs, _ext ] : this->list_excluding)
 			{
 				// FUCK
@@ -6882,8 +6905,7 @@ namespace nabs::fs
 
 					for(auto& excl : excls)
 					{
-						std::error_code ec { };
-						if(!fs::proximate(dirent.path(), excl, ec).empty())
+						if(is_parent_path(excl, dirent.path()))
 							return false;
 					}
 					return true;
@@ -7125,7 +7147,7 @@ namespace nabs
 			// all the provided files actually exist.
 			std::vector<fs::path> files;
 			for(auto& f : filenames)
-				files.push_back(fs::canonical(f));
+				files.push_back(stdfs::canonical(f));
 
 			CompilerFlags flags;
 
@@ -7135,7 +7157,7 @@ namespace nabs
 				fs::path include_dir;
 
 				auto this_path = fs::path(__FILE__);
-				if(!fs::exists(this_path))
+				if(!stdfs::exists(this_path))
 				{
 					impl::int_warn("somehow, the current header ('{}') does not exist, aborting self-rebuild", __FILE__);
 					return;
@@ -7191,7 +7213,7 @@ namespace nabs
 			}
 
 			auto this_path = fs::path(argv[0]);
-			assert(fs::exists(this_path));
+			assert(stdfs::exists(this_path));
 
 			auto new_name = fs::path("__" + this_path.filename().string());
 			int status = compile_files(cpp, flags, new_name, std::move(files));
@@ -7204,7 +7226,7 @@ namespace nabs
 
 		#else
 			// for posix, it's just a rename + exec... ez.
-			fs::rename(new_name, this_path);
+			stdfs::rename(new_name, this_path);
 
 			// now just exec without forking.
 			if(execvp(this_path.string().c_str(), argv) < 0)
@@ -7222,7 +7244,7 @@ namespace nabs
 		}
 
 	#if defined(_WIN32)
-		if(fs::exists(impl::TMP_FILE_NAME) && fs::is_regular_file(impl::TMP_FILE_NAME))
+		if(stdfs::exists(impl::TMP_FILE_NAME) && stdfs::is_regular_file(impl::TMP_FILE_NAME))
 		{
 			// note: we don't care if this fails, we just don't want it to throw an exception.
 			// for windows, we cannot remove the file from under a running exe, even though we
@@ -7230,32 +7252,32 @@ namespace nabs
 			// __please_delete_me.exe file is still running (our parent), so we can't delete it.
 			// in such a case, just leave it, and try to delete it next time.
 			std::error_code ec;
-			fs::remove(impl::TMP_FILE_NAME, ec);
+			stdfs::remove(impl::TMP_FILE_NAME, ec);
 		}
 	#endif
 
 		// first, get the modification time of this file:
 		auto this_path = fs::path(argv[0]);
-		if(!fs::exists(this_path))
+		if(!stdfs::exists(this_path))
 		{
 			impl::int_warn("argv[0] (= '{}') does not exist, something fishy is going on",
-				fs::weakly_canonical(this_path).string());
+				stdfs::weakly_canonical(this_path).string());
 			return;
 		}
 
 		bool need_rebuild = false;
 
-		auto this_time = fs::last_write_time(this_path);
+		auto this_time = stdfs::last_write_time(this_path);
 		for(auto& file : filenames)
 		{
 			// note: there's no requirement for any of the recipe sources to exist;
 			// maybe you want to distribute a binary or something. if any of
 			// the files don't exist we obviously can't rebuild, so exit.
 			auto p = fs::path(file);
-			if(!fs::exists(p))
+			if(!stdfs::exists(p))
 				return;
 
-			if(fs::last_write_time(p) > this_time)
+			if(stdfs::last_write_time(p) > this_time)
 			{
 				need_rebuild = true;
 				break;
@@ -7263,7 +7285,7 @@ namespace nabs
 		}
 
 		// also check the header itself.
-		if(auto p = fs::path(__FILE__); fs::exists(p) && fs::last_write_time(p) > this_time)
+		if(auto p = fs::path(__FILE__); stdfs::exists(p) && stdfs::last_write_time(p) > this_time)
 			need_rebuild = true;
 
 		if(need_rebuild)
@@ -8194,18 +8216,18 @@ namespace nabs
 			// i don't actually know if this makes a difference.
 			if(opts.prefer_static_library)
 			{
-				if(fs::exists(static_lib))
+				if(stdfs::exists(static_lib))
 					return foozle(static_lib_name);
 
-				else if(!opts.require_static_library && fs::exists(dynamic_lib))
+				else if(!opts.require_static_library && stdfs::exists(dynamic_lib))
 					return foozle(dynamic_lib_name);
 			}
 			else
 			{
-				if(!opts.require_static_library && fs::exists(dynamic_lib))
+				if(!opts.require_static_library && stdfs::exists(dynamic_lib))
 					return foozle(dynamic_lib_name);
 
-				else if(fs::exists(static_lib))
+				else if(stdfs::exists(static_lib))
 					return foozle(static_lib_name);
 			}
 
@@ -8596,11 +8618,11 @@ namespace nabs
 				return Ok();
 
 
-			bool target_exists = fs::exists(target->name());
+			bool target_exists = stdfs::exists(target->name());
 
 			auto dependency_needs_rebuilding = [&target_exists](Item* target, Item* dep) -> Result<bool, std::string> {
 
-				bool dep_exists = fs::exists(dep->name());
+				bool dep_exists = stdfs::exists(dep->name());
 				bool dep_phony = is_kind_phonylike(dep->kind());
 
 				if(!dep_phony && !dep_exists && !(dep->flags & Item::FLAG_MIGHT_NOT_EXIST))
@@ -8612,7 +8634,7 @@ namespace nabs
 				if(dep_phony || !dep_exists || !target_exists)
 					return Ok(true);
 
-				if(fs::last_write_time(dep->name()) > fs::last_write_time(target->name()))
+				if(stdfs::last_write_time(dep->name()) > stdfs::last_write_time(target->name()))
 					return Ok(true);
 
 				return Ok(false);
