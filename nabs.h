@@ -6882,6 +6882,25 @@ namespace nabs::fs
 	std::vector<fs::path> find_files_ext_recursively(const std::initializer_list<fs::path>& dir, std::string_view ext);
 
 	/*
+		Merge directory structures, by copying files and folders from 'src' to 'dst'. For example, you might
+		want to merge_copy `/sysroot/usr/include` to `/usr/`, so the final result is `/usr/include`.
+
+		`create_missing` (true by default) determines whether missing folders in 'dst' that exist in 'src' are
+		automatically created.
+
+		`update_mode` (true by default), if enabled, only copies a file if its modification time in 'src' is
+		newer than its counterpart in 'dst'.
+	*/
+	Result<void, std::string> merge_copy_directories(const fs::path& src, const fs::path& dst,
+		bool create_missing = true, bool update_mode = true);
+
+	/*
+		Copy files to the destination folder, without any directory structure.
+	*/
+	Result<void, std::string> copy_files(const fs::path& dst, const std::vector<fs::path>& files,
+		bool create_missing = true, bool update_mode = true);
+
+	/*
 		Just a nonsense struct that reduces the amount of code you need to type to look for source files in
 		disjoint folders with different extensions (eg. c and c++)
 	*/
@@ -6983,6 +7002,74 @@ namespace nabs::fs
 		return find_files_recursively(dirs, [&ext](auto ent) -> bool {
 			return ent.path().extension() == ext;
 		});
+	}
+
+
+	Result<void, std::string> merge_copy_directories(const fs::path& src, const fs::path& dst, bool create_missing, bool update_mode)
+	{
+		// auto base = src;
+		std::error_code ec { };
+		auto iter = stdfs::recursive_directory_iterator(src);
+
+		if(!stdfs::is_directory(src))
+			return Err<std::string>(zpr::sprint("source '{}' is not a directory", src));
+
+		for(auto& ent : iter)
+		{
+			auto rel = stdfs::relative(ent.path(), src);
+			if((ent.is_regular_file() || ent.is_symlink()))
+			{
+				auto dst_file = dst / rel;
+				auto p = dst_file.parent_path();
+
+				if(!stdfs::exists(p))
+				{
+					if(!create_missing)
+						return Err<std::string>(zpr::sprint("directory '{}' missing in dst path", rel.parent_path()));
+
+					if(!stdfs::create_directories(p, ec))
+						return Err<std::string>(zpr::sprint("while creating '{}': {}", p, ec.message()));
+				}
+
+				if(!update_mode || !stdfs::exists(dst_file) || ent.last_write_time() > stdfs::last_write_time(dst_file))
+				{
+					if(!stdfs::copy_file(ent.path(), dst_file, ec))
+						return Err<std::string>(zpr::sprint("while copying '{}': {}", dst_file, ec.message()));
+				}
+			}
+			else if(ent.is_directory() && create_missing && !stdfs::exists(dst / rel))
+			{
+				if(!stdfs::create_directories(dst / rel, ec))
+					return Err<std::string>(zpr::sprint("while creating '{}': {}", dst / rel, ec.message()));
+			}
+		}
+
+		return Ok();
+	}
+
+	Result<void, std::string> copy_files(const fs::path& dst, const std::vector<fs::path>& files,
+		bool create_missing, bool update_mode)
+	{
+		if(create_missing && !stdfs::exists(dst))
+			stdfs::create_directories(dst);
+
+		if(!stdfs::is_directory(dst))
+			return Err<std::string>(zpr::sprint("destination '{}' is not a directory", dst));
+
+		for(auto& file : files)
+		{
+			auto name = file.filename();
+			auto dest = dst / name;
+			std::error_code ec { };
+
+			if(!update_mode || !stdfs::exists(dest) || stdfs::last_write_time(file) > stdfs::last_write_time(dest))
+			{
+				if(!stdfs::copy_file(file, dest, ec))
+					return Err<std::string>(zpr::sprint("while copying '{}': {}", name, ec.message()));
+			}
+		}
+
+		return Ok();
 	}
 
 
