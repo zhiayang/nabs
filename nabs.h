@@ -4807,6 +4807,7 @@ namespace nabs::dep
 		mutable size_t level = 0;
 
 		friend struct Graph;
+		friend void transitive_reduction_dfs(Item*, std::vector<Item*>&);
 	};
 
 	inline constexpr int KIND_NONE           = 0;
@@ -5023,6 +5024,28 @@ namespace nabs::dep
 		return dfs(root);
 	}
 
+	inline void transitive_reduction_dfs(Item* item, std::vector<Item*>& queue)
+	{
+		// assume that all the nodes have their level set to 0 -- we re-use it here
+		// as a 'seen' marker. if we've seen it, don't recurse.
+		for(auto dep : item->deps)
+		{
+			if(auto it = std::find(queue.begin(), queue.end(), dep); it != queue.end())
+				queue.erase(it);
+
+			if(dep->level == 0)
+				transitive_reduction_dfs(dep, queue);
+
+			dep->level = 1;
+		}
+	}
+
+	inline void transitive_reduction(std::vector<Item*>& queue)
+	{
+		for(size_t x = 0; x < queue.size(); x++)
+			transitive_reduction_dfs(queue[x], queue);
+	}
+
 	// based on https://stackoverflow.com/questions/4073119/topological-sort-with-grouping
 	Result<std::vector<std::vector<Item*>>, std::vector<Item*>> Graph::topological_sort(std::vector<Item*> queue) const
 	{
@@ -5031,8 +5054,17 @@ namespace nabs::dep
 
 		std::set<Item*> visited;
 
+		// first reset the level
 		for(auto& [ name, item ] : this->items)
 			item->level = 0;
+
+		// then transitively reduce
+		transitive_reduction(queue);
+
+		// then reset the levels again
+		for(auto& [ name, item ] : this->items)
+			item->level = 0;
+
 
 		size_t max_level = 0;
 		while(!queue.empty())
